@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "research-assistant",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-u", "run.py"],
+      "port": 8000
+    }
+  ]
+}

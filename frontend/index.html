@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ResearchAssistant - Citation Extractor</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>ResearchAssistant</h1>
+            <span class="badge">v0.1 - Citation Extractor</span>
+        </header>
+
+        <!-- Settings Panel -->
+        <details class="panel" id="settings-panel">
+            <summary>LLM Backend Settings</summary>
+            <div class="panel-body">
+                <div class="form-row">
+                    <label for="backend-kind">Backend Type</label>
+                    <select id="backend-kind">
+                        <option value="ollama">Ollama (Local)</option>
+                        <option value="openai">OpenAI-Compatible</option>
+                    </select>
+                </div>
+                <div class="form-row">
+                    <label for="base-url">Base URL</label>
+                    <input type="text" id="base-url" value="http://localhost:11434" placeholder="http://localhost:11434">
+                </div>
+                <div class="form-row" id="api-key-row" style="display:none">
+                    <label for="api-key">API Key</label>
+                    <input type="password" id="api-key" placeholder="sk-...">
+                </div>
+                <div class="form-row">
+                    <label for="model-select">Model</label>
+                    <div class="input-group">
+                        <select id="model-select">
+                            <option value="">-- Load models first --</option>
+                        </select>
+                        <button id="btn-load-models" class="btn btn-sm">Load Models</button>
+                    </div>
+                </div>
+                <div id="ollama-settings">
+                    <div class="form-row">
+                        <label for="ollama-temperature">Ollama Temperature</label>
+                        <input type="number" id="ollama-temperature" min="0" max="2" step="0.1" value="0">
+                    </div>
+                    <div class="form-row">
+                        <label for="ollama-think-mode">Ollama Think Mode</label>
+                        <select id="ollama-think-mode">
+                            <option value="default">Default</option>
+                            <option value="think">Think</option>
+                            <option value="no_think">No Think</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-row">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="use-llm">
+                        Use LLM-assisted repair (optional)
+                    </label>
+                </div>
+                <button id="btn-save-settings" class="btn">Save Settings</button>
+                <span id="settings-status" class="status-text"></span>
+            </div>
+        </details>
+
+        <!-- Upload Panel -->
+        <div class="panel">
+            <h2>Upload Documents</h2>
+            <div class="panel-body">
+                <div class="upload-zone" id="upload-zone">
+                    <p>Drag & drop PDF, DOCX, or MD files here</p>
+                    <p class="muted">or click to select multiple</p>
+                    <input type="file" id="file-input" accept=".pdf,.docx,.md" multiple hidden>
+                </div>
+                <div id="file-list" class="file-list" style="display:none"></div>
+            </div>
+        </div>
+
+        <div class="panel">
+            <h2>Upload Source URL Spreadsheet</h2>
+            <div class="panel-body">
+                <div class="form-row">
+                    <label for="source-list-input">CSV/XLSX File (must include URL column)</label>
+                    <input type="file" id="source-list-input" accept=".csv,.xlsx">
+                </div>
+                <div class="export-actions">
+                    <button id="btn-upload-source-list" class="btn">Upload Source List</button>
+                    <span id="source-list-status" class="status-text"></span>
+                </div>
+                <p class="muted">Optional columns like Title, DOI, Authors, Year, CitationNumber, and SourceDocumentName are supported.</p>
+            </div>
+        </div>
+
+        <div class="panel">
+            <h2>Attached Repository</h2>
+            <div class="panel-body">
+                <div class="form-row">
+                    <label for="repository-path">Absolute Local Folder Path</label>
+                    <div class="input-group">
+                        <input type="text" id="repository-path" placeholder="/absolute/path/to/repository">
+                        <button id="btn-attach-repository" class="btn">Attach + Scan</button>
+                    </div>
+                </div>
+                <div class="export-actions">
+                    <span id="repository-status" class="status-text"></span>
+                </div>
+                <div id="repository-summary" class="export-summary muted"></div>
+
+                <div class="form-row">
+                    <label for="repository-source-list-input">Import URL Spreadsheet (CSV/XLSX)</label>
+                    <div class="input-group">
+                        <input type="file" id="repository-source-list-input" accept=".csv,.xlsx">
+                        <button id="btn-repository-import-list" class="btn">Import Spreadsheet</button>
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <label for="repository-document-input">Import Research Document (PDF/DOCX/MD)</label>
+                    <div class="input-group">
+                        <input type="file" id="repository-document-input" accept=".pdf,.docx,.md">
+                        <button id="btn-repository-import-document" class="btn">Import Document</button>
+                    </div>
+                </div>
+
+                <div class="export-actions">
+                    <button id="btn-repository-download" class="btn btn-primary">Download Queued Sources</button>
+                    <button id="btn-repository-rebuild" class="btn">Rebuild Spreadsheets</button>
+                    <button id="btn-repository-manifest-csv" class="btn">Manifest CSV</button>
+                    <button id="btn-repository-manifest-xlsx" class="btn">Manifest XLSX</button>
+                    <button id="btn-repository-citations-csv" class="btn">Citations CSV</button>
+                </div>
+                <p class="muted">Existing files are never moved/renamed; duplicate URLs reuse existing source records and keep provenance metadata.</p>
+            </div>
+        </div>
+
+        <!-- Research Purpose -->
+        <details class="panel" id="research-purpose-panel">
+            <summary>Research Purpose (used for source summarization)</summary>
+            <div class="panel-body">
+                <textarea id="research-purpose" rows="3" placeholder="e.g., Focus on policy implications and implementation barriers for heat pump adoption..."></textarea>
+                <p class="muted">Used to guide per-source summaries generated during Download Sources.</p>
+            </div>
+        </details>
+
+        <!-- Process Button -->
+        <div class="action-bar">
+            <button id="btn-process" class="btn btn-primary btn-lg" disabled>Extract Citations</button>
+        </div>
+
+        <!-- Progress Panel -->
+        <div class="panel" id="progress-panel" style="display:none">
+            <h2>Processing</h2>
+            <div class="panel-body">
+                <div class="progress-bar-container">
+                    <div class="progress-bar" id="progress-bar" style="width:0%"></div>
+                </div>
+                <div id="progress-pct" class="progress-text">0%</div>
+                <ul class="stage-list" id="stage-list"></ul>
+            </div>
+        </div>
+
+        <!-- Results Panel -->
+        <details class="panel" id="results-panel" style="display:none" open>
+            <summary>Results</summary>
+            <div class="panel-body">
+                <div class="tabs" id="result-tabs">
+                    <button class="tab active" data-tab="bibliography">Bibliography</button>
+                    <button class="tab" data-tab="citations">Citations</button>
+                    <button class="tab" data-tab="sentences">Sentences</button>
+                    <button class="tab" data-tab="matches">Matches</button>
+                </div>
+                <div class="tab-content" id="tab-content">
+                    <div id="tab-bibliography" class="tab-pane active"></div>
+                    <div id="tab-citations" class="tab-pane" style="display:none"></div>
+                    <div id="tab-sentences" class="tab-pane" style="display:none"></div>
+                    <div id="tab-matches" class="tab-pane" style="display:none"></div>
+                </div>
+            </div>
+        </details>
+
+        <!-- Warnings/Errors Panel -->
+        <div class="panel" id="warnings-panel" style="display:none">
+            <h2>Warnings & Errors</h2>
+            <div class="panel-body">
+                <ul id="warnings-list" class="warnings-list"></ul>
+            </div>
+        </div>
+
+        <!-- Export Panel -->
+        <div class="panel" id="export-panel" style="display:none">
+            <h2>Export</h2>
+            <div class="panel-body">
+                <div id="export-summary" class="export-summary"></div>
+                <div class="export-actions">
+                    <button id="btn-download-csv" class="btn btn-primary">Download CSV</button>
+                    <button id="btn-download-sources" class="btn">Download Sources</button>
+                    <button id="btn-rerun-failed" class="btn" disabled>Re-run Failed</button>
+                    <button id="btn-cancel-sources" class="btn" disabled>Cancel Download</button>
+                </div>
+
+                <div id="sources-progress" class="sources-progress" style="display:none">
+                    <h3>Source Download Progress</h3>
+                    <div class="progress-bar-container">
+                        <div class="progress-bar" id="sources-progress-bar" style="width:0%"></div>
+                    </div>
+                    <div id="sources-progress-text" class="progress-text">0/0</div>
+                    <div id="sources-summary" class="export-summary muted"></div>
+                    <div id="sources-runtime-guidance" class="runtime-guidance" style="display:none"></div>
+                    <ul id="sources-status-list" class="sources-status-list"></ul>
+                </div>
+
+                <div id="sources-files" class="sources-files" style="display:none">
+                    <h3>Source Output Package</h3>
+                    <div class="export-actions">
+                        <button id="btn-download-manifest-csv" class="btn">Manifest CSV</button>
+                        <button id="btn-download-manifest-xlsx" class="btn">Manifest XLSX</button>
+                        <button id="btn-download-sources-bundle" class="btn btn-primary">Download Output Bundle (ZIP)</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
