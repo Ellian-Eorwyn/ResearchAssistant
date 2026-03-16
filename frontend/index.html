@@ -131,8 +131,44 @@
                     <button id="btn-repository-manifest-csv" class="btn">Manifest CSV</button>
                     <button id="btn-repository-manifest-xlsx" class="btn">Manifest XLSX</button>
                     <button id="btn-repository-citations-csv" class="btn">Citations CSV</button>
+                    <button id="btn-repo-sqlite" class="btn">SQLite (.db)</button>
+                    <button id="btn-repo-sqlite-taxonomy" class="btn">SQLite (.db + taxonomy)</button>
                 </div>
                 <p class="muted">Existing files are never moved/renamed; duplicate URLs reuse existing source records and keep provenance metadata.</p>
+
+                <details class="sub-panel" id="merge-panel">
+                    <summary>Merge Two Repositories</summary>
+                    <div class="panel-body">
+                        <div class="form-row">
+                            <label for="merge-primary-path">Primary Repository (numbered first)</label>
+                            <input type="text" id="merge-primary-path" placeholder="/path/to/primary/repo">
+                        </div>
+                        <div class="form-row">
+                            <label for="merge-secondary-path">Secondary Repository (numbered after primary)</label>
+                            <input type="text" id="merge-secondary-path" placeholder="/path/to/secondary/repo">
+                        </div>
+                        <div class="form-row">
+                            <label>Output Mode</label>
+                            <div class="radio-group">
+                                <label class="checkbox-label compact">
+                                    <input type="radio" name="merge-output-mode" value="new" checked> New Directory
+                                </label>
+                                <label class="checkbox-label compact">
+                                    <input type="radio" name="merge-output-mode" value="into_primary"> Merge Into Primary
+                                </label>
+                            </div>
+                        </div>
+                        <div class="form-row" id="merge-output-path-row">
+                            <label for="merge-output-path">Output Directory</label>
+                            <input type="text" id="merge-output-path" placeholder="/path/to/new/merged/repo">
+                        </div>
+                        <div class="export-actions">
+                            <button id="btn-merge-repos" class="btn btn-primary">Merge Repositories</button>
+                            <span id="merge-status" class="status-text"></span>
+                        </div>
+                        <p class="muted">Duplicate URLs keep the higher-quality version. Primary sources are numbered 1..N, unique secondary sources N+1..M.</p>
+                    </div>
+                </details>
             </div>
         </div>
 
@@ -194,11 +230,80 @@
             <h2>Export</h2>
             <div class="panel-body">
                 <div id="export-summary" class="export-summary"></div>
+                <div class="source-task-controls">
+                    <div class="source-task-group">
+                        <div class="source-task-title">Phases</div>
+                        <label class="checkbox-label compact">
+                            <input type="checkbox" id="sources-run-download" checked>
+                            Download / refresh source files
+                        </label>
+                        <label class="checkbox-label compact">
+                            <input type="checkbox" id="sources-run-cleanup">
+                            LLM markdown cleanup
+                        </label>
+                        <label class="checkbox-label compact">
+                            <input type="checkbox" id="sources-run-summary">
+                            LLM summaries
+                        </label>
+                    </div>
+                    <div class="source-task-group">
+                        <div class="source-task-title">Download Outputs</div>
+                        <label class="checkbox-label compact">
+                            <input type="checkbox" id="sources-output-raw" checked>
+                            Raw files
+                        </label>
+                        <label class="checkbox-label compact">
+                            <input type="checkbox" id="sources-output-rendered-html" checked>
+                            Rendered HTML
+                        </label>
+                        <label class="checkbox-label compact">
+                            <input type="checkbox" id="sources-output-rendered-pdf" checked>
+                            Rendered PDF
+                        </label>
+                        <label class="checkbox-label compact">
+                            <input type="checkbox" id="sources-output-markdown" checked>
+                            Markdown extraction
+                        </label>
+                    </div>
+                    <div class="source-task-group">
+                        <div class="source-task-title">Re-run Behavior</div>
+                        <label class="checkbox-label compact">
+                            <input type="checkbox" id="sources-force-download">
+                            Force regenerate selected download outputs
+                        </label>
+                        <label class="checkbox-label compact">
+                            <input type="checkbox" id="sources-force-cleanup">
+                            Re-run cleanup even if cleanup file exists
+                        </label>
+                        <label class="checkbox-label compact">
+                            <input type="checkbox" id="sources-force-summary">
+                            Re-run summaries (use current research purpose)
+                        </label>
+                    </div>
+                </div>
                 <div class="export-actions">
                     <button id="btn-download-csv" class="btn btn-primary">Download CSV</button>
-                    <button id="btn-download-sources" class="btn">Download Sources</button>
-                    <button id="btn-rerun-failed" class="btn" disabled>Re-run Failed</button>
+                    <button id="btn-download-sqlite" class="btn">Download SQLite (.db)</button>
+                    <button id="btn-download-sqlite-taxonomy" class="btn">Download SQLite (.db + taxonomy)</button>
+                    <button id="btn-download-sources" class="btn">Run Selected Tasks</button>
+                    <button id="btn-rerun-failed" class="btn" disabled>Run Selected Tasks (Failed Only)</button>
                     <button id="btn-cancel-sources" class="btn" disabled>Cancel Download</button>
+                    <label for="fetch-delay" class="fetch-delay-label">Fetch delay:
+                        <input type="number" id="fetch-delay" min="1" max="10" step="0.5" value="2.0" class="fetch-delay-input"> sec
+                    </label>
+                </div>
+                <div class="form-row">
+                    <label for="taxonomy-preset">Taxonomy Classification</label>
+                    <select id="taxonomy-preset">
+                        <option value="wikipedia" selected>Wikipedia</option>
+                        <option value="sep">Stanford Encyclopedia of Philosophy</option>
+                        <option value="none">None (default classification)</option>
+                        <option value="custom">Custom file path...</option>
+                    </select>
+                </div>
+                <div class="form-row" id="taxonomy-custom-path-row" style="display:none">
+                    <label for="taxonomy-config-path">Taxonomy Config Path</label>
+                    <input type="text" id="taxonomy-config-path" placeholder="~/path/to/domains.yaml">
                 </div>
 
                 <div id="sources-progress" class="sources-progress" style="display:none">

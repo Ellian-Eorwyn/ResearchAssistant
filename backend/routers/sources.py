@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 
 from fastapi import APIRouter, Body, File, Form, HTTPException, Request, UploadFile
@@ -11,15 +12,36 @@ from pydantic import BaseModel
 from backend.models.bibliography import BibliographyArtifact
 from backend.models.common import PipelineStage
 from backend.models.settings import AppSettings
-from backend.models.sources import SourceListUploadResponse
-from backend.pipeline.source_downloader import SourceDownloadOrchestrator
+from backend.models.sources import (
+    SourceDownloadStatus,
+    SourceItemStatus,
+    SourceListUploadResponse,
+    SourceManifestRow,
+    SourceOutputOptions,
+)
+from backend.pipeline.source_downloader import (
+    SourceDownloadOrchestrator,
+    summarize_output_rows,
+)
 from backend.pipeline.source_list_parser import parse_source_list_upload
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 
 class SourceDownloadRequest(BaseModel):
     rerun_failed_only: bool = False
+    run_download: bool = True
+    run_llm_cleanup: bool = False
+    run_llm_summary: bool = True
+    force_redownload: bool = False
+    force_llm_cleanup: bool = False
+    force_summary: bool = False
+    include_raw_file: bool = True
+    include_rendered_html: bool = True
+    include_rendered_pdf: bool = True
+    include_markdown: bool = True
 
 
 @router.post("/sources/upload-list", response_model=SourceListUploadResponse)
@@ -128,6 +150,26 @@ async def start_source_download(
     if source_status.get("state") == "running":
         raise HTTPException(status_code=409, detail="Source download is already running")
 
+    if not (payload.run_download or payload.run_llm_cleanup or payload.run_llm_summary):
+        raise HTTPException(status_code=400, detail="Select at least one phase to run")
+    if payload.run_download and not any(
+        [
+            payload.include_raw_file,
+            payload.include_rendered_html,
+            payload.include_rendered_pdf,
+            payload.include_markdown,
+        ]
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Select at least one download output type",
+        )
+    if not payload.run_download and store.load_artifact(job_id, "06_sources_manifest") is None:
+        raise HTTPException(
+            status_code=409,
+            detail="No existing output run found. Run download phase first.",
+        )
+
     raw_settings = store.load_settings()
     settings = AppSettings(**raw_settings) if raw_settings else AppSettings()
     jobs = request.app.state.source_download_jobs
@@ -140,6 +182,19 @@ async def start_source_download(
         use_llm=settings.use_llm,
         llm_backend=settings.llm_backend,
         research_purpose=settings.research_purpose,
+        fetch_delay=settings.fetch_delay,
+        run_download=payload.run_download,
+        run_llm_cleanup=payload.run_llm_cleanup,
+        run_llm_summary=payload.run_llm_summary,
+        force_redownload=payload.force_redownload,
+        force_llm_cleanup=payload.force_llm_cleanup,
+        force_summary=payload.force_summary,
+        output_options=SourceOutputOptions(
+            include_raw_file=payload.include_raw_file,
+            include_rendered_html=payload.include_rendered_html,
+            include_rendered_pdf=payload.include_rendered_pdf,
+            include_markdown=payload.include_markdown,
+        ),
     )
 
     with jobs_lock:
@@ -150,6 +205,23 @@ async def start_source_download(
     def _run_and_cleanup() -> None:
         try:
             orchestrator.run()
+            # Auto-merge into attached repository if available
+            try:
+                repo_service = request.app.state.repository_service
+                if repo_service.is_attached:
+                    result = repo_service.merge_job_results(job_id)
+                    if result.get("merged"):
+                        logger.info(
+                            "Auto-merged job %s into repository: %d new, %d updated, %d skipped",
+                            job_id,
+                            result.get("new_sources", 0),
+                            result.get("updated_sources", 0),
+                            result.get("skipped", 0),
+                        )
+            except Exception:
+                logger.warning(
+                    "Auto-merge into repository failed for job %s", job_id, exc_info=True
+                )
         finally:
             with jobs_lock:
                 current = jobs.get(job_id)
@@ -163,6 +235,9 @@ async def start_source_download(
         "job_id": job_id,
         "status": "started",
         "rerun_failed_only": payload.rerun_failed_only,
+        "run_download": payload.run_download,
+        "run_llm_cleanup": payload.run_llm_cleanup,
+        "run_llm_summary": payload.run_llm_summary,
     }
 
 
@@ -196,7 +271,57 @@ async def get_source_download_status(job_id: str, request: Request) -> dict:
 
     status = store.get_source_status(job_id)
     if status is None:
-        raise HTTPException(status_code=404, detail="Source download status not found")
+        artifact = store.load_artifact(job_id, "06_sources_manifest")
+        if artifact is None:
+            raise HTTPException(status_code=404, detail="Source download status not found")
+
+        rows: list[SourceManifestRow] = []
+        for raw_row in artifact.get("rows", []):
+            try:
+                rows.append(SourceManifestRow.model_validate(raw_row))
+            except Exception:
+                continue
+
+        output_summary = summarize_output_rows(rows)
+        success_count = int(artifact.get("success_count") or 0)
+        failed_count = int(artifact.get("failed_count") or 0)
+        partial_count = int(artifact.get("partial_count") or 0)
+        if (success_count + failed_count + partial_count) == 0 and rows:
+            success_count = sum(1 for row in rows if row.fetch_status == "success")
+            partial_count = sum(1 for row in rows if row.fetch_status == "partial")
+            failed_count = len(rows) - success_count - partial_count
+        item_rows = rows[:200]
+        items = [
+            SourceItemStatus(
+                id=row.id,
+                original_url=row.original_url,
+                citation_number=row.citation_number,
+                status="completed" if row.fetch_status != "failed" else "failed",
+                fetch_status=row.fetch_status,
+                llm_cleanup_status=row.llm_cleanup_status,
+                summary_status=row.summary_status,
+                error_message=row.error_message,
+            )
+            for row in item_rows
+        ]
+
+        synthesized = SourceDownloadStatus(
+            job_id=job_id,
+            state="completed",
+            total_urls=len(rows),
+            processed_urls=len(rows),
+            success_count=success_count,
+            failed_count=failed_count,
+            partial_count=partial_count,
+            message="Loaded existing output run",
+            output_dir="output_run",
+            manifest_csv="output_run/manifest.csv",
+            manifest_xlsx="output_run/manifest.xlsx",
+            bundle_file="output_run.zip",
+            output_summary=output_summary,
+            items=items,
+        )
+        return synthesized.model_dump(mode="json")
     return status
 
 

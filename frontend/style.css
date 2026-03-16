@@ -81,6 +81,40 @@ details.panel[open] summary::before {
 }
 .panel-body { padding: 16px; }
 
+/* Sub-panels (nested details inside a panel) */
+.sub-panel {
+    margin-top: 16px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg);
+}
+.sub-panel summary {
+    font-size: 0.9rem;
+    font-weight: 600;
+    padding: 10px 14px;
+    cursor: pointer;
+    list-style: none;
+}
+.sub-panel summary::before {
+    content: "\25B6";
+    display: inline-block;
+    margin-right: 8px;
+    font-size: 0.65rem;
+    transition: transform 0.2s;
+}
+.sub-panel[open] summary::before {
+    transform: rotate(90deg);
+}
+.sub-panel .panel-body {
+    padding: 12px 14px;
+}
+
+.radio-group {
+    display: flex;
+    gap: 16px;
+    margin-top: 4px;
+}
+
 /* Forms */
 .form-row {
     margin-bottom: 12px;
@@ -98,6 +132,10 @@ details.panel[open] summary::before {
     gap: 8px;
     font-size: 0.9rem !important;
     color: var(--text) !important;
+}
+.checkbox-label.compact {
+    margin-bottom: 6px;
+    font-size: 0.82rem !important;
 }
 input[type="text"],
 input[type="password"],
@@ -323,6 +361,45 @@ textarea { resize: vertical; }
     gap: 8px;
     flex-wrap: wrap;
     margin-bottom: 12px;
+}
+
+.source-task-controls {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+.source-task-group {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 10px;
+    background: #fcfcfc;
+}
+
+.source-task-title {
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: #6b7280;
+    font-weight: 600;
+    margin-bottom: 6px;
+}
+
+.fetch-delay-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 0.85rem;
+    color: #555;
+    margin-left: 8px;
+}
+.fetch-delay-input {
+    width: 60px;
+    padding: 4px 6px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-size: 0.85rem;
 }
 
 .sources-progress h3,

@@ -78,6 +78,87 @@ class RepositoryServiceTests(unittest.TestCase):
         self.assertEqual(status.total_sources, 1)
         self.assertEqual(status.next_source_id, 2)
 
+    def test_create_export_job_scope_all_creates_job_bibliography(self):
+        repo_dir = self.tmp_path / "repo_all"
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        self.service.attach(str(repo_dir))
+        self.service.import_source_list(
+            filename="sources.csv",
+            content=(
+                "URL\n"
+                "https://example.com/a\n"
+                "https://example.com/b\n"
+            ).encode("utf-8"),
+        )
+
+        result = self.service.create_export_job(scope="all")
+        self.assertEqual(result.scope, "all")
+        self.assertEqual(result.total_urls, 2)
+        self.assertTrue(result.job_id)
+
+        bib = self.store.load_artifact(result.job_id, "03_bibliography")
+        self.assertIsNotNone(bib)
+        urls = [entry.get("url") for entry in bib.get("entries", [])]
+        self.assertEqual(urls, ["https://example.com/a", "https://example.com/b"])
+
+    def test_create_export_job_scope_import_selects_only_that_import(self):
+        repo_dir = self.tmp_path / "repo_import"
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        self.service.attach(str(repo_dir))
+
+        first = self.service.import_source_list(
+            filename="sources.csv",
+            content=("URL\nhttps://example.com/a\n").encode("utf-8"),
+        )
+        second = self.service.import_source_list(
+            filename="sources2.csv",
+            content=("URL\nhttps://example.com/b\n").encode("utf-8"),
+        )
+        self.assertNotEqual(first.import_id, second.import_id)
+
+        result = self.service.create_export_job(scope="import", import_id=second.import_id)
+        self.assertEqual(result.scope, "import")
+        self.assertEqual(result.import_id, second.import_id)
+        self.assertEqual(result.total_urls, 1)
+
+        bib = self.store.load_artifact(result.job_id, "03_bibliography")
+        self.assertIsNotNone(bib)
+        urls = [entry.get("url") for entry in bib.get("entries", [])]
+        self.assertEqual(urls, ["https://example.com/b"])
+
+    def test_create_export_job_scope_import_rejects_unknown_import_id(self):
+        repo_dir = self.tmp_path / "repo_unknown_import"
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        self.service.attach(str(repo_dir))
+        self.service.import_source_list(
+            filename="sources.csv",
+            content=("URL\nhttps://example.com/a\n").encode("utf-8"),
+        )
+
+        with self.assertRaises(ValueError):
+            self.service.create_export_job(scope="import", import_id="does-not-exist")
+
+    def test_create_export_job_scope_import_empty_selection_raises_runtime_error(self):
+        repo_dir = self.tmp_path / "repo_empty_import"
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        self.service.attach(str(repo_dir))
+        self.service.import_source_list(
+            filename="sources.csv",
+            content=("URL\nhttps://example.com/a\n").encode("utf-8"),
+        )
+        duplicate_import = self.service.import_source_list(
+            filename="sources_dup.csv",
+            content=("URL\nhttps://example.com/a\n").encode("utf-8"),
+        )
+        self.assertEqual(duplicate_import.accepted_new, 0)
+
+        artifacts_dir = self.store.artifacts_dir
+        before = len(list(artifacts_dir.iterdir())) if artifacts_dir.exists() else 0
+        with self.assertRaises(RuntimeError):
+            self.service.create_export_job(scope="import", import_id=duplicate_import.import_id)
+        after = len(list(artifacts_dir.iterdir())) if artifacts_dir.exists() else 0
+        self.assertEqual(before, after)
+
 
 if __name__ == "__main__":
     unittest.main()

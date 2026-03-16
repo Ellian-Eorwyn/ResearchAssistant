@@ -21,6 +21,7 @@ class AppSettings(BaseModel):
     use_llm: bool = False
     research_purpose: str = ""
     repository_path: str = ""
+    fetch_delay: float = Field(default=2.0, ge=1.0, le=10.0)
 
 
 class ModelsResponse(BaseModel):

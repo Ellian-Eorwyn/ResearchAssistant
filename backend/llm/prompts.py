@@ -47,3 +47,19 @@ Source content:
 {source_markdown}
 
 Return exactly one paragraph with 3-4 sentences."""
+
+SOURCE_MARKDOWN_CLEANUP_SYSTEM = """You are cleaning extracted markdown from downloaded web/PDF sources.
+Preserve factual content and citations while improving readability.
+Do not add new claims, references, or interpretation."""
+
+SOURCE_MARKDOWN_CLEANUP_USER = """Research purpose (for context only):
+{research_purpose}
+
+Extracted markdown:
+{source_markdown}
+
+Decide whether markdown cleanup is needed.
+Respond in exactly this format:
+NEEDS_CLEANUP: yes|no
+CLEANED_MARKDOWN:
+<markdown text when NEEDS_CLEANUP is yes; otherwise leave empty>"""

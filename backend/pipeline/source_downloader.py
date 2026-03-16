@@ -28,11 +28,18 @@ from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 
 from backend.llm.client import UnifiedLLMClient
-from backend.llm.prompts import SOURCE_SUMMARY_SYSTEM, SOURCE_SUMMARY_USER
+from backend.llm.prompts import (
+    SOURCE_MARKDOWN_CLEANUP_SYSTEM,
+    SOURCE_MARKDOWN_CLEANUP_USER,
+    SOURCE_SUMMARY_SYSTEM,
+    SOURCE_SUMMARY_USER,
+)
 from backend.models.settings import LLMBackendConfig
 from backend.models.sources import (
     SOURCE_MANIFEST_COLUMNS,
     SourceDownloadStatus,
+    SourceOutputOptions,
+    SourceOutputSummary,
     SourceItemStatus,
     SourceManifestArtifact,
     SourceManifestRow,
@@ -56,6 +63,7 @@ PLAYWRIGHT_VIEWPORT_HEIGHT = 1200
 MAX_VISUAL_CAPTURE_SEGMENTS = 40
 MIN_MARKDOWN_SCORE = 180
 MIN_FALLBACK_MARKDOWN_SCORE = 20
+MAX_CLEANUP_SOURCE_CHARS = 24000
 MAX_SUMMARY_SOURCE_CHARS = 20000
 
 NOTE_RUNTIME_MISSING_TRAFILATURA = "runtime_missing_trafilatura"
@@ -68,6 +76,8 @@ NOTE_EXTRACTION_FAILURE = "extraction_failure"
 NOTE_OCR_LOCAL_USED = "ocr_local_used"
 NOTE_OCR_LLM_FALLBACK_USED = "ocr_llm_fallback_used"
 NOTE_DOC_CONVERSION_FAILED = "doc_conversion_failed"
+NOTE_LLM_CLEANUP_FAILED = "llm_cleanup_failed"
+NOTE_LLM_CLEANUP_SKIPPED_LLM_NOT_CONFIGURED = "llm_cleanup_skipped_llm_not_configured"
 NOTE_SUMMARY_GENERATION_FAILED = "summary_generation_failed"
 NOTE_SUMMARY_SKIPPED_LLM_NOT_CONFIGURED = "summary_skipped_llm_not_configured"
 NOTE_VISUAL_CAPTURE_FAILED = "visual_capture_failed"
@@ -337,6 +347,14 @@ class SourceDownloadOrchestrator:
         use_llm: bool = False,
         llm_backend: LLMBackendConfig | None = None,
         research_purpose: str = "",
+        fetch_delay: float = 2.0,
+        run_download: bool = True,
+        run_llm_cleanup: bool = False,
+        run_llm_summary: bool = True,
+        force_redownload: bool = False,
+        force_llm_cleanup: bool = False,
+        force_summary: bool = False,
+        output_options: SourceOutputOptions | None = None,
     ):
         self.job_id = job_id
         self.store = store
@@ -344,6 +362,14 @@ class SourceDownloadOrchestrator:
         self.use_llm = use_llm
         self.llm_backend = llm_backend or LLMBackendConfig()
         self.research_purpose = (research_purpose or "").strip()
+        self.fetch_delay = max(1.0, min(10.0, fetch_delay))
+        self.run_download = bool(run_download)
+        self.run_llm_cleanup = bool(run_llm_cleanup)
+        self.run_llm_summary = bool(run_llm_summary)
+        self.force_redownload = bool(force_redownload)
+        self.force_llm_cleanup = bool(force_llm_cleanup)
+        self.force_summary = bool(force_summary)
+        self.output_options = output_options or SourceOutputOptions()
         self.output_dir = self.store.get_sources_output_dir(job_id)
         self.logs_dir = self.output_dir / "logs"
         self.log_file = self.logs_dir / "source_download.jsonl"
@@ -368,21 +394,48 @@ class SourceDownloadOrchestrator:
     def run(self) -> None:
         """Execute source downloads sequentially with per-URL fault isolation."""
         try:
+            if not (self.run_download or self.run_llm_cleanup or self.run_llm_summary):
+                raise RuntimeError("Select at least one phase to run")
+            if self.run_download and not any(
+                [
+                    self.output_options.include_raw_file,
+                    self.output_options.include_rendered_html,
+                    self.output_options.include_rendered_pdf,
+                    self.output_options.include_markdown,
+                ]
+            ):
+                raise RuntimeError("Select at least one download output type")
+
             targets = self._build_targets()
             previous_rows = self._load_previous_rows()
+            if not self.run_download and not previous_rows:
+                raise RuntimeError(
+                    "No existing downloaded sources found. Run download phase first."
+                )
             rows_by_id = {r.id: r for r in previous_rows}
             self._ensure_output_dirs()
             self.runtime_capabilities = detect_runtime_capabilities(
                 use_llm=self.use_llm,
                 llm_backend=self.llm_backend,
             )
-            self._initialize_status(targets, self.runtime_capabilities)
+            self._initialize_status(
+                targets=targets,
+                runtime_capabilities=self.runtime_capabilities,
+                existing_rows=previous_rows,
+            )
             self._append_log(
                 {
                     "event": "started",
                     "job_id": self.job_id,
                     "total_urls": len(targets),
                     "rerun_failed_only": self.rerun_failed_only,
+                    "run_download": self.run_download,
+                    "run_llm_cleanup": self.run_llm_cleanup,
+                    "run_llm_summary": self.run_llm_summary,
+                    "force_redownload": self.force_redownload,
+                    "force_llm_cleanup": self.force_llm_cleanup,
+                    "force_summary": self.force_summary,
+                    "output_options": self.output_options.model_dump(mode="json"),
                     "runtime_notes": self.runtime_capabilities.runtime_notes,
                     "runtime_guidance": self.runtime_capabilities.runtime_guidance,
                     "timestamp": _utc_now_iso(),
@@ -411,20 +464,56 @@ class SourceDownloadOrchestrator:
                         "Accept": "*/*",
                     },
                 ) as client:
-                    for target in targets:
+                    last_idx = len(targets) - 1
+                    for idx, target in enumerate(targets):
                         if self._cancel_event.is_set():
                             cancelled = True
                             break
+                        existing_row = rows_by_id.get(target.id)
+
                         if self.rerun_failed_only and self._should_skip_successful_target(
                             target, rows_by_id
                         ):
-                            self._mark_item_skipped(target.id)
+                            if self._should_run_llm_postprocess(existing_row):
+                                self._mark_item_running(target)
+                                row = self._process_existing_row(target, existing_row)
+                                rows_by_id[row.id] = row
+                                self._mark_item_finished(row)
+                            else:
+                                self._mark_item_skipped(target.id, existing_row)
                             continue
 
-                        self._mark_item_running(target)
-                        row = self._process_target(target, client, renderer)
-                        rows_by_id[row.id] = row
-                        self._mark_item_finished(row)
+                        if self.run_download:
+                            if self._should_skip_download_target(existing_row):
+                                if self._should_run_llm_postprocess(existing_row):
+                                    self._mark_item_running(target)
+                                    row = self._process_existing_row(target, existing_row)
+                                    rows_by_id[row.id] = row
+                                    self._mark_item_finished(row)
+                                else:
+                                    self._mark_item_skipped(target.id, existing_row)
+                                continue
+
+                            self._mark_item_running(target)
+                            row = self._process_target(
+                                target=target,
+                                client=client,
+                                renderer=renderer,
+                                existing_row=existing_row,
+                            )
+                            rows_by_id[row.id] = row
+                            self._mark_item_finished(row)
+                        else:
+                            if existing_row is None:
+                                self._mark_item_skipped(target.id, existing_row)
+                                continue
+                            self._mark_item_running(target)
+                            row = self._process_existing_row(target, existing_row)
+                            rows_by_id[row.id] = row
+                            self._mark_item_finished(row)
+
+                        if idx < last_idx and not self._cancel_event.is_set():
+                            self._cancel_event.wait(self.fetch_delay)
             finally:
                 renderer.close()
 
@@ -437,6 +526,7 @@ class SourceDownloadOrchestrator:
                 failed_count=counts["failed"],
                 partial_count=counts["partial"],
             )
+            output_summary = summarize_output_rows(final_rows)
 
             csv_content = build_manifest_csv(final_rows)
             xlsx_bytes = build_manifest_xlsx(final_rows)
@@ -448,7 +538,7 @@ class SourceDownloadOrchestrator:
             bundle_path = self.store.build_sources_bundle(self.job_id)
 
             if cancelled:
-                self._mark_status_cancelled(artifact, bundle_path)
+                self._mark_status_cancelled(artifact, bundle_path, output_summary)
                 self._append_log(
                     {
                         "event": "cancelled",
@@ -457,12 +547,13 @@ class SourceDownloadOrchestrator:
                         "success_count": artifact.success_count,
                         "failed_count": artifact.failed_count,
                         "partial_count": artifact.partial_count,
+                        "output_summary": output_summary.model_dump(mode="json"),
                         "bundle_file": str(bundle_path),
                         "timestamp": _utc_now_iso(),
                     }
                 )
             else:
-                self._mark_status_completed(artifact, bundle_path)
+                self._mark_status_completed(artifact, bundle_path, output_summary)
                 self._append_log(
                     {
                         "event": "completed",
@@ -471,6 +562,7 @@ class SourceDownloadOrchestrator:
                         "success_count": artifact.success_count,
                         "failed_count": artifact.failed_count,
                         "partial_count": artifact.partial_count,
+                        "output_summary": output_summary.model_dump(mode="json"),
                         "bundle_file": str(bundle_path),
                         "timestamp": _utc_now_iso(),
                     }
@@ -550,6 +642,7 @@ class SourceDownloadOrchestrator:
         self,
         targets: list[SourceTarget],
         runtime_capabilities: RuntimeCapabilities,
+        existing_rows: list[SourceManifestRow],
     ) -> None:
         items = [
             SourceItemStatus(
@@ -559,7 +652,15 @@ class SourceDownloadOrchestrator:
             )
             for t in targets
         ]
-        base_message = self._compose_status_message("Downloading source URLs")
+        phase_bits: list[str] = []
+        if self.run_download:
+            phase_bits.append("download")
+        if self.run_llm_cleanup:
+            phase_bits.append("llm cleanup")
+        if self.run_llm_summary:
+            phase_bits.append("summary")
+        phase_text = ", ".join(phase_bits) if phase_bits else "none"
+        base_message = self._compose_status_message(f"Running phases: {phase_text}")
         self._status_items = {i.id: i for i in items}
         self.status = SourceDownloadStatus(
             job_id=self.job_id,
@@ -579,6 +680,14 @@ class SourceDownloadOrchestrator:
             runtime_notes=runtime_capabilities.runtime_notes,
             runtime_guidance=runtime_capabilities.runtime_guidance,
             rerun_failed_only=self.rerun_failed_only,
+            run_download=self.run_download,
+            run_llm_cleanup=self.run_llm_cleanup,
+            run_llm_summary=self.run_llm_summary,
+            force_redownload=self.force_redownload,
+            force_llm_cleanup=self.force_llm_cleanup,
+            force_summary=self.force_summary,
+            output_options=self.output_options,
+            output_summary=summarize_output_rows(existing_rows),
             output_dir="output_run",
             manifest_csv="output_run/manifest.csv",
             manifest_xlsx="output_run/manifest.xlsx",
@@ -619,20 +728,84 @@ class SourceDownloadOrchestrator:
         previous = rows_by_id.get(target.id)
         return bool(previous and previous.fetch_status == "success")
 
-    def _mark_item_skipped(self, item_id: str) -> None:
+    def _should_skip_download_target(self, existing_row: SourceManifestRow | None) -> bool:
+        if not self.run_download:
+            return True
+        if existing_row is None:
+            return False
+        if self.force_redownload:
+            return False
+        if existing_row.fetch_status == "failed":
+            return False
+        if existing_row.fetch_status in {"", "queued"}:
+            return False
+
+        checks: list[bool] = []
+        if self.output_options.include_raw_file:
+            checks.append(bool(existing_row.raw_file))
+        if self.output_options.include_rendered_html:
+            checks.append(bool(existing_row.rendered_file))
+        if self.output_options.include_rendered_pdf:
+            checks.append(bool(existing_row.rendered_pdf_file))
+        if self.output_options.include_markdown:
+            checks.append(bool(existing_row.markdown_file))
+
+        if not checks:
+            return True
+        return all(checks)
+
+    def _should_run_llm_postprocess(self, existing_row: SourceManifestRow | None) -> bool:
+        if existing_row is None:
+            return False
+        return self.run_llm_cleanup or self.run_llm_summary
+
+    def _process_existing_row(
+        self,
+        target: SourceTarget,
+        existing_row: SourceManifestRow,
+    ) -> SourceManifestRow:
+        row = existing_row.model_copy(deep=True)
+        row.id = target.id
+        row.source_document_name = target.source_document_name or row.source_document_name
+        row.citation_number = target.citation_number or row.citation_number
+        row.original_url = target.original_url or row.original_url
+        notes = parse_notes(row.notes)
+        event: dict = {
+            "event": "source_postprocess",
+            "job_id": self.job_id,
+            "id": row.id,
+            "original_url": row.original_url,
+            "started_at": _utc_now_iso(),
+        }
+        return self._finalize_row(
+            row=row,
+            notes=notes,
+            event=event,
+            update_fetched_at=False,
+        )
+
+    def _mark_item_skipped(
+        self,
+        item_id: str,
+        existing_row: SourceManifestRow | None,
+    ) -> None:
         if not self.status:
             return
         item = self._status_items.get(item_id)
         if item:
             item.status = "skipped"
-            item.fetch_status = "success"
+            item.fetch_status = existing_row.fetch_status if existing_row else "skipped"
+            item.llm_cleanup_status = (
+                existing_row.llm_cleanup_status if existing_row else item.llm_cleanup_status
+            )
+            item.summary_status = (
+                existing_row.summary_status if existing_row else item.summary_status
+            )
         self.status.skipped_count += 1
         self.status.processed_urls += 1
         self.status.current_item_id = item_id
         self.status.current_url = item.original_url if item else ""
-        self.status.message = self._compose_status_message(
-            "Reused previously successful downloads"
-        )
+        self.status.message = self._compose_status_message("Skipped (already complete)")
         self._save_status()
 
     def _mark_item_running(self, target: SourceTarget) -> None:
@@ -653,8 +826,13 @@ class SourceDownloadOrchestrator:
         item = self._status_items.get(row.id)
         if item:
             item.fetch_status = row.fetch_status
+            item.llm_cleanup_status = row.llm_cleanup_status
+            item.summary_status = row.summary_status
             item.error_message = row.error_message
-            item.status = "failed" if row.fetch_status == "failed" else "completed"
+            if self.run_download and row.fetch_status == "failed":
+                item.status = "failed"
+            else:
+                item.status = "completed"
 
         self.status.processed_urls += 1
         if row.fetch_status == "success":
@@ -688,6 +866,7 @@ class SourceDownloadOrchestrator:
         self,
         artifact: SourceManifestArtifact,
         bundle_path: Path,
+        output_summary: SourceOutputSummary,
     ) -> None:
         if not self.status:
             return
@@ -704,12 +883,14 @@ class SourceDownloadOrchestrator:
             f"{artifact.partial_count} partial, {artifact.failed_count} failed"
         )
         self.status.bundle_file = bundle_path.name
+        self.status.output_summary = output_summary
         self._save_status()
 
     def _mark_status_cancelled(
         self,
         artifact: SourceManifestArtifact,
         bundle_path: Path,
+        output_summary: SourceOutputSummary,
     ) -> None:
         if not self.status:
             return
@@ -732,6 +913,7 @@ class SourceDownloadOrchestrator:
         self.status.message = self._compose_status_message(
             f"Cancelled after {self.status.processed_urls}/{self.status.total_urls} URLs"
         )
+        self.status.output_summary = output_summary
         self._save_status()
 
     def _process_target(
@@ -739,14 +921,22 @@ class SourceDownloadOrchestrator:
         target: SourceTarget,
         client: httpx.Client,
         renderer: PlaywrightRenderer,
+        existing_row: SourceManifestRow | None = None,
     ) -> SourceManifestRow:
-        row = SourceManifestRow(
-            id=target.id,
-            source_document_name=target.source_document_name,
-            citation_number=target.citation_number,
-            original_url=target.original_url,
-        )
-        notes: list[str] = []
+        if existing_row is not None:
+            row = existing_row.model_copy(deep=True)
+            row.id = target.id
+            row.source_document_name = target.source_document_name or row.source_document_name
+            row.citation_number = target.citation_number or row.citation_number
+            row.original_url = target.original_url
+        else:
+            row = SourceManifestRow(
+                id=target.id,
+                source_document_name=target.source_document_name,
+                citation_number=target.citation_number,
+                original_url=target.original_url,
+            )
+        notes: list[str] = parse_notes(row.notes)
         event: dict = {
             "event": "source_processed",
             "job_id": self.job_id,
@@ -786,6 +976,7 @@ class SourceDownloadOrchestrator:
             body=response.content,
         )
         row.fetch_method = "http"
+        row.error_message = ""
 
         if row.detected_type == "pdf":
             self._handle_pdf_response(row, response, notes)
@@ -804,9 +995,10 @@ class SourceDownloadOrchestrator:
         response: httpx.Response,
         notes: list[str],
     ) -> None:
-        rel_path = Path("originals") / f"{row.id}_source.pdf"
-        row.raw_file = rel_path.as_posix()
-        self._write_binary(rel_path, response.content)
+        if self.output_options.include_raw_file:
+            rel_path = Path("originals") / f"{row.id}_source.pdf"
+            row.raw_file = rel_path.as_posix()
+            self._write_binary(rel_path, response.content)
         row.sha256 = hashlib.sha256(response.content).hexdigest()
         if response.status_code >= 400:
             row.fetch_status = "failed"
@@ -814,6 +1006,10 @@ class SourceDownloadOrchestrator:
             notes.append(reason)
             row.error_message = f"{reason}: http_status_{response.status_code}"
         else:
+            if not self.output_options.include_markdown:
+                row.fetch_status = "success"
+                return
+
             markdown_text, extraction_method, conversion_notes = self._convert_pdf_to_markdown(
                 response.content
             )
@@ -841,24 +1037,27 @@ class SourceDownloadOrchestrator:
     ) -> None:
         raw_html = decode_html(response)
         if raw_html:
-            raw_rel = Path("originals") / f"{row.id}_source.html"
-            self._write_text(raw_rel, raw_html)
-            row.raw_file = raw_rel.as_posix()
+            if self.output_options.include_raw_file:
+                raw_rel = Path("originals") / f"{row.id}_source.html"
+                self._write_text(raw_rel, raw_html)
+                row.raw_file = raw_rel.as_posix()
             row.sha256 = hashlib.sha256(raw_html.encode("utf-8")).hexdigest()
             row.title = extract_title(raw_html)
             row.canonical_url = extract_canonical_url(raw_html)
 
-        rendered_pdf, rendered_pdf_error, rendered_pdf_notes = renderer.capture_visual_pdf(
-            normalized_url
-        )
-        notes.extend(rendered_pdf_notes)
-        if rendered_pdf:
-            rendered_pdf_rel = Path("rendered") / f"{row.id}_rendered.pdf"
-            self._write_binary(rendered_pdf_rel, rendered_pdf)
-            row.rendered_pdf_file = rendered_pdf_rel.as_posix()
-        elif rendered_pdf_error:
-            notes.append(NOTE_VISUAL_CAPTURE_FAILED)
-            notes.append(normalize_render_error_note(rendered_pdf_error))
+        if self.output_options.include_rendered_pdf:
+            self._cancel_event.wait(self.fetch_delay)
+            rendered_pdf, rendered_pdf_error, rendered_pdf_notes = renderer.capture_visual_pdf(
+                normalized_url
+            )
+            notes.extend(rendered_pdf_notes)
+            if rendered_pdf:
+                rendered_pdf_rel = Path("rendered") / f"{row.id}_rendered.pdf"
+                self._write_binary(rendered_pdf_rel, rendered_pdf)
+                row.rendered_pdf_file = rendered_pdf_rel.as_posix()
+            elif rendered_pdf_error:
+                notes.append(NOTE_VISUAL_CAPTURE_FAILED)
+                notes.append(normalize_render_error_note(rendered_pdf_error))
 
         blocked_by_challenge = detect_blocked_page(
             html_text=raw_html,
@@ -866,62 +1065,72 @@ class SourceDownloadOrchestrator:
             final_url=row.final_url,
         )
 
-        raw_markdown, raw_used_fallback, raw_notes = extract_markdown_with_fallback(
-            raw_html,
-            self.runtime_capabilities,
-        )
-        notes.extend(raw_notes)
-        raw_score = markdown_score(raw_markdown)
+        raw_markdown = ""
+        raw_used_fallback = False
+        raw_score = 0
+        if self.output_options.include_markdown:
+            raw_markdown, raw_used_fallback, raw_notes = extract_markdown_with_fallback(
+                raw_html,
+                self.runtime_capabilities,
+            )
+            notes.extend(raw_notes)
+            raw_score = markdown_score(raw_markdown)
 
         rendered_html = ""
         rendered_markdown = ""
         rendered_used_fallback = False
         rendered_score = 0
 
-        should_render = (
-            (response.status_code >= 400 or raw_score < MIN_MARKDOWN_SCORE)
-            and not blocked_by_challenge
-        )
+        should_render = False
+        if not blocked_by_challenge:
+            should_render = self.output_options.include_rendered_html or (
+                self.output_options.include_markdown
+                and (response.status_code >= 400 or raw_score < MIN_MARKDOWN_SCORE)
+            )
         if should_render:
+            self._cancel_event.wait(self.fetch_delay)
             rendered_html, render_error = renderer.render(normalized_url)
             if render_error:
                 notes.append(normalize_render_error_note(render_error))
             elif rendered_html:
-                rendered_rel = Path("rendered") / f"{row.id}_rendered.html"
-                self._write_text(rendered_rel, rendered_html)
-                row.rendered_file = rendered_rel.as_posix()
+                if self.output_options.include_rendered_html:
+                    rendered_rel = Path("rendered") / f"{row.id}_rendered.html"
+                    self._write_text(rendered_rel, rendered_html)
+                    row.rendered_file = rendered_rel.as_posix()
 
                 if not row.title:
                     row.title = extract_title(rendered_html)
                 if not row.canonical_url:
                     row.canonical_url = extract_canonical_url(rendered_html)
 
-                rendered_markdown, rendered_used_fallback, rendered_notes = (
-                    extract_markdown_with_fallback(
-                        rendered_html,
-                        self.runtime_capabilities,
+                if self.output_options.include_markdown:
+                    rendered_markdown, rendered_used_fallback, rendered_notes = (
+                        extract_markdown_with_fallback(
+                            rendered_html,
+                            self.runtime_capabilities,
+                        )
                     )
+                    notes.extend(rendered_notes)
+                    rendered_score = markdown_score(rendered_markdown)
+
+        if self.output_options.include_markdown:
+            markdown_to_write = raw_markdown
+            used_fallback = raw_used_fallback
+            extraction_method = "raw_html" if raw_markdown else ""
+            if rendered_score > raw_score:
+                markdown_to_write = rendered_markdown
+                used_fallback = rendered_used_fallback
+                extraction_method = "rendered_html"
+                row.fetch_method = "playwright"
+
+            if markdown_to_write:
+                markdown_rel = Path("markdown") / f"{row.id}_clean.md"
+                self._write_text(markdown_rel, markdown_to_write)
+                row.markdown_file = markdown_rel.as_posix()
+                row.markdown_char_count = len(markdown_to_write)
+                row.extraction_method = (
+                    f"{extraction_method}_fallback" if used_fallback else extraction_method
                 )
-                notes.extend(rendered_notes)
-                rendered_score = markdown_score(rendered_markdown)
-
-        markdown_to_write = raw_markdown
-        used_fallback = raw_used_fallback
-        extraction_method = "raw_html" if raw_markdown else ""
-        if rendered_score > raw_score:
-            markdown_to_write = rendered_markdown
-            used_fallback = rendered_used_fallback
-            extraction_method = "rendered_html"
-            row.fetch_method = "playwright"
-
-        if markdown_to_write:
-            markdown_rel = Path("markdown") / f"{row.id}_clean.md"
-            self._write_text(markdown_rel, markdown_to_write)
-            row.markdown_file = markdown_rel.as_posix()
-            row.markdown_char_count = len(markdown_to_write)
-            row.extraction_method = (
-                f"{extraction_method}_fallback" if used_fallback else extraction_method
-            )
 
         if blocked_by_challenge:
             notes.append(NOTE_BLOCKED_REQUEST)
@@ -934,6 +1143,10 @@ class SourceDownloadOrchestrator:
             notes.append(reason)
             row.fetch_status = "failed"
             row.error_message = f"{reason}: http_status_{response.status_code}"
+            return
+
+        if not self.output_options.include_markdown:
+            row.fetch_status = "success"
             return
 
         if row.markdown_file:
@@ -960,9 +1173,10 @@ class SourceDownloadOrchestrator:
             content_type=row.content_type,
             content_disposition=response.headers.get("content-disposition", ""),
         )
-        rel_path = Path("originals") / f"{row.id}_source{extension}"
-        row.raw_file = rel_path.as_posix()
-        self._write_binary(rel_path, response.content)
+        if self.output_options.include_raw_file:
+            rel_path = Path("originals") / f"{row.id}_source{extension}"
+            row.raw_file = rel_path.as_posix()
+            self._write_binary(rel_path, response.content)
         row.sha256 = hashlib.sha256(response.content).hexdigest()
 
         if response.status_code >= 400:
@@ -973,6 +1187,10 @@ class SourceDownloadOrchestrator:
             return
 
         notes.append("download_only")
+        if not self.output_options.include_markdown:
+            row.fetch_status = "success"
+            return
+
         markdown_text, extraction_method, conversion_notes = self._convert_document_to_markdown(
             extension=extension,
             binary_content=response.content,
@@ -1003,9 +1221,10 @@ class SourceDownloadOrchestrator:
         response: httpx.Response,
         notes: list[str],
     ) -> None:
-        rel_path = Path("originals") / f"{row.id}_source.bin"
-        self._write_binary(rel_path, response.content)
-        row.raw_file = rel_path.as_posix()
+        if self.output_options.include_raw_file:
+            rel_path = Path("originals") / f"{row.id}_source.bin"
+            self._write_binary(rel_path, response.content)
+            row.raw_file = rel_path.as_posix()
         row.sha256 = hashlib.sha256(response.content).hexdigest()
         row.fetch_status = "failed"
         notes.append("unsupported_content")
@@ -1018,8 +1237,12 @@ class SourceDownloadOrchestrator:
         row: SourceManifestRow,
         notes: list[str],
         event: dict,
+        update_fetched_at: bool = True,
     ) -> SourceManifestRow:
-        row.fetched_at = _utc_now_iso()
+        if update_fetched_at or not row.fetched_at:
+            row.fetched_at = _utc_now_iso()
+
+        self._generate_markdown_cleanup(row, notes)
         self._generate_source_summary(row, notes)
         row.notes = "; ".join(dict.fromkeys(n for n in notes if n))
         metadata_rel = Path("metadata") / f"{row.id}.json"
@@ -1041,6 +1264,7 @@ class SourceDownloadOrchestrator:
                 "rendered_file": row.rendered_file,
                 "rendered_pdf_file": row.rendered_pdf_file,
                 "markdown_file": row.markdown_file,
+                "llm_cleanup_file": row.llm_cleanup_file,
                 "summary_file": row.summary_file,
                 "metadata_file": row.metadata_file,
             },
@@ -1050,6 +1274,9 @@ class SourceDownloadOrchestrator:
             "canonical_url": row.canonical_url,
             "extraction_method": row.extraction_method,
             "markdown_char_count": row.markdown_char_count,
+            "llm_cleanup_needed": row.llm_cleanup_needed,
+            "llm_cleanup_status": row.llm_cleanup_status,
+            "summary_status": row.summary_status,
         }
         self._write_text(
             metadata_rel,
@@ -1057,25 +1284,128 @@ class SourceDownloadOrchestrator:
         )
 
         event.update(metadata_payload)
-        event["completed_at"] = row.fetched_at
+        event["completed_at"] = _utc_now_iso()
         self._append_log(event)
         return row
+
+    def _generate_markdown_cleanup(
+        self,
+        row: SourceManifestRow,
+        notes: list[str],
+    ) -> None:
+        if not self.run_llm_cleanup:
+            if row.llm_cleanup_file and _has_output_file(self.output_dir, row.llm_cleanup_file):
+                row.llm_cleanup_status = row.llm_cleanup_status or "existing"
+            elif not row.llm_cleanup_status:
+                row.llm_cleanup_status = "not_requested"
+            return
+
+        if not row.markdown_file:
+            row.llm_cleanup_status = "missing_markdown"
+            row.llm_cleanup_needed = False
+            return
+        if not self.use_llm:
+            row.llm_cleanup_status = "skipped_llm_disabled"
+            row.llm_cleanup_needed = False
+            return
+        if not llm_backend_ready_for_chat(self.llm_backend):
+            row.llm_cleanup_status = "skipped_llm_not_configured"
+            row.llm_cleanup_needed = False
+            notes.append(NOTE_LLM_CLEANUP_SKIPPED_LLM_NOT_CONFIGURED)
+            return
+
+        if (
+            row.llm_cleanup_file
+            and not self.force_llm_cleanup
+            and _has_output_file(self.output_dir, row.llm_cleanup_file)
+        ):
+            row.llm_cleanup_status = row.llm_cleanup_status or "existing"
+            return
+
+        markdown_text = self._read_text(Path(row.markdown_file))
+        if not markdown_text.strip():
+            row.llm_cleanup_status = "missing_markdown"
+            row.llm_cleanup_needed = False
+            return
+
+        source_text = markdown_text.strip()
+        if len(source_text) > MAX_CLEANUP_SOURCE_CHARS:
+            source_text = source_text[:MAX_CLEANUP_SOURCE_CHARS]
+
+        research_purpose = self.research_purpose or (
+            "No explicit research purpose was provided. Preserve factual content and clarity."
+        )
+        user_prompt = SOURCE_MARKDOWN_CLEANUP_USER.format(
+            research_purpose=research_purpose,
+            source_markdown=source_text,
+        )
+
+        try:
+            cleanup_response = run_async_in_sync(
+                self._run_llm_cleanup_completion,
+                system_prompt=SOURCE_MARKDOWN_CLEANUP_SYSTEM,
+                user_prompt=user_prompt,
+            ).strip()
+            needs_cleanup, cleaned_markdown = parse_cleanup_response(cleanup_response)
+            row.llm_cleanup_needed = needs_cleanup
+
+            if needs_cleanup:
+                normalized = normalize_cleaned_markdown(cleaned_markdown)
+                if not normalized:
+                    row.llm_cleanup_status = "failed"
+                    notes.append(NOTE_LLM_CLEANUP_FAILED)
+                    return
+                cleanup_rel = Path("markdown") / f"{row.id}_llm_clean.md"
+                self._write_text(cleanup_rel, normalized)
+                row.llm_cleanup_file = cleanup_rel.as_posix()
+                row.llm_cleanup_status = "cleaned"
+            else:
+                row.llm_cleanup_status = "not_needed"
+        except Exception as exc:
+            row.llm_cleanup_status = "failed"
+            row.llm_cleanup_needed = False
+            notes.append(NOTE_LLM_CLEANUP_FAILED)
+            logger.warning("Markdown cleanup failed for %s: %s", row.id, exc)
 
     def _generate_source_summary(
         self,
         row: SourceManifestRow,
         notes: list[str],
     ) -> None:
-        if not row.markdown_file:
-            return
-        if not self.use_llm:
-            return
-        if not llm_backend_ready_for_chat(self.llm_backend):
-            notes.append(NOTE_SUMMARY_SKIPPED_LLM_NOT_CONFIGURED)
+        if not self.run_llm_summary:
+            if row.summary_file and _has_output_file(self.output_dir, row.summary_file):
+                row.summary_status = row.summary_status or "existing"
+            elif not row.summary_status:
+                row.summary_status = "not_requested"
             return
 
-        markdown_text = self._read_text(Path(row.markdown_file))
+        summary_source_path = ""
+        if row.llm_cleanup_file and _has_output_file(self.output_dir, row.llm_cleanup_file):
+            summary_source_path = row.llm_cleanup_file
+        elif row.markdown_file:
+            summary_source_path = row.markdown_file
+
+        if not summary_source_path:
+            row.summary_status = "missing_markdown"
+            return
+        if not self.use_llm:
+            row.summary_status = "skipped_llm_disabled"
+            return
+        if not llm_backend_ready_for_chat(self.llm_backend):
+            row.summary_status = "skipped_llm_not_configured"
+            notes.append(NOTE_SUMMARY_SKIPPED_LLM_NOT_CONFIGURED)
+            return
+        if (
+            row.summary_file
+            and not self.force_summary
+            and _has_output_file(self.output_dir, row.summary_file)
+        ):
+            row.summary_status = "existing"
+            return
+
+        markdown_text = self._read_text(Path(summary_source_path))
         if not markdown_text.strip():
+            row.summary_status = "missing_markdown"
             return
 
         source_text = markdown_text.strip()
@@ -1100,14 +1430,32 @@ class SourceDownloadOrchestrator:
             summary = normalize_summary_paragraph(summary)
             if not summary:
                 notes.append(NOTE_SUMMARY_GENERATION_FAILED)
+                row.summary_status = "failed"
                 return
 
             summary_rel = Path("summaries") / f"{row.id}_summary.md"
             self._write_text(summary_rel, summary + "\n")
             row.summary_file = summary_rel.as_posix()
+            row.summary_status = "generated"
         except Exception as exc:
             notes.append(NOTE_SUMMARY_GENERATION_FAILED)
+            row.summary_status = "failed"
             logger.warning("Summary generation failed for %s: %s", row.id, exc)
+
+    async def _run_llm_cleanup_completion(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> str:
+        client = UnifiedLLMClient(self.llm_backend)
+        try:
+            return await client.chat_completion(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                response_format=None,
+            )
+        finally:
+            await client.close()
 
     async def _run_llm_summary(
         self,
@@ -1282,6 +1630,7 @@ def build_manifest_xlsx(rows: list[SourceManifestRow]) -> bytes:
         "rendered_file",
         "rendered_pdf_file",
         "markdown_file",
+        "llm_cleanup_file",
         "summary_file",
         "metadata_file",
     }
@@ -1309,9 +1658,9 @@ def build_manifest_xlsx(rows: list[SourceManifestRow]) -> bytes:
     return stream.getvalue()
 
 
-def _serialize_manifest_row(row: SourceManifestRow) -> dict[str, str | int]:
+def _serialize_manifest_row(row: SourceManifestRow) -> dict[str, str | int | bool]:
     data = row.model_dump()
-    serialized: dict[str, str | int] = {}
+    serialized: dict[str, str | int | bool] = {}
     for column in SOURCE_MANIFEST_COLUMNS:
         value = data.get(column)
         if value is None:
@@ -1331,6 +1680,51 @@ def _count_fetch_outcomes(rows: list[SourceManifestRow]) -> dict[str, int]:
         else:
             counts["failed"] += 1
     return counts
+
+
+def summarize_output_rows(rows: list[SourceManifestRow]) -> SourceOutputSummary:
+    markdown_ready = 0
+    summary_missing = 0
+    summary_failed = 0
+    llm_cleanup_failed = 0
+
+    for row in rows:
+        if row.markdown_file or row.llm_cleanup_file:
+            markdown_ready += 1
+        if (row.summary_status or "").strip().lower() == "failed":
+            summary_failed += 1
+        if (row.llm_cleanup_status or "").strip().lower() == "failed":
+            llm_cleanup_failed += 1
+
+        has_summary = bool(row.summary_file)
+        if (row.markdown_file or row.llm_cleanup_file) and not has_summary:
+            summary_missing += 1
+
+    return SourceOutputSummary(
+        total_rows=len(rows),
+        raw_file_count=sum(1 for row in rows if row.raw_file),
+        rendered_html_count=sum(1 for row in rows if row.rendered_file),
+        rendered_pdf_count=sum(1 for row in rows if row.rendered_pdf_file),
+        markdown_count=sum(1 for row in rows if row.markdown_file),
+        llm_cleanup_file_count=sum(1 for row in rows if row.llm_cleanup_file),
+        llm_cleanup_needed_count=sum(1 for row in rows if row.llm_cleanup_needed),
+        llm_cleanup_failed_count=llm_cleanup_failed,
+        summary_file_count=sum(1 for row in rows if row.summary_file),
+        summary_missing_count=summary_missing,
+        summary_failed_count=summary_failed,
+    )
+
+
+def parse_notes(value: str) -> list[str]:
+    if not value:
+        return []
+    return [part.strip() for part in value.split(";") if part.strip()]
+
+
+def _has_output_file(output_dir: Path, rel_path: str) -> bool:
+    if not rel_path:
+        return False
+    return (output_dir / rel_path).exists()
 
 
 def png_images_to_pdf_bytes(images: list[bytes]) -> bytes:
@@ -1482,6 +1876,34 @@ def llm_backend_ready_for_chat(config: LLMBackendConfig) -> bool:
     if not config.base_url.strip():
         return False
     return config.kind in {"openai", "ollama"}
+
+
+def parse_cleanup_response(response_text: str) -> tuple[bool, str]:
+    text = (response_text or "").strip()
+    if not text:
+        return False, ""
+
+    needs_match = re.search(r"NEEDS_CLEANUP:\s*(yes|no)", text, flags=re.IGNORECASE)
+    needs_cleanup = False
+    if needs_match:
+        needs_cleanup = needs_match.group(1).strip().lower() == "yes"
+
+    cleaned_markdown = ""
+    marker_match = re.search(r"CLEANED_MARKDOWN:\s*", text, flags=re.IGNORECASE)
+    if marker_match:
+        cleaned_markdown = text[marker_match.end() :].strip()
+    elif needs_cleanup:
+        # Fallback: if the model ignored the format, treat full text as cleaned output.
+        cleaned_markdown = text
+
+    return needs_cleanup, cleaned_markdown
+
+
+def normalize_cleaned_markdown(text: str) -> str:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+    return cleaned + "\n"
 
 
 def normalize_summary_paragraph(text: str) -> str:

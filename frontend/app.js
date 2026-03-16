@@ -63,6 +63,8 @@
         exportPanel: $("#export-panel"),
         exportSummary: $("#export-summary"),
         btnDownloadCsv: $("#btn-download-csv"),
+        btnDownloadSqlite: $("#btn-download-sqlite"),
+        btnDownloadSqliteTaxonomy: $("#btn-download-sqlite-taxonomy"),
         btnDownloadSources: $("#btn-download-sources"),
         btnRerunFailed: $("#btn-rerun-failed"),
         btnCancelSources: $("#btn-cancel-sources"),
@@ -76,6 +78,28 @@
         btnDownloadManifestCsv: $("#btn-download-manifest-csv"),
         btnDownloadManifestXlsx: $("#btn-download-manifest-xlsx"),
         btnDownloadSourcesBundle: $("#btn-download-sources-bundle"),
+        fetchDelay: $("#fetch-delay"),
+        sourcesRunDownload: $("#sources-run-download"),
+        sourcesRunCleanup: $("#sources-run-cleanup"),
+        sourcesRunSummary: $("#sources-run-summary"),
+        sourcesOutputRaw: $("#sources-output-raw"),
+        sourcesOutputRenderedHtml: $("#sources-output-rendered-html"),
+        sourcesOutputRenderedPdf: $("#sources-output-rendered-pdf"),
+        sourcesOutputMarkdown: $("#sources-output-markdown"),
+        sourcesForceDownload: $("#sources-force-download"),
+        sourcesForceCleanup: $("#sources-force-cleanup"),
+        sourcesForceSummary: $("#sources-force-summary"),
+        taxonomyPreset: $("#taxonomy-preset"),
+        taxonomyCustomPathRow: $("#taxonomy-custom-path-row"),
+        taxonomyConfigPath: $("#taxonomy-config-path"),
+        mergePrimaryPath: $("#merge-primary-path"),
+        mergeSecondaryPath: $("#merge-secondary-path"),
+        mergeOutputPathRow: $("#merge-output-path-row"),
+        mergeOutputPath: $("#merge-output-path"),
+        btnMergeRepos: $("#btn-merge-repos"),
+        mergeStatus: $("#merge-status"),
+        btnRepoSqlite: $("#btn-repo-sqlite"),
+        btnRepoSqliteTaxonomy: $("#btn-repo-sqlite-taxonomy"),
     };
 
     // ---- API helpers ----
@@ -143,10 +167,18 @@
             );
             dom.useLlm.checked = s.use_llm || false;
             dom.researchPurpose.value = s.research_purpose || "";
+            dom.fetchDelay.value = s.fetch_delay ?? 2.0;
             if (dom.repositoryPath) {
                 dom.repositoryPath.value = s.repository_path || "";
             }
+            if (dom.sourcesRunSummary) {
+                dom.sourcesRunSummary.checked = Boolean(s.use_llm);
+            }
+            if (dom.sourcesRunCleanup) {
+                dom.sourcesRunCleanup.checked = false;
+            }
             updateBackendSettingsVisibility();
+            syncSourceTaskControls();
             if (s.llm_backend?.model) {
                 addModelOption(s.llm_backend.model, true);
             }
@@ -169,6 +201,7 @@
             use_llm: dom.useLlm.checked,
             research_purpose: dom.researchPurpose.value,
             repository_path: (dom.repositoryPath?.value || "").trim(),
+            fetch_delay: parseFloat(dom.fetchDelay.value) || 2.0,
         };
         try {
             const saved = await apiPut("settings", settings);
@@ -342,10 +375,14 @@
             if (!data.merged_with_existing_job) {
                 state.hasExportCsv = false;
                 dom.btnDownloadCsv.disabled = true;
+                dom.btnDownloadSqlite.disabled = true;
+                dom.btnDownloadSqliteTaxonomy.disabled = true;
             }
 
             resetSourceDownloadUI();
-            dom.btnDownloadSources.disabled = !state.hasSourceUrls;
+            dom.btnDownloadSources.disabled =
+                !sourcePhasesSelected() ||
+                (dom.sourcesRunDownload.checked && !state.hasSourceUrls);
             dom.exportSummary.innerHTML =
                 `<p>Source list loaded: ${data.accepted_rows} URLs accepted ` +
                 `(${data.missing_url_rows} rows missing URL, ` +
@@ -399,6 +436,13 @@
         if (dom.btnRepositoryCitationsCsv) {
             dom.btnRepositoryCitationsCsv.disabled = !attached;
         }
+        const hasCitations = attached && (status?.total_citations || 0) > 0;
+        if (dom.btnRepoSqlite) {
+            dom.btnRepoSqlite.disabled = !hasCitations;
+        }
+        if (dom.btnRepoSqliteTaxonomy) {
+            dom.btnRepoSqliteTaxonomy.disabled = !hasCitations;
+        }
     }
 
     function renderRepositoryStatus(status) {
@@ -417,6 +461,7 @@
         }
 
         const health = status.health || {};
+        const outputSummaryText = renderSourceOutputSummary(status.output_summary || {});
         dom.repositorySummary.textContent =
             `${status.total_sources || 0} sources | ` +
             `${status.total_citations || 0} citation rows | ` +
@@ -424,7 +469,8 @@
             `next ID ${status.next_source_id || 1} | ` +
             `${status.download_state || "idle"} | ` +
             `${health.missing_files || 0} missing files | ` +
-            `${health.orphaned_citation_rows || 0} orphaned citation rows`;
+            `${health.orphaned_citation_rows || 0} orphaned citation rows` +
+            (outputSummaryText ? ` | ${outputSummaryText}` : "");
 
         setRepositoryButtonsEnabled(true, status);
         if (status.message) {
@@ -464,6 +510,34 @@
         }
     }
 
+    async function activateRepositoryExportJob(scope, importId = "") {
+        const payload = { scope };
+        if (scope === "import") {
+            payload.import_id = (importId || "").trim();
+        }
+        const exportJob = await apiPost("repository/export-job", payload);
+
+        state.jobId = exportJob.job_id || null;
+        state.hasSourceUrls = (exportJob.total_urls || 0) > 0;
+        state.hasExportCsv = false;
+
+        dom.resultsPanel.style.display = "none";
+        dom.warningsPanel.style.display = "none";
+        dom.exportPanel.style.display = "";
+        dom.btnDownloadCsv.disabled = true;
+        dom.btnDownloadSqlite.disabled = true;
+        dom.btnDownloadSqliteTaxonomy.disabled = true;
+
+        resetSourceDownloadUI();
+        dom.btnDownloadSources.disabled =
+            !sourcePhasesSelected() ||
+            (dom.sourcesRunDownload.checked && !state.hasSourceUrls);
+        dom.btnRerunFailed.disabled = true;
+        dom.exportSummary.innerHTML = `<p>${escapeHtml(exportJob.message || "")}</p>`;
+        await loadSourceDownloadStatus();
+        return exportJob;
+    }
+
     async function attachRepository() {
         const path = (dom.repositoryPath?.value || "").trim();
         if (!path) {
@@ -478,9 +552,17 @@
         try {
             const status = await apiPost("repository/attach", { path });
             renderRepositoryStatus(status);
-            setRepositoryStatus("Repository attached and scanned.");
             if (status.download_state === "running") {
                 startRepositoryStatusPolling();
+            }
+            try {
+                const exportJob = await activateRepositoryExportJob("all");
+                setRepositoryStatus(`Repository attached and scanned. ${exportJob.message}`);
+            } catch (e) {
+                setRepositoryStatus(
+                    `Repository attached and scanned. ${String(e.message || "No URLs available for export tasks.")}`,
+                    false
+                );
             }
         } catch (e) {
             setRepositoryStatus(String(e.message || "Failed to attach repository"), true);
@@ -510,11 +592,19 @@
             });
             const data = await resp.json();
             if (!resp.ok) throw new Error(data.detail || "Import failed");
-            setRepositoryStatus(
-                `Imported ${data.accepted_new} new URLs (${data.duplicates_skipped} duplicates skipped).`
-            );
             dom.repositorySourceListInput.value = "";
             await loadRepositoryStatus(false);
+            let detail = "";
+            try {
+                const exportJob = await activateRepositoryExportJob("import", data.import_id);
+                detail = ` ${exportJob.message}`;
+            } catch (e) {
+                detail = ` ${String(e.message || "No new URLs available for export tasks.")}`;
+            }
+            setRepositoryStatus(
+                `Imported ${data.accepted_new} new URLs (${data.duplicates_skipped} duplicates skipped).${detail}`,
+                false
+            );
         } catch (e) {
             setRepositoryStatus(String(e.message || "Import failed"), true);
         } finally {
@@ -543,11 +633,19 @@
             });
             const data = await resp.json();
             if (!resp.ok) throw new Error(data.detail || "Import failed");
-            setRepositoryStatus(
-                `Imported ${data.accepted_new} new URLs from document (${data.duplicates_skipped} duplicates skipped).`
-            );
             dom.repositoryDocumentInput.value = "";
             await loadRepositoryStatus(false);
+            let detail = "";
+            try {
+                const exportJob = await activateRepositoryExportJob("import", data.import_id);
+                detail = ` ${exportJob.message}`;
+            } catch (e) {
+                detail = ` ${String(e.message || "No new URLs available for export tasks.")}`;
+            }
+            setRepositoryStatus(
+                `Imported ${data.accepted_new} new URLs from document (${data.duplicates_skipped} duplicates skipped).${detail}`,
+                false
+            );
         } catch (e) {
             setRepositoryStatus(String(e.message || "Document import failed"), true);
         } finally {
@@ -593,6 +691,65 @@
         }
     }
 
+    // ---- Repository Merge ----
+    function setMergeStatus(message, isError = false) {
+        if (!dom.mergeStatus) return;
+        dom.mergeStatus.textContent = message || "";
+        dom.mergeStatus.style.color = isError ? "var(--error)" : "";
+    }
+
+    function syncMergeOutputPathVisibility() {
+        const mode = document.querySelector('input[name="merge-output-mode"]:checked')?.value || "new";
+        if (dom.mergeOutputPathRow) {
+            dom.mergeOutputPathRow.style.display = mode === "new" ? "" : "none";
+        }
+    }
+
+    async function mergeRepositories() {
+        const primaryPath = (dom.mergePrimaryPath?.value || "").trim();
+        const secondaryPath = (dom.mergeSecondaryPath?.value || "").trim();
+        const outputMode = document.querySelector('input[name="merge-output-mode"]:checked')?.value || "new";
+        const outputPath = (dom.mergeOutputPath?.value || "").trim();
+
+        if (!primaryPath) {
+            setMergeStatus("Enter the primary repository path.", true);
+            return;
+        }
+        if (!secondaryPath) {
+            setMergeStatus("Enter the secondary repository path.", true);
+            return;
+        }
+        if (outputMode === "new" && !outputPath) {
+            setMergeStatus("Enter an output directory for the merged repository.", true);
+            return;
+        }
+
+        if (dom.btnMergeRepos) {
+            dom.btnMergeRepos.disabled = true;
+            dom.btnMergeRepos.textContent = "Merging...";
+        }
+        setMergeStatus("");
+
+        try {
+            const result = await apiPost("repository/merge", {
+                primary_path: primaryPath,
+                secondary_path: secondaryPath,
+                output_mode: outputMode,
+                output_path: outputPath,
+            });
+            setMergeStatus(result.message || "Merge started. Check repository status for progress.");
+            // Start polling repository status to pick up completion
+            startRepositoryStatusPolling();
+        } catch (e) {
+            setMergeStatus(String(e.message || "Merge failed"), true);
+        } finally {
+            if (dom.btnMergeRepos) {
+                dom.btnMergeRepos.disabled = false;
+                dom.btnMergeRepos.textContent = "Merge Repositories";
+            }
+        }
+    }
+
     // ---- Processing ----
     async function startProcessing() {
         dom.btnProcess.disabled = true;
@@ -606,6 +763,8 @@
         dom.exportPanel.style.display = "none";
         resetSourceDownloadUI();
         dom.btnDownloadCsv.disabled = true;
+        dom.btnDownloadSqlite.disabled = true;
+        dom.btnDownloadSqliteTaxonomy.disabled = true;
 
         try {
             // Upload files
@@ -747,7 +906,11 @@
             dom.resultsPanel.open = true;
             dom.exportPanel.style.display = "";
             dom.btnDownloadCsv.disabled = false;
-            dom.btnDownloadSources.disabled = !state.hasSourceUrls;
+            dom.btnDownloadSqlite.disabled = false;
+            dom.btnDownloadSqliteTaxonomy.disabled = false;
+            dom.btnDownloadSources.disabled =
+                !sourcePhasesSelected() ||
+                (dom.sourcesRunDownload.checked && !state.hasSourceUrls);
             dom.btnRerunFailed.disabled = true;
             await loadSourceDownloadStatus();
         } catch (e) {
@@ -879,6 +1042,67 @@
     }
 
     // ---- Source Download ----
+    function sourcePhasesSelected() {
+        return Boolean(
+            dom.sourcesRunDownload?.checked ||
+            dom.sourcesRunCleanup?.checked ||
+            dom.sourcesRunSummary?.checked
+        );
+    }
+
+    function sourceDownloadOutputsSelected() {
+        return Boolean(
+            dom.sourcesOutputRaw?.checked ||
+            dom.sourcesOutputRenderedHtml?.checked ||
+            dom.sourcesOutputRenderedPdf?.checked ||
+            dom.sourcesOutputMarkdown?.checked
+        );
+    }
+
+    function getSourceTaskPayload(rerunFailedOnly = false) {
+        return {
+            rerun_failed_only: rerunFailedOnly,
+            run_download: Boolean(dom.sourcesRunDownload?.checked),
+            run_llm_cleanup: Boolean(dom.sourcesRunCleanup?.checked),
+            run_llm_summary: Boolean(dom.sourcesRunSummary?.checked),
+            force_redownload: Boolean(dom.sourcesForceDownload?.checked),
+            force_llm_cleanup: Boolean(dom.sourcesForceCleanup?.checked),
+            force_summary: Boolean(dom.sourcesForceSummary?.checked),
+            include_raw_file: Boolean(dom.sourcesOutputRaw?.checked),
+            include_rendered_html: Boolean(dom.sourcesOutputRenderedHtml?.checked),
+            include_rendered_pdf: Boolean(dom.sourcesOutputRenderedPdf?.checked),
+            include_markdown: Boolean(dom.sourcesOutputMarkdown?.checked),
+        };
+    }
+
+    function syncSourceTaskControls() {
+        const runDownload = Boolean(dom.sourcesRunDownload?.checked);
+        const runCleanup = Boolean(dom.sourcesRunCleanup?.checked);
+        const runSummary = Boolean(dom.sourcesRunSummary?.checked);
+
+        [dom.sourcesOutputRaw, dom.sourcesOutputRenderedHtml, dom.sourcesOutputRenderedPdf, dom.sourcesOutputMarkdown]
+            .forEach((el) => {
+                if (el) el.disabled = !runDownload;
+            });
+        if (dom.sourcesForceDownload) dom.sourcesForceDownload.disabled = !runDownload;
+        if (dom.sourcesForceCleanup) dom.sourcesForceCleanup.disabled = !runCleanup;
+        if (dom.sourcesForceSummary) dom.sourcesForceSummary.disabled = !runSummary;
+
+        if (!runDownload) {
+            if (dom.sourcesForceDownload) dom.sourcesForceDownload.checked = false;
+        }
+        if (!runCleanup) {
+            if (dom.sourcesForceCleanup) dom.sourcesForceCleanup.checked = false;
+        }
+        if (!runSummary) {
+            if (dom.sourcesForceSummary) dom.sourcesForceSummary.checked = false;
+        }
+
+        if (runDownload && !sourceDownloadOutputsSelected()) {
+            if (dom.sourcesOutputMarkdown) dom.sourcesOutputMarkdown.checked = true;
+        }
+    }
+
     function resetSourceDownloadUI() {
         if (state.sourcePollInterval) {
             clearInterval(state.sourcePollInterval);
@@ -895,10 +1119,22 @@
         dom.btnDownloadSources.disabled = true;
         dom.btnRerunFailed.disabled = true;
         dom.btnCancelSources.disabled = true;
+        syncSourceTaskControls();
     }
 
     async function startSourceDownload(rerunFailedOnly = false) {
         if (!state.jobId) return;
+        syncSourceTaskControls();
+
+        if (!sourcePhasesSelected()) {
+            alert("Select at least one phase: download, LLM cleanup, or LLM summary.");
+            return;
+        }
+        if (dom.sourcesRunDownload.checked && !sourceDownloadOutputsSelected()) {
+            alert("Select at least one download output type.");
+            return;
+        }
+
         dom.btnDownloadSources.disabled = true;
         dom.btnRerunFailed.disabled = true;
 
@@ -907,15 +1143,16 @@
         btn.textContent = rerunFailedOnly ? "Re-running..." : "Starting...";
 
         try {
-            await apiPost(`sources/${state.jobId}/download`, {
-                rerun_failed_only: rerunFailedOnly,
-            });
+            const payload = getSourceTaskPayload(rerunFailedOnly);
+            await apiPost(`sources/${state.jobId}/download`, payload);
             dom.sourcesProgress.style.display = "";
             dom.btnCancelSources.disabled = false;
             startSourceStatusPolling();
         } catch (e) {
             alert("Error starting source download: " + e.message);
-            dom.btnDownloadSources.disabled = !state.hasSourceUrls;
+            dom.btnDownloadSources.disabled =
+                !sourcePhasesSelected() ||
+                (dom.sourcesRunDownload.checked && !state.hasSourceUrls);
             dom.btnRerunFailed.disabled = true;
             dom.btnCancelSources.disabled = true;
         } finally {
@@ -968,7 +1205,8 @@
                 startSourceStatusPolling();
             }
         } catch (e) {
-            if (!String(e.message).includes("404")) {
+            const detail = String(e.message || "").toLowerCase();
+            if (!detail.includes("404") && !detail.includes("not found")) {
                 console.error("Failed to load source status:", e);
             }
         }
@@ -980,29 +1218,69 @@
         const pct = total > 0 ? Math.min((processed / total) * 100, 100) : 0;
         const failedLike = (status.failed_count || 0) + (status.partial_count || 0);
         const isRunning = status.state === "running";
+        const phases = [
+            status.run_download ? "download" : "",
+            status.run_llm_cleanup ? "LLM cleanup" : "",
+            status.run_llm_summary ? "summaries" : "",
+        ].filter(Boolean);
+        const outputSummary = renderSourceOutputSummary(status.output_summary || {});
 
         dom.sourcesProgress.style.display = "";
         dom.sourcesProgressBar.style.width = `${pct}%`;
         dom.sourcesProgressText.textContent = `${processed}/${total} (${Math.round(pct)}%)`;
-        dom.sourcesSummary.textContent =
-            `${status.state || "pending"} | ` +
-            `${status.success_count || 0} success, ` +
-            `${status.partial_count || 0} partial, ` +
-            `${status.failed_count || 0} failed` +
-            ((status.duplicate_urls_removed || 0) > 0
-                ? `, ${status.duplicate_urls_removed} duplicates removed`
+        dom.sourcesSummary.innerHTML =
+            `<div>${escapeHtml(
+                `${status.state || "pending"} | ` +
+                `${status.success_count || 0} success, ` +
+                `${status.partial_count || 0} partial, ` +
+                `${status.failed_count || 0} failed` +
+                ((status.duplicate_urls_removed || 0) > 0
+                    ? `, ${status.duplicate_urls_removed} duplicates removed`
+                    : "") +
+                (status.message ? ` | ${status.message}` : "")
+            )}</div>` +
+            (phases.length > 0
+                ? `<div>${escapeHtml(`Phases: ${phases.join(", ")}`)}</div>`
                 : "") +
-            (status.message ? ` | ${status.message}` : "");
+            (outputSummary ? `<div>${escapeHtml(outputSummary)}</div>` : "");
 
         renderRuntimeGuidance(resolveRuntimeGuidance(status));
         renderSourceStatusList(status.items || []);
 
-        dom.btnDownloadSources.disabled = isRunning || !state.hasSourceUrls;
-        dom.btnRerunFailed.disabled = isRunning || failedLike === 0;
+        const runDownloadSelected = Boolean(dom.sourcesRunDownload?.checked);
+        dom.btnDownloadSources.disabled =
+            isRunning ||
+            !sourcePhasesSelected() ||
+            (runDownloadSelected && !state.hasSourceUrls);
+        dom.btnRerunFailed.disabled =
+            isRunning ||
+            !runDownloadSelected ||
+            failedLike === 0;
         dom.btnCancelSources.disabled = !isRunning;
 
         dom.sourcesFiles.style.display =
             status.state === "completed" || status.state === "cancelled" ? "" : "none";
+    }
+
+    function renderSourceOutputSummary(summary) {
+        if (!summary || typeof summary !== "object") return "";
+        const totalRows = summary.total_rows || 0;
+        if (totalRows === 0) return "";
+        return (
+            `Outputs ${totalRows} rows | ` +
+            `raw ${summary.raw_file_count || 0}, ` +
+            `rendered HTML ${summary.rendered_html_count || 0}, ` +
+            `rendered PDF ${summary.rendered_pdf_count || 0}, ` +
+            `markdown ${summary.markdown_count || 0}, ` +
+            `LLM cleanup ${summary.llm_cleanup_file_count || 0}` +
+            ((summary.llm_cleanup_needed_count || 0) > 0
+                ? ` (${summary.llm_cleanup_needed_count} flagged by LLM)`
+                : "") +
+            `, summaries ${summary.summary_file_count || 0}` +
+            ((summary.summary_missing_count || 0) > 0
+                ? ` (${summary.summary_missing_count} missing)`
+                : "")
+        );
     }
 
     function resolveRuntimeGuidance(status) {
@@ -1066,9 +1344,20 @@
         dom.sourcesStatusList.innerHTML = visible
             .map((item) => {
                 const label = item.fetch_status || item.status || "pending";
+                const llmBits = [];
+                if (item.llm_cleanup_status) {
+                    llmBits.push(`cleanup: ${item.llm_cleanup_status}`);
+                }
+                if (item.summary_status) {
+                    llmBits.push(`summary: ${item.summary_status}`);
+                }
+                const llmText = llmBits.join(" | ");
                 return `<li>
                     <span class="source-id">${escapeHtml(item.id || "")}</span>
-                    <span class="source-url" title="${escapeHtml(item.original_url || "")}">${escapeHtml(item.original_url || "")}</span>
+                    <span class="source-url" title="${escapeHtml(item.original_url || "")}">
+                        ${escapeHtml(item.original_url || "")}
+                        ${llmText ? `<br><span class="muted">${escapeHtml(llmText)}</span>` : ""}
+                    </span>
                     <span class="source-status ${escapeHtml(item.status || "pending")}">${escapeHtml(label)}</span>
                 </li>`;
             })
@@ -1179,17 +1468,81 @@
         return seen.size;
     }
 
+    function syncTaxonomyPresetControls() {
+        if (!dom.taxonomyCustomPathRow || !dom.taxonomyPreset) return;
+        dom.taxonomyCustomPathRow.style.display =
+            dom.taxonomyPreset.value === "custom" ? "" : "none";
+    }
+
+    async function loadTaxonomyPresets() {
+        if (!dom.taxonomyPreset) return;
+        try {
+            const presets = await apiGet("taxonomy-presets");
+            if (!Array.isArray(presets) || presets.length === 0) {
+                syncTaxonomyPresetControls();
+                return;
+            }
+
+            const current = dom.taxonomyPreset.value;
+            dom.taxonomyPreset.innerHTML = "";
+            presets.forEach((preset) => {
+                const key = String(preset?.key || "").trim();
+                const name = String(preset?.name || "").trim();
+                if (!key || !name) return;
+                const option = document.createElement("option");
+                option.value = key;
+                option.textContent = name;
+                dom.taxonomyPreset.appendChild(option);
+            });
+
+            const available = Array.from(dom.taxonomyPreset.options).map((opt) => opt.value);
+            if (available.includes(current)) {
+                dom.taxonomyPreset.value = current;
+            } else if (available.includes("wikipedia")) {
+                dom.taxonomyPreset.value = "wikipedia";
+            } else if (available.includes("none")) {
+                dom.taxonomyPreset.value = "none";
+            } else if (available.length > 0) {
+                dom.taxonomyPreset.value = available[0];
+            }
+        } catch (e) {
+            // Keep static fallback options from HTML.
+        } finally {
+            syncTaxonomyPresetControls();
+        }
+    }
+
+    function buildTaxonomySqliteExportUrl() {
+        if (!state.jobId) return "";
+        const preset = (dom.taxonomyPreset?.value || "wikipedia");
+        const params = new URLSearchParams();
+        params.set("taxonomy_preset", preset);
+        if (preset === "custom") {
+            const rawPath = (dom.taxonomyConfigPath?.value || "").trim();
+            if (rawPath) {
+                params.set("taxonomy_config_path", rawPath);
+            }
+        }
+        return `/api/export/${state.jobId}/sqlite-taxonomy?${params.toString()}`;
+    }
+
     // ---- Init ----
     function init() {
         loadSettings();
+        loadTaxonomyPresets();
         setupUpload();
         setupTabs();
         resetSourceDownloadUI();
+        syncSourceTaskControls();
+        syncTaxonomyPresetControls();
         updateBackendSettingsVisibility();
         dom.btnDownloadCsv.disabled = true;
+        dom.btnDownloadSqlite.disabled = true;
+        dom.btnDownloadSqliteTaxonomy.disabled = true;
         setRepositoryButtonsEnabled(false, null);
 
         // Event listeners
+        dom.taxonomyPreset?.addEventListener("change", syncTaxonomyPresetControls);
         dom.backendKind.addEventListener("change", updateBackendSettingsVisibility);
         dom.btnLoadModels.addEventListener("click", loadModels);
         dom.btnSaveSettings.addEventListener("click", saveSettings);
@@ -1207,12 +1560,52 @@
         dom.btnRepositoryCitationsCsv?.addEventListener("click", () => {
             window.location.href = "/api/repository/citations/csv";
         });
+        dom.btnRepoSqlite?.addEventListener("click", () => {
+            window.location.href = "/api/repository/export/sqlite";
+        });
+        dom.btnRepoSqliteTaxonomy?.addEventListener("click", () => {
+            const params = new URLSearchParams();
+            const preset = dom.taxonomyPreset?.value;
+            if (preset && preset !== "none") params.set("taxonomy_preset", preset);
+            const configPath = dom.taxonomyConfigPath?.value;
+            if (configPath) params.set("taxonomy_config_path", configPath);
+            const qs = params.toString();
+            window.location.href = `/api/repository/export/sqlite-taxonomy${qs ? "?" + qs : ""}`;
+        });
+        dom.btnMergeRepos?.addEventListener("click", mergeRepositories);
+        document.querySelectorAll('input[name="merge-output-mode"]').forEach((radio) => {
+            radio.addEventListener("change", syncMergeOutputPathVisibility);
+        });
+        syncMergeOutputPathVisibility();
         dom.btnUploadSourceList.addEventListener("click", uploadSourceList);
         dom.btnProcess.addEventListener("click", startProcessing);
+        [
+            dom.sourcesRunDownload,
+            dom.sourcesRunCleanup,
+            dom.sourcesRunSummary,
+            dom.sourcesOutputRaw,
+            dom.sourcesOutputRenderedHtml,
+            dom.sourcesOutputRenderedPdf,
+            dom.sourcesOutputMarkdown,
+            dom.sourcesForceDownload,
+            dom.sourcesForceCleanup,
+            dom.sourcesForceSummary,
+        ].forEach((el) => {
+            el?.addEventListener("change", syncSourceTaskControls);
+        });
         dom.btnDownloadCsv.addEventListener("click", () => {
             if (state.jobId && state.hasExportCsv) {
                 window.location.href = `/api/export/${state.jobId}/csv`;
             }
+        });
+        dom.btnDownloadSqlite.addEventListener("click", () => {
+            if (state.jobId && state.hasExportCsv) {
+                window.location.href = `/api/export/${state.jobId}/sqlite`;
+            }
+        });
+        dom.btnDownloadSqliteTaxonomy.addEventListener("click", () => {
+            if (!state.jobId || !state.hasExportCsv) return;
+            window.location.href = buildTaxonomySqliteExportUrl();
         });
         dom.btnDownloadSources.addEventListener("click", () => {
             startSourceDownload(false);

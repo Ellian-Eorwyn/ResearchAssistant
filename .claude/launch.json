@@ -5,7 +5,7 @@
       "name": "research-assistant",
       "runtimeExecutable": "python",
       "runtimeArgs": ["-u", "run.py"],
-      "port": 8000
+      "port": 7995
     }
   ]
 }

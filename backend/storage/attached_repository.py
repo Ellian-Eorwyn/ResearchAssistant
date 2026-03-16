@@ -20,8 +20,10 @@ from backend.models.bibliography import BibliographyArtifact, BibliographyEntry
 from backend.models.export import ExportArtifact, ExportRow
 from backend.models.repository import (
     RepositoryActionResponse,
+    RepositoryExportJobResponse,
     RepositoryHealth,
     RepositoryImportResponse,
+    RepositoryMergeResponse,
     RepositoryScanSummary,
     RepositoryStatusResponse,
 )
@@ -33,6 +35,7 @@ from backend.pipeline.source_downloader import (
     build_manifest_xlsx,
     dedupe_url_key,
     normalize_url,
+    summarize_output_rows,
 )
 from backend.pipeline.source_list_parser import parse_source_list_upload
 from backend.pipeline.stage_bibliography import (
@@ -41,6 +44,7 @@ from backend.pipeline.stage_bibliography import (
     parse_bibliography,
 )
 from backend.pipeline.stage_export import write_csv
+from backend.pipeline.stage_export_sqlite import build_wikiclaude_sqlite_db
 from backend.pipeline.stage_ingest import run_ingestion
 from backend.pipeline.stage_references import detect_references_section
 from backend.storage.file_store import FileStore
@@ -68,6 +72,7 @@ FILE_FIELDS = [
     "rendered_file",
     "rendered_pdf_file",
     "markdown_file",
+    "llm_cleanup_file",
     "summary_file",
     "metadata_file",
 ]
@@ -166,6 +171,7 @@ class AttachedRepositoryService:
                 last_scan_at=str(meta.get("last_scan_at") or ""),
                 last_updated_at=str(meta.get("updated_at") or ""),
                 health=health,
+                output_summary=summarize_output_rows(rows),
                 scan=self._last_scan,
             )
 
@@ -325,6 +331,647 @@ class AttachedRepositoryService:
             raise ValueError("No repository attached")
         return self.path / CITATIONS_CSV_NAME
 
+    def create_export_job(self, scope: str, import_id: str = "") -> RepositoryExportJobResponse:
+        if not self.is_attached:
+            raise ValueError("Attach a repository before creating an export job")
+
+        normalized_scope = str(scope or "").strip().lower()
+        if normalized_scope not in {"all", "queued", "import"}:
+            raise ValueError("Invalid scope. Use `all`, `queued`, or `import`.")
+
+        with self._writer_lock():
+            state = self._load_state_locked()
+            rows = _load_source_rows(state.get("sources", []))
+            imports = list(state.get("imports", []))
+            selected_rows, normalized_import_id = self._select_rows_for_export_scope(
+                rows=rows,
+                imports=imports,
+                scope=normalized_scope,
+                import_id=import_id,
+            )
+            bibliography = self._build_export_job_bibliography(selected_rows, normalized_scope)
+
+        if not bibliography.entries:
+            if normalized_scope == "import" and normalized_import_id:
+                raise RuntimeError(f"No URLs available for import `{normalized_import_id}`.")
+            raise RuntimeError(f"No URLs available for scope `{normalized_scope}`.")
+
+        job_id = self.store.create_job()
+        self.store.save_artifact(job_id, "03_bibliography", bibliography.model_dump(mode="json"))
+
+        import_suffix = f", import: {normalized_import_id}" if normalized_import_id else ""
+        message = (
+            f"Repository source set: {len(bibliography.entries)} URLs "
+            f"(scope: {normalized_scope}{import_suffix})"
+        )
+        return RepositoryExportJobResponse(
+            job_id=job_id,
+            total_urls=len(bibliography.entries),
+            scope=normalized_scope,
+            import_id=normalized_import_id,
+            message=message,
+        )
+
+    def _select_rows_for_export_scope(
+        self,
+        rows: list[SourceManifestRow],
+        imports: list[dict[str, Any]],
+        scope: str,
+        import_id: str,
+    ) -> tuple[list[SourceManifestRow], str]:
+        ordered_rows = self._sort_rows(rows)
+        if scope == "all":
+            return ordered_rows, ""
+
+        if scope == "queued":
+            queued = [
+                row for row in ordered_rows if (row.fetch_status or "").strip() in {"", "queued"}
+            ]
+            return queued, ""
+
+        normalized_import_id = str(import_id or "").strip()
+        if not normalized_import_id:
+            raise ValueError("`import_id` is required when scope is `import`.")
+
+        known_import_ids = {
+            str(item.get("import_id") or "").strip()
+            for item in imports
+            if str(item.get("import_id") or "").strip()
+        }
+        if normalized_import_id not in known_import_ids:
+            raise ValueError(f"Unknown import_id: {normalized_import_id}")
+
+        prefix = f"{normalized_import_id}:"
+        selected = [row for row in ordered_rows if (row.provenance_ref or "").startswith(prefix)]
+        return selected, normalized_import_id
+
+    def _build_export_job_bibliography(
+        self,
+        rows: list[SourceManifestRow],
+        scope: str,
+    ) -> BibliographyArtifact:
+        deduped_rows: list[SourceManifestRow] = []
+        seen_keys: set[str] = set()
+
+        for row in rows:
+            url_candidate = (row.original_url or row.final_url or "").strip()
+            if not url_candidate:
+                continue
+            dedupe_key = repository_dedupe_key(url_candidate) or dedupe_url_key(url_candidate)
+            if not dedupe_key:
+                continue
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+            deduped_rows.append(row)
+
+        entries: list[BibliographyEntry] = []
+        next_ref = 1
+        for row in deduped_rows:
+            url_candidate = (row.original_url or row.final_url or "").strip()
+            normalized, _ = normalize_url(url_candidate)
+            clean_url = normalized or url_candidate
+            if not clean_url:
+                continue
+
+            parsed_ref = _parse_int(row.citation_number)
+            if parsed_ref is None:
+                ref_number = next_ref
+                next_ref += 1
+            else:
+                ref_number = parsed_ref
+                if parsed_ref >= next_ref:
+                    next_ref = parsed_ref + 1
+
+            entries.append(
+                BibliographyEntry(
+                    ref_number=ref_number,
+                    raw_text=clean_url,
+                    source_document_name=row.source_document_name,
+                    title=row.title,
+                    url=clean_url,
+                    parse_confidence=1.0,
+                    parse_warnings=[],
+                    repair_method=f"repository_export_scope:{scope}",
+                )
+            )
+
+        return BibliographyArtifact(
+            sections=[],
+            entries=entries,
+            total_raw_entries=len(entries),
+            parse_failures=0,
+        )
+
+    def merge_job_results(self, job_id: str) -> dict:
+        """Merge completed job download results into the attached repository.
+
+        New URLs get new IDs; existing URLs get updated if the new download is
+        higher quality. Returns a summary dict. Silently returns if not attached
+        or no results are available.
+        """
+        if not self.is_attached:
+            return {"merged": False, "reason": "not_attached"}
+
+        artifact = self.store.load_artifact(job_id, "06_sources_manifest")
+        if not artifact:
+            return {"merged": False, "reason": "no_manifest"}
+
+        downloaded_rows = _load_source_rows(artifact.get("rows", []))
+        if not downloaded_rows:
+            return {"merged": False, "reason": "no_rows"}
+
+        output_dir = self.store.get_sources_output_dir(job_id)
+
+        new_sources = 0
+        updated_sources = 0
+        skipped = 0
+
+        with self._writer_lock():
+            state = self._load_state_locked()
+            meta = self._load_meta_locked()
+            rows = _load_source_rows(state.get("sources", []))
+            citations = _load_citation_rows(state.get("citations", []))
+
+            # Build dedupe map of existing rows
+            existing_by_key: dict[str, SourceManifestRow] = {}
+            for row in rows:
+                url = row.original_url or row.final_url
+                key = repository_dedupe_key(url)
+                if not key:
+                    key = dedupe_url_key(url)
+                if key:
+                    existing_by_key[key] = row
+
+            next_source_id = int(meta.get("next_source_id") or 1)
+
+            for dl_row in downloaded_rows:
+                # Skip rows that were not actually fetched
+                if (dl_row.fetch_status or "").strip() in {"", "queued", "failed"}:
+                    skipped += 1
+                    continue
+
+                url = dl_row.original_url or dl_row.final_url
+                key = repository_dedupe_key(url)
+                if not key:
+                    key = dedupe_url_key(url)
+                if not key:
+                    skipped += 1
+                    continue
+
+                existing = existing_by_key.get(key)
+                if existing:
+                    if _row_priority(dl_row) > _row_priority(existing):
+                        self._apply_download_result(
+                            target=existing, downloaded=dl_row, output_dir=output_dir
+                        )
+                        updated_sources += 1
+                    else:
+                        skipped += 1
+                else:
+                    # New URL — assign ID and add to repository
+                    source_id = f"{next_source_id:06d}"
+                    next_source_id += 1
+
+                    new_row = SourceManifestRow(
+                        id=source_id,
+                        repository_source_id=source_id,
+                        import_type="job_merge",
+                        imported_at=_utc_now_iso(),
+                        provenance_ref=f"job:{job_id}",
+                        source_document_name=dl_row.source_document_name,
+                        citation_number=dl_row.citation_number,
+                        original_url=dl_row.original_url,
+                    )
+                    self._apply_download_result(
+                        target=new_row, downloaded=dl_row, output_dir=output_dir
+                    )
+                    rows.append(new_row)
+                    existing_by_key[key] = new_row
+                    new_sources += 1
+
+            merged_rows = self._sort_rows(rows)
+            self._save_state_locked(
+                sources=merged_rows,
+                citations=citations,
+                imports=state.get("imports", []),
+            )
+            self._save_meta_locked(
+                {
+                    **meta,
+                    "next_source_id": _next_source_id_from_rows(merged_rows),
+                    "updated_at": _utc_now_iso(),
+                }
+            )
+            self._rebuild_outputs_locked(merged_rows, citations)
+
+        return {
+            "merged": True,
+            "new_sources": new_sources,
+            "updated_sources": updated_sources,
+            "skipped": skipped,
+            "total_sources": len(rows),
+        }
+
+    def start_merge(
+        self,
+        primary_path: str,
+        secondary_path: str,
+        output_mode: str,
+        output_path: str,
+    ) -> RepositoryMergeResponse:
+        """Start a repository merge in a background thread."""
+        with self._mutex:
+            if self._download_thread and self._download_thread.is_alive():
+                raise ValueError("A repository operation is already running")
+
+            self._download_state = "running"
+            self._download_message = "Merging repositories..."
+            self._download_thread = threading.Thread(
+                target=self._merge_worker,
+                args=(primary_path, secondary_path, output_mode, output_path),
+                daemon=True,
+            )
+            self._download_thread.start()
+
+        return RepositoryMergeResponse(
+            status="started",
+            message="Repository merge started",
+        )
+
+    def _merge_worker(
+        self,
+        primary_path: str,
+        secondary_path: str,
+        output_mode: str,
+        output_path: str,
+    ) -> None:
+        try:
+            result = self._merge_repositories(primary_path, secondary_path, output_mode, output_path)
+            with self._mutex:
+                self._download_state = "completed"
+                self._download_message = result.message
+        except Exception as exc:  # noqa: BLE001
+            with self._mutex:
+                self._download_state = "failed"
+                self._download_message = f"Merge failed: {type(exc).__name__}: {exc}"
+
+    def _merge_repositories(
+        self,
+        primary_path_str: str,
+        secondary_path_str: str,
+        output_mode: str,
+        output_path_str: str,
+    ) -> RepositoryMergeResponse:
+        """Merge two repositories: primary sources numbered first, secondary after."""
+        primary_path = Path(primary_path_str).expanduser().resolve()
+        secondary_path = Path(secondary_path_str).expanduser().resolve()
+
+        if not primary_path.is_dir():
+            raise ValueError(f"Primary repository path is not a directory: {primary_path}")
+        if not secondary_path.is_dir():
+            raise ValueError(f"Secondary repository path is not a directory: {secondary_path}")
+
+        if output_mode == "into_primary":
+            dest_path = primary_path
+        elif output_mode == "new":
+            if not output_path_str.strip():
+                raise ValueError("Output path is required when output_mode is 'new'")
+            dest_path = Path(output_path_str).expanduser().resolve()
+            dest_path.mkdir(parents=True, exist_ok=True)
+        else:
+            raise ValueError(f"Invalid output_mode: {output_mode}")
+
+        # Load states from both repos
+        primary_state = self._load_state_from_path(primary_path)
+        secondary_state = self._load_state_from_path(secondary_path)
+
+        primary_rows = _load_source_rows(primary_state.get("sources", []))
+        secondary_rows = _load_source_rows(secondary_state.get("sources", []))
+        primary_citations = _load_citation_rows(primary_state.get("citations", []))
+        secondary_citations = _load_citation_rows(secondary_state.get("citations", []))
+
+        # Create backup if merging into primary
+        if output_mode == "into_primary":
+            internal_dir = dest_path / INTERNAL_DIR_NAME
+            internal_dir.mkdir(parents=True, exist_ok=True)
+            backups_dir = internal_dir / "backups"
+            backups_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            backup_dir = backups_dir / f"{timestamp}_pre_merge"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            for name in [MANIFEST_CSV_NAME, MANIFEST_XLSX_NAME, CITATIONS_CSV_NAME,
+                         STATE_FILE_NAME, META_FILE_NAME]:
+                candidates = [dest_path / name, internal_dir / name]
+                for src in candidates:
+                    if src.exists():
+                        shutil.copy2(src, backup_dir / src.name)
+
+        # Build dedupe map: for each URL, pick the best row and track its origin path
+        dedupe_map: dict[str, tuple[SourceManifestRow, Path]] = {}
+        duplicates_removed = 0
+
+        for row in primary_rows:
+            url = row.original_url or row.final_url
+            key = repository_dedupe_key(url)
+            if not key:
+                key = dedupe_url_key(url)
+            if key:
+                dedupe_map[key] = (row, primary_path)
+
+        for row in secondary_rows:
+            url = row.original_url or row.final_url
+            key = repository_dedupe_key(url)
+            if not key:
+                key = dedupe_url_key(url)
+            if not key:
+                continue
+            existing = dedupe_map.get(key)
+            if existing:
+                if _row_priority(row) > _row_priority(existing[0]):
+                    dedupe_map[key] = (row, secondary_path)
+                duplicates_removed += 1
+            else:
+                dedupe_map[key] = (row, secondary_path)
+
+        # Build ordered list: primary-keyed first (in primary order), then secondary-only
+        seen_keys: set[str] = set()
+        ordered_rows: list[tuple[SourceManifestRow, Path]] = []
+
+        for row in primary_rows:
+            url = row.original_url or row.final_url
+            key = repository_dedupe_key(url)
+            if not key:
+                key = dedupe_url_key(url)
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            ordered_rows.append(dedupe_map[key])
+
+        for row in secondary_rows:
+            url = row.original_url or row.final_url
+            key = repository_dedupe_key(url)
+            if not key:
+                key = dedupe_url_key(url)
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            ordered_rows.append(dedupe_map[key])
+
+        # Ensure dest structure — replicate the source downloader's type-based layout
+        dest_internal = dest_path / INTERNAL_DIR_NAME
+        dest_internal.mkdir(parents=True, exist_ok=True)
+        for sub in ["originals", "rendered", "markdown", "summaries", "metadata", "logs"]:
+            (dest_path / sub).mkdir(parents=True, exist_ok=True)
+
+        # Map each file field to its canonical output subdirectory and name pattern
+        _FIELD_DIR_MAP = {
+            "raw_file": "originals",
+            "rendered_file": "rendered",
+            "rendered_pdf_file": "rendered",
+            "markdown_file": "markdown",
+            "llm_cleanup_file": "markdown",
+            "summary_file": "summaries",
+            "metadata_file": "metadata",
+        }
+
+        # Re-number and copy files
+        old_to_new_id: dict[str, str] = {}
+        merged_rows: list[SourceManifestRow] = []
+        next_id = 1
+
+        for row, origin_path in ordered_rows:
+            old_id = row.id
+            new_id = f"{next_id:06d}"
+            next_id += 1
+            old_to_new_id[f"{origin_path}:{old_id}"] = new_id
+
+            new_row = row.model_copy()
+            new_row.id = new_id
+            new_row.repository_source_id = new_id
+
+            # Copy source files from origin repo to dest, preserving type-based dirs
+            for field in FILE_FIELDS:
+                rel_value = getattr(row, field)
+                if not rel_value:
+                    setattr(new_row, field, "")
+                    continue
+                src_file = origin_path / rel_value
+                if not src_file.exists():
+                    setattr(new_row, field, "")
+                    continue
+
+                # Determine target subdirectory
+                target_subdir = _FIELD_DIR_MAP.get(field, "originals")
+
+                # Rename file with new ID prefix
+                old_name = src_file.name
+                if old_id and old_name.startswith(old_id):
+                    new_name = new_id + old_name[len(old_id):]
+                else:
+                    new_name = f"{new_id}_{old_name}"
+                dest_file = dest_path / target_subdir / new_name
+                shutil.copy2(src_file, dest_file)
+                setattr(new_row, field, (Path(target_subdir) / new_name).as_posix())
+
+            # Write metadata JSON
+            metadata_rel = Path("metadata") / f"{new_id}.json"
+            metadata_abs = dest_path / metadata_rel
+            metadata_abs.write_text(
+                json.dumps(new_row.model_dump(mode="json"), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            new_row.metadata_file = metadata_rel.as_posix()
+
+            merged_rows.append(new_row)
+
+        # Merge citations: update repository_source_id via old→new mapping
+        all_citations = [*primary_citations, *secondary_citations]
+        merged_citations: list[ExportRow] = []
+        # Build URL→new_id mapping for citation remapping
+        url_to_new_id: dict[str, str] = {}
+        for row in merged_rows:
+            url = row.original_url or row.final_url
+            key = repository_dedupe_key(url)
+            if key:
+                url_to_new_id[key] = row.id
+
+        seen_citation_keys: set[tuple[str, ...]] = set()
+        for citation in all_citations:
+            # Remap source ID via URL
+            url_key = repository_dedupe_key(citation.cited_url)
+            if url_key and url_key in url_to_new_id:
+                citation.repository_source_id = url_to_new_id[url_key]
+
+            # Dedupe
+            dedup_key = (
+                citation.repository_source_id,
+                citation.import_type,
+                citation.provenance_ref,
+                citation.citation_ref_numbers,
+                citation.cited_url,
+                citation.citation_raw,
+                citation.citing_sentence,
+                citation.cited_raw_entry,
+            )
+            if dedup_key in seen_citation_keys:
+                continue
+            seen_citation_keys.add(dedup_key)
+            merged_citations.append(citation)
+
+        sorted_citations = self._sort_citations(merged_citations)
+
+        # Save to dest
+        state_data = {
+            "sources": [row.model_dump(mode="json") for row in merged_rows],
+            "citations": [row.model_dump(mode="json") for row in sorted_citations],
+            "imports": [
+                *primary_state.get("imports", []),
+                *secondary_state.get("imports", []),
+            ],
+        }
+        state_path = dest_internal / STATE_FILE_NAME
+        state_path.write_text(
+            json.dumps(state_data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        now = _utc_now_iso()
+        meta = {
+            "schema_version": SCHEMA_VERSION,
+            "created_at": now,
+            "updated_at": now,
+            "last_scan_at": now,
+            "next_source_id": next_id,
+        }
+        meta_path = dest_internal / META_FILE_NAME
+        meta_path.write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        # Rebuild outputs
+        (dest_path / MANIFEST_CSV_NAME).write_text(
+            build_manifest_csv(merged_rows),
+            encoding="utf-8-sig",
+        )
+        (dest_path / MANIFEST_XLSX_NAME).write_bytes(build_manifest_xlsx(merged_rows))
+
+        citation_artifact = ExportArtifact(
+            rows=sorted_citations,
+            total_citations_found=len(sorted_citations),
+            total_bib_entries=len(sorted_citations),
+            matched_count=0,
+            unmatched_count=0,
+        )
+        (dest_path / CITATIONS_CSV_NAME).write_text(
+            write_csv(citation_artifact),
+            encoding="utf-8-sig",
+        )
+
+        primary_count = sum(1 for _ in primary_rows)
+        secondary_count = sum(1 for _ in secondary_rows)
+        message = (
+            f"Merged {primary_count} primary + {secondary_count} secondary sources → "
+            f"{len(merged_rows)} total ({duplicates_removed} duplicates removed, "
+            f"{len(sorted_citations)} citations)"
+        )
+
+        return RepositoryMergeResponse(
+            status="completed",
+            message=message,
+            primary_sources=primary_count,
+            secondary_sources=secondary_count,
+            duplicates_removed=duplicates_removed,
+            total_merged_sources=len(merged_rows),
+            total_merged_citations=len(sorted_citations),
+            output_path=str(dest_path),
+        )
+
+    def export_sqlite(
+        self,
+        taxonomy_preset: str = "",
+        taxonomy_config_path: str = "",
+    ) -> Path:
+        """Generate a SQLite database from the attached repository's sources and citations.
+
+        Returns the Path to the generated .db file.
+        """
+        if not self.is_attached:
+            raise ValueError("No repository is attached")
+
+        with self._writer_lock():
+            state = self._load_state_locked()
+
+        sources = _load_source_rows(state.get("sources", []))
+        citations = _load_citation_rows(state.get("citations", []))
+
+        if not citations:
+            raise ValueError("No citations available for export")
+
+        # Resolve taxonomy config if requested
+        taxonomy_config: dict | None = None
+        if taxonomy_preset or taxonomy_config_path:
+            from backend.taxonomies.presets import get_taxonomy_config
+
+            taxonomy_config = get_taxonomy_config(taxonomy_preset or None, taxonomy_config_path or None)
+
+        # Read markdown content from source files (prefer LLM cleanup, fall back to raw markdown)
+        markdown_by_source_id: dict[str, str] = {}
+        for src in sources:
+            src_id = src.repository_source_id or src.id
+            if not src_id:
+                continue
+            for field_name in ("llm_cleanup_file", "markdown_file"):
+                rel_path = getattr(src, field_name, "") or ""
+                if not rel_path:
+                    continue
+                full_path = self.path / rel_path
+                if full_path.is_file():
+                    try:
+                        markdown_by_source_id[src_id] = full_path.read_text(encoding="utf-8", errors="replace")
+                        break
+                    except OSError:
+                        continue
+
+        # Determine output filename
+        suffix = "_taxonomy" if taxonomy_config else ""
+        db_path = self.path / INTERNAL_DIR_NAME / f"wikiclaude_export{suffix}.db"
+
+        build_wikiclaude_sqlite_db(
+            db_path=db_path,
+            export_rows=citations,
+            source_rows=sources,
+            taxonomy_config=taxonomy_config,
+            markdown_by_source_id=markdown_by_source_id or None,
+        )
+
+        # Checkpoint WAL so the .db file is self-contained for download
+        import sqlite3
+
+        with sqlite3.connect(str(db_path), timeout=10) as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+        return db_path
+
+    @staticmethod
+    def _load_state_from_path(repo_path: Path) -> dict[str, Any]:
+        """Load repository_state.json from any repo path."""
+        state_path = repo_path / INTERNAL_DIR_NAME / STATE_FILE_NAME
+        if not state_path.exists():
+            return {"sources": [], "citations": [], "imports": []}
+        try:
+            data = json.loads(state_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return {"sources": [], "citations": [], "imports": []}
+            return {
+                "sources": data.get("sources", []),
+                "citations": data.get("citations", []),
+                "imports": data.get("imports", []),
+            }
+        except Exception:
+            return {"sources": [], "citations": [], "imports": []}
+
     def _download_worker(self, queued_ids: list[str], settings: AppSettings) -> None:
         try:
             with self._writer_lock():
@@ -455,6 +1102,9 @@ class AttachedRepositoryService:
         target.sha256 = downloaded.sha256
         target.extraction_method = downloaded.extraction_method
         target.markdown_char_count = downloaded.markdown_char_count
+        target.llm_cleanup_needed = downloaded.llm_cleanup_needed
+        target.llm_cleanup_status = downloaded.llm_cleanup_status
+        target.summary_status = downloaded.summary_status
 
         source_dest_dir = self.path / "sources" / target.id
         source_dest_dir.mkdir(parents=True, exist_ok=True)
@@ -1144,7 +1794,7 @@ def _entry_url(entry: BibliographyEntry) -> str:
     return normalized or f"https://doi.org/{doi}"
 
 
-def _row_priority(row: SourceManifestRow) -> tuple[int, int, int, int]:
+def _row_priority(row: SourceManifestRow) -> tuple[int, int, int, int, int, int]:
     status_rank = {
         "success": 3,
         "partial": 2,
@@ -1155,6 +1805,8 @@ def _row_priority(row: SourceManifestRow) -> tuple[int, int, int, int]:
     return (
         status_rank,
         1 if row.markdown_file else 0,
+        1 if row.llm_cleanup_file else 0,
+        1 if row.rendered_pdf_file else 0,
         1 if row.raw_file else 0,
         1 if row.summary_file else 0,
     )
@@ -1192,6 +1844,16 @@ def _safe_manifest_row(payload: dict[str, Any]) -> SourceManifestRow | None:
             payload["http_status"] = None
         else:
             payload["http_status"] = _parse_int(str(payload.get("http_status")))
+        llm_cleanup_needed = payload.get("llm_cleanup_needed")
+        if llm_cleanup_needed in {"", None}:
+            payload["llm_cleanup_needed"] = False
+        elif isinstance(llm_cleanup_needed, str):
+            payload["llm_cleanup_needed"] = llm_cleanup_needed.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "y",
+            }
         payload["markdown_char_count"] = _parse_int(str(payload.get("markdown_char_count") or "0")) or 0
         return SourceManifestRow.model_validate(payload)
     except Exception:

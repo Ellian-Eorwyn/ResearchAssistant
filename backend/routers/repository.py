@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 
 from backend.models.repository import (
     AttachRepositoryRequest,
     RepositoryActionResponse,
+    RepositoryExportJobRequest,
+    RepositoryExportJobResponse,
     RepositoryImportResponse,
+    RepositoryMergeRequest,
+    RepositoryMergeResponse,
     RepositoryStatusResponse,
 )
 from backend.models.settings import AppSettings
@@ -90,6 +94,20 @@ async def rebuild_repository_outputs(request: Request) -> RepositoryActionRespon
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/repository/export-job", response_model=RepositoryExportJobResponse)
+async def create_repository_export_job(
+    request: Request,
+    payload: RepositoryExportJobRequest,
+) -> RepositoryExportJobResponse:
+    service = request.app.state.repository_service
+    try:
+        return service.create_export_job(scope=payload.scope, import_id=payload.import_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @router.get("/repository/manifest/csv")
 async def download_repository_manifest_csv(request: Request):
     service = request.app.state.repository_service
@@ -135,4 +153,66 @@ async def download_repository_citations_csv(request: Request):
         path=str(path),
         media_type="text/csv",
         filename="citations.csv",
+    )
+
+
+@router.post("/repository/merge", response_model=RepositoryMergeResponse)
+async def merge_repositories(
+    request: Request,
+    payload: RepositoryMergeRequest,
+) -> RepositoryMergeResponse:
+    service = request.app.state.repository_service
+    if not payload.primary_path.strip():
+        raise HTTPException(status_code=400, detail="Primary path is required")
+    if not payload.secondary_path.strip():
+        raise HTTPException(status_code=400, detail="Secondary path is required")
+    if payload.output_mode not in ("new", "into_primary"):
+        raise HTTPException(status_code=400, detail="output_mode must be 'new' or 'into_primary'")
+    if payload.output_mode == "new" and not payload.output_path.strip():
+        raise HTTPException(status_code=400, detail="output_path is required when output_mode is 'new'")
+    try:
+        return service.start_merge(
+            primary_path=payload.primary_path,
+            secondary_path=payload.secondary_path,
+            output_mode=payload.output_mode,
+            output_path=payload.output_path,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/repository/export/sqlite")
+async def export_repository_sqlite(request: Request):
+    """Generate and download a SQLite database from the attached repository."""
+    service = request.app.state.repository_service
+    try:
+        db_path = service.export_sqlite()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return FileResponse(
+        path=str(db_path),
+        media_type="application/x-sqlite3",
+        filename="wikiclaude_export.db",
+    )
+
+
+@router.get("/repository/export/sqlite-taxonomy")
+async def export_repository_sqlite_taxonomy(
+    request: Request,
+    taxonomy_preset: str | None = Query(default=None),
+    taxonomy_config_path: str | None = Query(default=None),
+):
+    """Generate and download a SQLite database with taxonomy classification."""
+    service = request.app.state.repository_service
+    try:
+        db_path = service.export_sqlite(
+            taxonomy_preset=taxonomy_preset or "",
+            taxonomy_config_path=taxonomy_config_path or "",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return FileResponse(
+        path=str(db_path),
+        media_type="application/x-sqlite3",
+        filename="wikiclaude_export_taxonomy.db",
     )

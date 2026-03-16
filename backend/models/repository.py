@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from backend.models.sources import SourceOutputSummary
+
 
 class AttachRepositoryRequest(BaseModel):
     path: str
@@ -38,6 +40,7 @@ class RepositoryStatusResponse(BaseModel):
     last_scan_at: str = ""
     last_updated_at: str = ""
     health: RepositoryHealth = Field(default_factory=RepositoryHealth)
+    output_summary: SourceOutputSummary = Field(default_factory=SourceOutputSummary)
     scan: RepositoryScanSummary | None = None
 
 
@@ -58,3 +61,34 @@ class RepositoryActionResponse(BaseModel):
     queued_count: int = 0
     total_sources: int = 0
     total_citations: int = 0
+
+
+class RepositoryExportJobRequest(BaseModel):
+    scope: str = "all"
+    import_id: str = ""
+
+
+class RepositoryExportJobResponse(BaseModel):
+    job_id: str
+    total_urls: int = 0
+    scope: str = "all"
+    import_id: str = ""
+    message: str = ""
+
+
+class RepositoryMergeRequest(BaseModel):
+    primary_path: str
+    secondary_path: str
+    output_mode: str = "new"  # "new" | "into_primary"
+    output_path: str = ""
+
+
+class RepositoryMergeResponse(BaseModel):
+    status: str  # "started" | "completed" | "failed"
+    message: str = ""
+    primary_sources: int = 0
+    secondary_sources: int = 0
+    duplicates_removed: int = 0
+    total_merged_sources: int = 0
+    total_merged_citations: int = 0
+    output_path: str = ""

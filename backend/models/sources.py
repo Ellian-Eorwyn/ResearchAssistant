@@ -25,7 +25,11 @@ class SourceManifestRow(BaseModel):
     rendered_file: str = ""
     rendered_pdf_file: str = ""
     markdown_file: str = ""
+    llm_cleanup_needed: bool = False
+    llm_cleanup_file: str = ""
+    llm_cleanup_status: str = ""  # not_requested | not_needed | cleaned | failed | skipped_*
     summary_file: str = ""
+    summary_status: str = ""  # not_requested | existing | generated | failed | skipped_*
     metadata_file: str = ""
     notes: str = ""
     error_message: str = ""
@@ -56,7 +60,11 @@ SOURCE_MANIFEST_COLUMNS = [
     "rendered_file",
     "rendered_pdf_file",
     "markdown_file",
+    "llm_cleanup_needed",
+    "llm_cleanup_file",
+    "llm_cleanup_status",
     "summary_file",
+    "summary_status",
     "metadata_file",
     "notes",
     "error_message",
@@ -82,6 +90,8 @@ class SourceItemStatus(BaseModel):
     citation_number: str = ""
     status: str = "pending"  # pending | running | completed | failed | skipped | cancelled
     fetch_status: str = ""
+    llm_cleanup_status: str = ""
+    summary_status: str = ""
     error_message: str = ""
 
 
@@ -90,6 +100,27 @@ class RuntimeGuidance(BaseModel):
     title: str = ""
     detail: str = ""
     command: str = ""
+
+
+class SourceOutputOptions(BaseModel):
+    include_raw_file: bool = True
+    include_rendered_html: bool = True
+    include_rendered_pdf: bool = True
+    include_markdown: bool = True
+
+
+class SourceOutputSummary(BaseModel):
+    total_rows: int = 0
+    raw_file_count: int = 0
+    rendered_html_count: int = 0
+    rendered_pdf_count: int = 0
+    markdown_count: int = 0
+    llm_cleanup_file_count: int = 0
+    llm_cleanup_needed_count: int = 0
+    llm_cleanup_failed_count: int = 0
+    summary_file_count: int = 0
+    summary_missing_count: int = 0
+    summary_failed_count: int = 0
 
 
 class SourceDownloadStatus(BaseModel):
@@ -110,6 +141,14 @@ class SourceDownloadStatus(BaseModel):
     runtime_notes: list[str] = Field(default_factory=list)
     runtime_guidance: list[RuntimeGuidance] = Field(default_factory=list)
     rerun_failed_only: bool = False
+    run_download: bool = True
+    run_llm_cleanup: bool = False
+    run_llm_summary: bool = True
+    force_redownload: bool = False
+    force_llm_cleanup: bool = False
+    force_summary: bool = False
+    output_options: SourceOutputOptions = Field(default_factory=SourceOutputOptions)
+    output_summary: SourceOutputSummary = Field(default_factory=SourceOutputSummary)
     output_dir: str = ""
     manifest_csv: str = ""
     manifest_xlsx: str = ""
