@@ -888,11 +888,7 @@ class AttachedRepositoryService:
             output_path=str(dest_path),
         )
 
-    def export_sqlite(
-        self,
-        taxonomy_preset: str = "",
-        taxonomy_config_path: str = "",
-    ) -> Path:
+    def export_sqlite(self) -> Path:
         """Generate a SQLite database from the attached repository's sources and citations.
 
         Returns the Path to the generated .db file.
@@ -908,13 +904,6 @@ class AttachedRepositoryService:
 
         if not citations:
             raise ValueError("No citations available for export")
-
-        # Resolve taxonomy config if requested
-        taxonomy_config: dict | None = None
-        if taxonomy_preset or taxonomy_config_path:
-            from backend.taxonomies.presets import get_taxonomy_config
-
-            taxonomy_config = get_taxonomy_config(taxonomy_preset or None, taxonomy_config_path or None)
 
         # Read markdown content from source files (prefer LLM cleanup, fall back to raw markdown)
         markdown_by_source_id: dict[str, str] = {}
@@ -934,15 +923,12 @@ class AttachedRepositoryService:
                     except OSError:
                         continue
 
-        # Determine output filename
-        suffix = "_taxonomy" if taxonomy_config else ""
-        db_path = self.path / INTERNAL_DIR_NAME / f"wikiclaude_export{suffix}.db"
+        db_path = self.path / INTERNAL_DIR_NAME / "wikiclaude_export.db"
 
         build_wikiclaude_sqlite_db(
             db_path=db_path,
             export_rows=citations,
             source_rows=sources,
-            taxonomy_config=taxonomy_config,
             markdown_by_source_id=markdown_by_source_id or None,
         )
 

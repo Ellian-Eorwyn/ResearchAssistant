@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
 from backend.models.repository import (
@@ -196,23 +196,3 @@ async def export_repository_sqlite(request: Request):
     )
 
 
-@router.get("/repository/export/sqlite-taxonomy")
-async def export_repository_sqlite_taxonomy(
-    request: Request,
-    taxonomy_preset: str | None = Query(default=None),
-    taxonomy_config_path: str | None = Query(default=None),
-):
-    """Generate and download a SQLite database with taxonomy classification."""
-    service = request.app.state.repository_service
-    try:
-        db_path = service.export_sqlite(
-            taxonomy_preset=taxonomy_preset or "",
-            taxonomy_config_path=taxonomy_config_path or "",
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return FileResponse(
-        path=str(db_path),
-        media_type="application/x-sqlite3",
-        filename="wikiclaude_export_taxonomy.db",
-    )

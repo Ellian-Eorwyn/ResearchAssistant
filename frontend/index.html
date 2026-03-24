@@ -132,7 +132,6 @@
                     <button id="btn-repository-manifest-xlsx" class="btn">Manifest XLSX</button>
                     <button id="btn-repository-citations-csv" class="btn">Citations CSV</button>
                     <button id="btn-repo-sqlite" class="btn">SQLite (.db)</button>
-                    <button id="btn-repo-sqlite-taxonomy" class="btn">SQLite (.db + taxonomy)</button>
                 </div>
                 <p class="muted">Existing files are never moved/renamed; duplicate URLs reuse existing source records and keep provenance metadata.</p>
 
@@ -284,7 +283,6 @@
                 <div class="export-actions">
                     <button id="btn-download-csv" class="btn btn-primary">Download CSV</button>
                     <button id="btn-download-sqlite" class="btn">Download SQLite (.db)</button>
-                    <button id="btn-download-sqlite-taxonomy" class="btn">Download SQLite (.db + taxonomy)</button>
                     <button id="btn-download-sources" class="btn">Run Selected Tasks</button>
                     <button id="btn-rerun-failed" class="btn" disabled>Run Selected Tasks (Failed Only)</button>
                     <button id="btn-cancel-sources" class="btn" disabled>Cancel Download</button>
@@ -293,17 +291,23 @@
                     </label>
                 </div>
                 <div class="form-row">
-                    <label for="taxonomy-preset">Taxonomy Classification</label>
-                    <select id="taxonomy-preset">
-                        <option value="wikipedia" selected>Wikipedia</option>
-                        <option value="sep">Stanford Encyclopedia of Philosophy</option>
-                        <option value="none">None (default classification)</option>
-                        <option value="custom">Custom file path...</option>
-                    </select>
+                    <label>
+                        <input type="checkbox" id="sources-run-rating"> Rate sources using project profile
+                    </label>
                 </div>
-                <div class="form-row" id="taxonomy-custom-path-row" style="display:none">
-                    <label for="taxonomy-config-path">Taxonomy Config Path</label>
-                    <input type="text" id="taxonomy-config-path" placeholder="~/path/to/domains.yaml">
+                <div class="form-row" id="project-profile-row" style="display:none">
+                    <label for="project-profile-select">Project Profile</label>
+                    <select id="project-profile-select">
+                        <option value="">-- Select a profile --</option>
+                    </select>
+                    <label>
+                        <input type="checkbox" id="sources-force-rating"> Force re-rate
+                    </label>
+                </div>
+                <div class="form-row" id="profile-upload-row" style="display:none">
+                    <label for="profile-upload-input">Upload Profile (.yaml)</label>
+                    <input type="file" id="profile-upload-input" accept=".yaml,.yml">
+                    <button id="btn-upload-profile" class="btn">Upload</button>
                 </div>
 
                 <div id="sources-progress" class="sources-progress" style="display:none">

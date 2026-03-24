@@ -35,9 +35,12 @@ class SourceDownloadRequest(BaseModel):
     run_download: bool = True
     run_llm_cleanup: bool = False
     run_llm_summary: bool = True
+    run_llm_rating: bool = False
     force_redownload: bool = False
     force_llm_cleanup: bool = False
     force_summary: bool = False
+    force_rating: bool = False
+    project_profile_name: str = ""
     include_raw_file: bool = True
     include_rendered_html: bool = True
     include_rendered_pdf: bool = True
@@ -150,7 +153,7 @@ async def start_source_download(
     if source_status.get("state") == "running":
         raise HTTPException(status_code=409, detail="Source download is already running")
 
-    if not (payload.run_download or payload.run_llm_cleanup or payload.run_llm_summary):
+    if not (payload.run_download or payload.run_llm_cleanup or payload.run_llm_summary or payload.run_llm_rating):
         raise HTTPException(status_code=400, detail="Select at least one phase to run")
     if payload.run_download and not any(
         [
@@ -172,6 +175,15 @@ async def start_source_download(
 
     raw_settings = store.load_settings()
     settings = AppSettings(**raw_settings) if raw_settings else AppSettings()
+
+    # Load project profile YAML if rating is requested
+    project_profile_yaml = ""
+    if payload.run_llm_rating and payload.project_profile_name:
+        try:
+            project_profile_yaml = store.load_project_profile(payload.project_profile_name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     jobs = request.app.state.source_download_jobs
     jobs_lock = request.app.state.source_download_lock
 
@@ -186,9 +198,12 @@ async def start_source_download(
         run_download=payload.run_download,
         run_llm_cleanup=payload.run_llm_cleanup,
         run_llm_summary=payload.run_llm_summary,
+        run_llm_rating=payload.run_llm_rating,
         force_redownload=payload.force_redownload,
         force_llm_cleanup=payload.force_llm_cleanup,
         force_summary=payload.force_summary,
+        force_rating=payload.force_rating,
+        project_profile_yaml=project_profile_yaml,
         output_options=SourceOutputOptions(
             include_raw_file=payload.include_raw_file,
             include_rendered_html=payload.include_rendered_html,

@@ -64,7 +64,6 @@
         exportSummary: $("#export-summary"),
         btnDownloadCsv: $("#btn-download-csv"),
         btnDownloadSqlite: $("#btn-download-sqlite"),
-        btnDownloadSqliteTaxonomy: $("#btn-download-sqlite-taxonomy"),
         btnDownloadSources: $("#btn-download-sources"),
         btnRerunFailed: $("#btn-rerun-failed"),
         btnCancelSources: $("#btn-cancel-sources"),
@@ -89,9 +88,13 @@
         sourcesForceDownload: $("#sources-force-download"),
         sourcesForceCleanup: $("#sources-force-cleanup"),
         sourcesForceSummary: $("#sources-force-summary"),
-        taxonomyPreset: $("#taxonomy-preset"),
-        taxonomyCustomPathRow: $("#taxonomy-custom-path-row"),
-        taxonomyConfigPath: $("#taxonomy-config-path"),
+        sourcesRunRating: $("#sources-run-rating"),
+        sourcesForceRating: $("#sources-force-rating"),
+        projectProfileRow: $("#project-profile-row"),
+        profileUploadRow: $("#profile-upload-row"),
+        projectProfileSelect: $("#project-profile-select"),
+        profileUploadInput: $("#profile-upload-input"),
+        btnUploadProfile: $("#btn-upload-profile"),
         mergePrimaryPath: $("#merge-primary-path"),
         mergeSecondaryPath: $("#merge-secondary-path"),
         mergeOutputPathRow: $("#merge-output-path-row"),
@@ -99,7 +102,6 @@
         btnMergeRepos: $("#btn-merge-repos"),
         mergeStatus: $("#merge-status"),
         btnRepoSqlite: $("#btn-repo-sqlite"),
-        btnRepoSqliteTaxonomy: $("#btn-repo-sqlite-taxonomy"),
     };
 
     // ---- API helpers ----
@@ -376,8 +378,7 @@
                 state.hasExportCsv = false;
                 dom.btnDownloadCsv.disabled = true;
                 dom.btnDownloadSqlite.disabled = true;
-                dom.btnDownloadSqliteTaxonomy.disabled = true;
-            }
+                    }
 
             resetSourceDownloadUI();
             dom.btnDownloadSources.disabled =
@@ -526,7 +527,6 @@
         dom.exportPanel.style.display = "";
         dom.btnDownloadCsv.disabled = true;
         dom.btnDownloadSqlite.disabled = true;
-        dom.btnDownloadSqliteTaxonomy.disabled = true;
 
         resetSourceDownloadUI();
         dom.btnDownloadSources.disabled =
@@ -764,7 +764,6 @@
         resetSourceDownloadUI();
         dom.btnDownloadCsv.disabled = true;
         dom.btnDownloadSqlite.disabled = true;
-        dom.btnDownloadSqliteTaxonomy.disabled = true;
 
         try {
             // Upload files
@@ -907,7 +906,6 @@
             dom.exportPanel.style.display = "";
             dom.btnDownloadCsv.disabled = false;
             dom.btnDownloadSqlite.disabled = false;
-            dom.btnDownloadSqliteTaxonomy.disabled = false;
             dom.btnDownloadSources.disabled =
                 !sourcePhasesSelected() ||
                 (dom.sourcesRunDownload.checked && !state.hasSourceUrls);
@@ -1065,9 +1063,12 @@
             run_download: Boolean(dom.sourcesRunDownload?.checked),
             run_llm_cleanup: Boolean(dom.sourcesRunCleanup?.checked),
             run_llm_summary: Boolean(dom.sourcesRunSummary?.checked),
+            run_llm_rating: Boolean(dom.sourcesRunRating?.checked),
             force_redownload: Boolean(dom.sourcesForceDownload?.checked),
             force_llm_cleanup: Boolean(dom.sourcesForceCleanup?.checked),
             force_summary: Boolean(dom.sourcesForceSummary?.checked),
+            force_rating: Boolean(dom.sourcesForceRating?.checked),
+            project_profile_name: dom.projectProfileSelect?.value || "",
             include_raw_file: Boolean(dom.sourcesOutputRaw?.checked),
             include_rendered_html: Boolean(dom.sourcesOutputRenderedHtml?.checked),
             include_rendered_pdf: Boolean(dom.sourcesOutputRenderedPdf?.checked),
@@ -1279,6 +1280,10 @@
             `, summaries ${summary.summary_file_count || 0}` +
             ((summary.summary_missing_count || 0) > 0
                 ? ` (${summary.summary_missing_count} missing)`
+                : "") +
+            `, ratings ${summary.rating_file_count || 0}` +
+            ((summary.rating_failed_count || 0) > 0
+                ? ` (${summary.rating_failed_count} failed)`
                 : "")
         );
     }
@@ -1350,6 +1355,9 @@
                 }
                 if (item.summary_status) {
                     llmBits.push(`summary: ${item.summary_status}`);
+                }
+                if (item.rating_status) {
+                    llmBits.push(`rating: ${item.rating_status}`);
                 }
                 const llmText = llmBits.join(" | ");
                 return `<li>
@@ -1468,81 +1476,82 @@
         return seen.size;
     }
 
-    function syncTaxonomyPresetControls() {
-        if (!dom.taxonomyCustomPathRow || !dom.taxonomyPreset) return;
-        dom.taxonomyCustomPathRow.style.display =
-            dom.taxonomyPreset.value === "custom" ? "" : "none";
+    function syncProjectProfileControls() {
+        if (!dom.projectProfileRow || !dom.sourcesRunRating) return;
+        const show = dom.sourcesRunRating.checked;
+        dom.projectProfileRow.style.display = show ? "" : "none";
+        if (dom.profileUploadRow) dom.profileUploadRow.style.display = show ? "" : "none";
     }
 
-    async function loadTaxonomyPresets() {
-        if (!dom.taxonomyPreset) return;
+    async function loadProjectProfiles() {
+        if (!dom.projectProfileSelect) return;
         try {
-            const presets = await apiGet("taxonomy-presets");
-            if (!Array.isArray(presets) || presets.length === 0) {
-                syncTaxonomyPresetControls();
-                return;
-            }
+            const profiles = await apiGet("project-profiles");
+            if (!Array.isArray(profiles)) return;
 
-            const current = dom.taxonomyPreset.value;
-            dom.taxonomyPreset.innerHTML = "";
-            presets.forEach((preset) => {
-                const key = String(preset?.key || "").trim();
-                const name = String(preset?.name || "").trim();
-                if (!key || !name) return;
+            const current = dom.projectProfileSelect.value;
+            dom.projectProfileSelect.innerHTML = '<option value="">-- Select a profile --</option>';
+            profiles.forEach((profile) => {
+                const filename = String(profile?.filename || "").trim();
+                const name = String(profile?.name || "").trim();
+                if (!filename || !name) return;
                 const option = document.createElement("option");
-                option.value = key;
+                option.value = filename;
                 option.textContent = name;
-                dom.taxonomyPreset.appendChild(option);
+                dom.projectProfileSelect.appendChild(option);
             });
 
-            const available = Array.from(dom.taxonomyPreset.options).map((opt) => opt.value);
-            if (available.includes(current)) {
-                dom.taxonomyPreset.value = current;
-            } else if (available.includes("wikipedia")) {
-                dom.taxonomyPreset.value = "wikipedia";
-            } else if (available.includes("none")) {
-                dom.taxonomyPreset.value = "none";
-            } else if (available.length > 0) {
-                dom.taxonomyPreset.value = available[0];
+            if (current) {
+                const available = Array.from(dom.projectProfileSelect.options).map((opt) => opt.value);
+                if (available.includes(current)) {
+                    dom.projectProfileSelect.value = current;
+                }
             }
         } catch (e) {
-            // Keep static fallback options from HTML.
-        } finally {
-            syncTaxonomyPresetControls();
+            // Keep static fallback.
         }
     }
 
-    function buildTaxonomySqliteExportUrl() {
-        if (!state.jobId) return "";
-        const preset = (dom.taxonomyPreset?.value || "wikipedia");
-        const params = new URLSearchParams();
-        params.set("taxonomy_preset", preset);
-        if (preset === "custom") {
-            const rawPath = (dom.taxonomyConfigPath?.value || "").trim();
-            if (rawPath) {
-                params.set("taxonomy_config_path", rawPath);
+    async function uploadProjectProfile() {
+        if (!dom.profileUploadInput?.files?.length) return;
+        const file = dom.profileUploadInput.files[0];
+        const formData = new FormData();
+        formData.append("file", file);
+        try {
+            const resp = await fetch("/api/project-profiles/upload", {
+                method: "POST",
+                body: formData,
+            });
+            if (resp.ok) {
+                const result = await resp.json();
+                await loadProjectProfiles();
+                if (result.filename && dom.projectProfileSelect) {
+                    dom.projectProfileSelect.value = result.filename;
+                }
+                dom.profileUploadInput.value = "";
             }
+        } catch (e) {
+            // Upload failed silently.
         }
-        return `/api/export/${state.jobId}/sqlite-taxonomy?${params.toString()}`;
     }
 
     // ---- Init ----
     function init() {
         loadSettings();
-        loadTaxonomyPresets();
+        loadProjectProfiles();
         setupUpload();
         setupTabs();
         resetSourceDownloadUI();
         syncSourceTaskControls();
-        syncTaxonomyPresetControls();
+        syncProjectProfileControls();
         updateBackendSettingsVisibility();
         dom.btnDownloadCsv.disabled = true;
         dom.btnDownloadSqlite.disabled = true;
-        dom.btnDownloadSqliteTaxonomy.disabled = true;
         setRepositoryButtonsEnabled(false, null);
 
         // Event listeners
-        dom.taxonomyPreset?.addEventListener("change", syncTaxonomyPresetControls);
+        dom.sourcesRunRating?.addEventListener("change", syncProjectProfileControls);
+        dom.btnUploadProfile?.addEventListener("click", uploadProjectProfile);
         dom.backendKind.addEventListener("change", updateBackendSettingsVisibility);
         dom.btnLoadModels.addEventListener("click", loadModels);
         dom.btnSaveSettings.addEventListener("click", saveSettings);
@@ -1562,15 +1571,6 @@
         });
         dom.btnRepoSqlite?.addEventListener("click", () => {
             window.location.href = "/api/repository/export/sqlite";
-        });
-        dom.btnRepoSqliteTaxonomy?.addEventListener("click", () => {
-            const params = new URLSearchParams();
-            const preset = dom.taxonomyPreset?.value;
-            if (preset && preset !== "none") params.set("taxonomy_preset", preset);
-            const configPath = dom.taxonomyConfigPath?.value;
-            if (configPath) params.set("taxonomy_config_path", configPath);
-            const qs = params.toString();
-            window.location.href = `/api/repository/export/sqlite-taxonomy${qs ? "?" + qs : ""}`;
         });
         dom.btnMergeRepos?.addEventListener("click", mergeRepositories);
         document.querySelectorAll('input[name="merge-output-mode"]').forEach((radio) => {
@@ -1602,10 +1602,6 @@
             if (state.jobId && state.hasExportCsv) {
                 window.location.href = `/api/export/${state.jobId}/sqlite`;
             }
-        });
-        dom.btnDownloadSqliteTaxonomy.addEventListener("click", () => {
-            if (!state.jobId || !state.hasExportCsv) return;
-            window.location.href = buildTaxonomySqliteExportUrl();
         });
         dom.btnDownloadSources.addEventListener("click", () => {
             startSourceDownload(false);

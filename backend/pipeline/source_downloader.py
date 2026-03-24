@@ -31,6 +31,8 @@ from backend.llm.client import UnifiedLLMClient
 from backend.llm.prompts import (
     SOURCE_MARKDOWN_CLEANUP_SYSTEM,
     SOURCE_MARKDOWN_CLEANUP_USER,
+    SOURCE_RATING_SYSTEM,
+    SOURCE_RATING_USER,
     SOURCE_SUMMARY_SYSTEM,
     SOURCE_SUMMARY_USER,
 )
@@ -80,6 +82,8 @@ NOTE_LLM_CLEANUP_FAILED = "llm_cleanup_failed"
 NOTE_LLM_CLEANUP_SKIPPED_LLM_NOT_CONFIGURED = "llm_cleanup_skipped_llm_not_configured"
 NOTE_SUMMARY_GENERATION_FAILED = "summary_generation_failed"
 NOTE_SUMMARY_SKIPPED_LLM_NOT_CONFIGURED = "summary_skipped_llm_not_configured"
+NOTE_RATING_GENERATION_FAILED = "rating_generation_failed"
+NOTE_RATING_SKIPPED_LLM_NOT_CONFIGURED = "rating_skipped_llm_not_configured"
 NOTE_VISUAL_CAPTURE_FAILED = "visual_capture_failed"
 NOTE_VISUAL_CAPTURE_SEGMENTED = "visual_capture_segmented"
 
@@ -351,9 +355,12 @@ class SourceDownloadOrchestrator:
         run_download: bool = True,
         run_llm_cleanup: bool = False,
         run_llm_summary: bool = True,
+        run_llm_rating: bool = False,
         force_redownload: bool = False,
         force_llm_cleanup: bool = False,
         force_summary: bool = False,
+        force_rating: bool = False,
+        project_profile_yaml: str = "",
         output_options: SourceOutputOptions | None = None,
     ):
         self.job_id = job_id
@@ -366,9 +373,12 @@ class SourceDownloadOrchestrator:
         self.run_download = bool(run_download)
         self.run_llm_cleanup = bool(run_llm_cleanup)
         self.run_llm_summary = bool(run_llm_summary)
+        self.run_llm_rating = bool(run_llm_rating)
         self.force_redownload = bool(force_redownload)
         self.force_llm_cleanup = bool(force_llm_cleanup)
         self.force_summary = bool(force_summary)
+        self.force_rating = bool(force_rating)
+        self.project_profile_yaml = (project_profile_yaml or "").strip()
         self.output_options = output_options or SourceOutputOptions()
         self.output_dir = self.store.get_sources_output_dir(job_id)
         self.logs_dir = self.output_dir / "logs"
@@ -394,7 +404,7 @@ class SourceDownloadOrchestrator:
     def run(self) -> None:
         """Execute source downloads sequentially with per-URL fault isolation."""
         try:
-            if not (self.run_download or self.run_llm_cleanup or self.run_llm_summary):
+            if not (self.run_download or self.run_llm_cleanup or self.run_llm_summary or self.run_llm_rating):
                 raise RuntimeError("Select at least one phase to run")
             if self.run_download and not any(
                 [
@@ -432,9 +442,11 @@ class SourceDownloadOrchestrator:
                     "run_download": self.run_download,
                     "run_llm_cleanup": self.run_llm_cleanup,
                     "run_llm_summary": self.run_llm_summary,
+                    "run_llm_rating": self.run_llm_rating,
                     "force_redownload": self.force_redownload,
                     "force_llm_cleanup": self.force_llm_cleanup,
                     "force_summary": self.force_summary,
+                    "force_rating": self.force_rating,
                     "output_options": self.output_options.model_dump(mode="json"),
                     "runtime_notes": self.runtime_capabilities.runtime_notes,
                     "runtime_guidance": self.runtime_capabilities.runtime_guidance,
@@ -801,6 +813,9 @@ class SourceDownloadOrchestrator:
             item.summary_status = (
                 existing_row.summary_status if existing_row else item.summary_status
             )
+            item.rating_status = (
+                existing_row.rating_status if existing_row else item.rating_status
+            )
         self.status.skipped_count += 1
         self.status.processed_urls += 1
         self.status.current_item_id = item_id
@@ -828,6 +843,7 @@ class SourceDownloadOrchestrator:
             item.fetch_status = row.fetch_status
             item.llm_cleanup_status = row.llm_cleanup_status
             item.summary_status = row.summary_status
+            item.rating_status = row.rating_status
             item.error_message = row.error_message
             if self.run_download and row.fetch_status == "failed":
                 item.status = "failed"
@@ -1244,6 +1260,7 @@ class SourceDownloadOrchestrator:
 
         self._generate_markdown_cleanup(row, notes)
         self._generate_source_summary(row, notes)
+        self._generate_source_rating(row, notes)
         row.notes = "; ".join(dict.fromkeys(n for n in notes if n))
         metadata_rel = Path("metadata") / f"{row.id}.json"
         row.metadata_file = metadata_rel.as_posix()
@@ -1266,6 +1283,7 @@ class SourceDownloadOrchestrator:
                 "markdown_file": row.markdown_file,
                 "llm_cleanup_file": row.llm_cleanup_file,
                 "summary_file": row.summary_file,
+                "rating_file": row.rating_file,
                 "metadata_file": row.metadata_file,
             },
             "notes": row.notes,
@@ -1277,6 +1295,7 @@ class SourceDownloadOrchestrator:
             "llm_cleanup_needed": row.llm_cleanup_needed,
             "llm_cleanup_status": row.llm_cleanup_status,
             "summary_status": row.summary_status,
+            "rating_status": row.rating_status,
         }
         self._write_text(
             metadata_rel,
@@ -1468,6 +1487,107 @@ class SourceDownloadOrchestrator:
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 response_format=None,
+            )
+        finally:
+            await client.close()
+
+    def _generate_source_rating(
+        self,
+        row: SourceManifestRow,
+        notes: list[str],
+    ) -> None:
+        if not self.run_llm_rating:
+            if row.rating_file and _has_output_file(self.output_dir, row.rating_file):
+                row.rating_status = row.rating_status or "existing"
+            elif not row.rating_status:
+                row.rating_status = "not_requested"
+            return
+
+        if not self.project_profile_yaml:
+            row.rating_status = "skipped_no_profile"
+            return
+
+        rating_source_path = ""
+        if row.llm_cleanup_file and _has_output_file(self.output_dir, row.llm_cleanup_file):
+            rating_source_path = row.llm_cleanup_file
+        elif row.markdown_file:
+            rating_source_path = row.markdown_file
+
+        if not rating_source_path:
+            row.rating_status = "missing_markdown"
+            return
+        if not self.use_llm:
+            row.rating_status = "skipped_llm_disabled"
+            return
+        if not llm_backend_ready_for_chat(self.llm_backend):
+            row.rating_status = "skipped_llm_not_configured"
+            notes.append(NOTE_RATING_SKIPPED_LLM_NOT_CONFIGURED)
+            return
+        if (
+            row.rating_file
+            and not self.force_rating
+            and _has_output_file(self.output_dir, row.rating_file)
+        ):
+            row.rating_status = "existing"
+            return
+
+        markdown_text = self._read_text(Path(rating_source_path))
+        if not markdown_text.strip():
+            row.rating_status = "missing_markdown"
+            return
+
+        source_text = markdown_text.strip()
+        if len(source_text) > MAX_SUMMARY_SOURCE_CHARS:
+            source_text = source_text[:MAX_SUMMARY_SOURCE_CHARS]
+
+        research_purpose = self.research_purpose or (
+            "No explicit research purpose was provided. "
+            "Evaluate the source based on the project profile dimensions."
+        )
+        system_prompt = SOURCE_RATING_SYSTEM.format(
+            project_profile_yaml=self.project_profile_yaml,
+        )
+        user_prompt = SOURCE_RATING_USER.format(
+            research_purpose=research_purpose,
+            source_markdown=source_text,
+        )
+
+        try:
+            raw_response = run_async_in_sync(
+                self._run_llm_rating,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            ).strip()
+
+            rating_data = json.loads(raw_response)
+            if not isinstance(rating_data, dict):
+                notes.append(NOTE_RATING_GENERATION_FAILED)
+                row.rating_status = "failed"
+                return
+
+            rating_rel = Path("ratings") / f"{row.id}_rating.json"
+            self._write_text(
+                rating_rel,
+                json.dumps(rating_data, ensure_ascii=False, indent=2) + "\n",
+            )
+            row.rating_file = rating_rel.as_posix()
+            row.rating_status = "generated"
+        except Exception as exc:
+            notes.append(NOTE_RATING_GENERATION_FAILED)
+            row.rating_status = "failed"
+            logger.warning("Rating generation failed for %s: %s", row.id, exc)
+
+    async def _run_llm_rating(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> str:
+        client = UnifiedLLMClient(self.llm_backend)
+        try:
+            return await client.chat_completion(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                response_format="json",
             )
         finally:
             await client.close()
@@ -1686,6 +1806,8 @@ def summarize_output_rows(rows: list[SourceManifestRow]) -> SourceOutputSummary:
     markdown_ready = 0
     summary_missing = 0
     summary_failed = 0
+    rating_missing = 0
+    rating_failed = 0
     llm_cleanup_failed = 0
 
     for row in rows:
@@ -1693,12 +1815,18 @@ def summarize_output_rows(rows: list[SourceManifestRow]) -> SourceOutputSummary:
             markdown_ready += 1
         if (row.summary_status or "").strip().lower() == "failed":
             summary_failed += 1
+        if (row.rating_status or "").strip().lower() == "failed":
+            rating_failed += 1
         if (row.llm_cleanup_status or "").strip().lower() == "failed":
             llm_cleanup_failed += 1
 
         has_summary = bool(row.summary_file)
         if (row.markdown_file or row.llm_cleanup_file) and not has_summary:
             summary_missing += 1
+
+        has_rating = bool(row.rating_file)
+        if (row.markdown_file or row.llm_cleanup_file) and not has_rating:
+            rating_missing += 1
 
     return SourceOutputSummary(
         total_rows=len(rows),
@@ -1712,6 +1840,9 @@ def summarize_output_rows(rows: list[SourceManifestRow]) -> SourceOutputSummary:
         summary_file_count=sum(1 for row in rows if row.summary_file),
         summary_missing_count=summary_missing,
         summary_failed_count=summary_failed,
+        rating_file_count=sum(1 for row in rows if row.rating_file),
+        rating_missing_count=rating_missing,
+        rating_failed_count=rating_failed,
     )
 
 

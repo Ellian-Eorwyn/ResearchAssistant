@@ -18,7 +18,8 @@ class FileStore:
         self.artifacts_dir = base_dir / "artifacts"
         self.exports_dir = base_dir / "exports"
         self.settings_path = base_dir / "settings.json"
-        for d in [self.uploads_dir, self.artifacts_dir, self.exports_dir]:
+        self.project_profiles_dir = base_dir / "project_profiles"
+        for d in [self.uploads_dir, self.artifacts_dir, self.exports_dir, self.project_profiles_dir]:
             d.mkdir(parents=True, exist_ok=True)
 
     def create_job(self) -> str:
@@ -160,6 +161,28 @@ class FileStore:
         path = self.artifacts_dir / job_id / "_sources_status.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(status, default=str, ensure_ascii=False, indent=2))
+
+    def list_project_profiles(self) -> list[dict]:
+        """List available project profile YAML files."""
+        profiles = []
+        for ext in ("*.yaml", "*.yml"):
+            for p in sorted(self.project_profiles_dir.glob(ext)):
+                if p.is_file():
+                    profiles.append({"name": p.stem, "filename": p.name})
+        return profiles
+
+    def load_project_profile(self, filename: str) -> str:
+        """Read and return raw YAML text for a project profile.
+
+        Raises ValueError if the file is not found or path traversal is attempted.
+        """
+        safe_name = Path(filename).name
+        if safe_name != filename:
+            raise ValueError(f"Invalid profile filename: {filename}")
+        path = self.project_profiles_dir / safe_name
+        if not path.is_file():
+            raise ValueError(f"Project profile not found: {filename}")
+        return path.read_text(encoding="utf-8")
 
     def job_exists(self, job_id: str) -> bool:
         return (self.artifacts_dir / job_id).is_dir()

@@ -48,6 +48,38 @@ Source content:
 
 Return exactly one paragraph with 3-4 sentences."""
 
+SOURCE_RATING_SYSTEM = """You are evaluating a source using an imported project profile.
+Use the project profile as the governing rubric for:
+- what counts as relevant
+- what should be deprioritized
+- how to score each dimension
+- how to assign confidence
+
+Evaluate the source only using:
+1. the source content
+2. the imported project profile
+
+Return output only in the required JSON structure.
+
+Important rules:
+- Use 0.05 increments only
+- Do not confuse source length with relevance
+- Separate depth from relevant detail
+- Lower confidence when evidence is incomplete or ambiguous
+- If the profile defines a flags section, include float scores (0.0-1.0, 0.05 increments) for each flag
+
+--- PROJECT PROFILE ---
+{project_profile_yaml}
+--- END PROJECT PROFILE ---"""
+
+SOURCE_RATING_USER = """Research purpose:
+{research_purpose}
+
+Source content:
+{source_markdown}
+
+Evaluate this source according to the project profile. Return JSON only."""
+
 SOURCE_MARKDOWN_CLEANUP_SYSTEM = """You are cleaning extracted markdown from downloaded web/PDF sources.
 Preserve factual content and citations while improving readability.
 Do not add new claims, references, or interpretation."""

@@ -30,6 +30,8 @@ class SourceManifestRow(BaseModel):
     llm_cleanup_status: str = ""  # not_requested | not_needed | cleaned | failed | skipped_*
     summary_file: str = ""
     summary_status: str = ""  # not_requested | existing | generated | failed | skipped_*
+    rating_file: str = ""
+    rating_status: str = ""  # not_requested | existing | generated | failed | skipped_*
     metadata_file: str = ""
     notes: str = ""
     error_message: str = ""
@@ -65,6 +67,8 @@ SOURCE_MANIFEST_COLUMNS = [
     "llm_cleanup_status",
     "summary_file",
     "summary_status",
+    "rating_file",
+    "rating_status",
     "metadata_file",
     "notes",
     "error_message",
@@ -92,6 +96,7 @@ class SourceItemStatus(BaseModel):
     fetch_status: str = ""
     llm_cleanup_status: str = ""
     summary_status: str = ""
+    rating_status: str = ""
     error_message: str = ""
 
 
@@ -121,6 +126,9 @@ class SourceOutputSummary(BaseModel):
     summary_file_count: int = 0
     summary_missing_count: int = 0
     summary_failed_count: int = 0
+    rating_file_count: int = 0
+    rating_missing_count: int = 0
+    rating_failed_count: int = 0
 
 
 class SourceDownloadStatus(BaseModel):
@@ -144,9 +152,12 @@ class SourceDownloadStatus(BaseModel):
     run_download: bool = True
     run_llm_cleanup: bool = False
     run_llm_summary: bool = True
+    run_llm_rating: bool = False
     force_redownload: bool = False
     force_llm_cleanup: bool = False
     force_summary: bool = False
+    force_rating: bool = False
+    project_profile_name: str = ""
     output_options: SourceOutputOptions = Field(default_factory=SourceOutputOptions)
     output_summary: SourceOutputSummary = Field(default_factory=SourceOutputSummary)
     output_dir: str = ""
