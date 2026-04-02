@@ -7,6 +7,8 @@ from enum import Enum
 
 from pydantic import BaseModel, Field
 
+from backend.models.settings import LLMBackendConfig
+
 
 class PipelineStage(str, Enum):
     PENDING = "pending"
@@ -54,6 +56,7 @@ class UploadResponse(BaseModel):
 class ProcessingConfig(BaseModel):
     use_llm: bool = False
     research_purpose: str = ""
+    llm_backend: LLMBackendConfig | None = None
 
 
 def utcnow() -> datetime:

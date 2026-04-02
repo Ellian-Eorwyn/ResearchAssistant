@@ -63,7 +63,8 @@ class PipelineOrchestratorTests(unittest.TestCase):
             confidence=1.0,
         )
 
-        def fake_parse_bibliography(sections):
+        def fake_parse_bibliography(sections, **kwargs):
+            del kwargs
             if not sections:
                 return BibliographyArtifact(
                     sections=[],

@@ -7,12 +7,13 @@
     const state = {
         jobId: null,
         files: [],
-        settings: {},
+        repoSettings: {},
         pollInterval: null,
         sourcePollInterval: null,
         repositoryPollInterval: null,
         hasSourceUrls: false,
         hasExportCsv: false,
+        repoLoaded: false,
     };
 
     // ---- DOM refs ----
@@ -20,6 +21,18 @@
     const $$ = (sel) => document.querySelectorAll(sel);
 
     const dom = {
+        // Gate
+        repoGate: $("#repo-gate"),
+        mainApp: $("#main-app"),
+        openRepoPath: $("#open-repo-path"),
+        btnOpenRepo: $("#btn-open-repo"),
+        createRepoPath: $("#create-repo-path"),
+        btnCreateRepo: $("#btn-create-repo"),
+        repoGateStatus: $("#repo-gate-status"),
+        // Repo info bar
+        currentRepoPath: $("#current-repo-path"),
+        btnSwitchRepo: $("#btn-switch-repo"),
+        // Settings
         backendKind: $("#backend-kind"),
         baseUrl: $("#base-url"),
         apiKey: $("#api-key"),
@@ -27,31 +40,33 @@
         ollamaSettings: $("#ollama-settings"),
         ollamaTemperature: $("#ollama-temperature"),
         ollamaThinkMode: $("#ollama-think-mode"),
+        ollamaNumCtx: $("#ollama-num-ctx"),
+        llmMaxSourceChars: $("#llm-max-source-chars"),
+        llmTimeout: $("#llm-timeout"),
         modelSelect: $("#model-select"),
         btnLoadModels: $("#btn-load-models"),
         useLlm: $("#use-llm"),
         btnSaveSettings: $("#btn-save-settings"),
         settingsStatus: $("#settings-status"),
+        // Upload / Import
         uploadZone: $("#upload-zone"),
         fileInput: $("#file-input"),
         fileList: $("#file-list"),
-        sourceListInput: $("#source-list-input"),
-        btnUploadSourceList: $("#btn-upload-source-list"),
-        sourceListStatus: $("#source-list-status"),
-        repositoryPath: $("#repository-path"),
-        btnAttachRepository: $("#btn-attach-repository"),
-        repositoryStatus: $("#repository-status"),
-        repositorySummary: $("#repository-summary"),
         repositorySourceListInput: $("#repository-source-list-input"),
         btnRepositoryImportList: $("#btn-repository-import-list"),
         repositoryDocumentInput: $("#repository-document-input"),
         btnRepositoryImportDocument: $("#btn-repository-import-document"),
+        // Repository
+        repositoryStatus: $("#repository-status"),
+        repositorySummary: $("#repository-summary"),
         btnRepositoryDownload: $("#btn-repository-download"),
         btnRepositoryRebuild: $("#btn-repository-rebuild"),
         btnRepositoryManifestCsv: $("#btn-repository-manifest-csv"),
         btnRepositoryManifestXlsx: $("#btn-repository-manifest-xlsx"),
         btnRepositoryCitationsCsv: $("#btn-repository-citations-csv"),
+        btnRepoSqlite: $("#btn-repo-sqlite"),
         researchPurpose: $("#research-purpose"),
+        // Processing
         btnProcess: $("#btn-process"),
         progressPanel: $("#progress-panel"),
         progressBar: $("#progress-bar"),
@@ -60,6 +75,7 @@
         resultsPanel: $("#results-panel"),
         warningsPanel: $("#warnings-panel"),
         warningsList: $("#warnings-list"),
+        // Export
         exportPanel: $("#export-panel"),
         exportSummary: $("#export-summary"),
         btnDownloadCsv: $("#btn-download-csv"),
@@ -95,13 +111,10 @@
         projectProfileSelect: $("#project-profile-select"),
         profileUploadInput: $("#profile-upload-input"),
         btnUploadProfile: $("#btn-upload-profile"),
-        mergePrimaryPath: $("#merge-primary-path"),
-        mergeSecondaryPath: $("#merge-secondary-path"),
-        mergeOutputPathRow: $("#merge-output-path-row"),
-        mergeOutputPath: $("#merge-output-path"),
+        // Merge
+        mergeSourcePaths: $("#merge-source-paths"),
         btnMergeRepos: $("#btn-merge-repos"),
         mergeStatus: $("#merge-status"),
-        btnRepoSqlite: $("#btn-repo-sqlite"),
     };
 
     // ---- API helpers ----
@@ -153,11 +166,103 @@
         exporting: "Exporting CSV",
     };
 
-    // ---- Settings ----
-    async function loadSettings() {
+    // ---- Repository Gate ----
+
+    function setGateStatus(message, isError = false) {
+        if (!dom.repoGateStatus) return;
+        dom.repoGateStatus.textContent = message || "";
+        dom.repoGateStatus.style.color = isError ? "var(--error)" : "";
+    }
+
+    async function openRepository(path) {
+        if (!path) {
+            setGateStatus("Enter a path first.", true);
+            return;
+        }
+        dom.btnOpenRepo.disabled = true;
+        dom.btnOpenRepo.textContent = "Opening...";
+        setGateStatus("");
+
         try {
-            const s = await apiGet("settings");
-            state.settings = s;
+            const status = await apiPost("repository/attach", { path });
+            await onRepoLoaded(status);
+        } catch (e) {
+            setGateStatus(String(e.message || "Failed to open repository"), true);
+        } finally {
+            dom.btnOpenRepo.disabled = false;
+            dom.btnOpenRepo.textContent = "Open";
+        }
+    }
+
+    async function createRepository(path) {
+        if (!path) {
+            setGateStatus("Enter a path for the new repository.", true);
+            return;
+        }
+        dom.btnCreateRepo.disabled = true;
+        dom.btnCreateRepo.textContent = "Creating...";
+        setGateStatus("");
+
+        try {
+            const status = await apiPost("repository/create", { path });
+            await onRepoLoaded(status);
+        } catch (e) {
+            setGateStatus(String(e.message || "Failed to create repository"), true);
+        } finally {
+            dom.btnCreateRepo.disabled = false;
+            dom.btnCreateRepo.textContent = "Create";
+        }
+    }
+
+    async function onRepoLoaded(status) {
+        state.repoLoaded = true;
+        dom.repoGate.style.display = "none";
+        dom.mainApp.style.display = "";
+        dom.currentRepoPath.textContent = status.path || "";
+        renderRepositoryStatus(status);
+
+        // Load per-repo settings
+        await loadRepoSettings();
+        await loadProjectProfiles();
+
+        if (status.download_state === "running") {
+            startRepositoryStatusPolling();
+        }
+
+        // Activate export job for the repo
+        try {
+            await activateRepositoryExportJob("all");
+        } catch (e) {
+            // No URLs available yet — that's fine
+        }
+    }
+
+    function switchRepository() {
+        state.repoLoaded = false;
+        stopRepositoryStatusPolling();
+        if (state.sourcePollInterval) {
+            clearInterval(state.sourcePollInterval);
+            state.sourcePollInterval = null;
+        }
+        if (state.pollInterval) {
+            clearInterval(state.pollInterval);
+            state.pollInterval = null;
+        }
+        state.jobId = null;
+        state.files = [];
+        state.hasSourceUrls = false;
+        state.hasExportCsv = false;
+
+        dom.mainApp.style.display = "none";
+        dom.repoGate.style.display = "";
+        setGateStatus("");
+    }
+
+    // ---- Settings (per-repo) ----
+    async function loadRepoSettings() {
+        try {
+            const s = await apiGet("repository/settings");
+            state.repoSettings = s;
             dom.backendKind.value = s.llm_backend?.kind || "ollama";
             dom.baseUrl.value = s.llm_backend?.base_url || "http://localhost:11434";
             dom.apiKey.value = s.llm_backend?.api_key || "";
@@ -167,12 +272,12 @@
             dom.ollamaThinkMode.value = normalizeThinkMode(
                 s.llm_backend?.think_mode || "default"
             );
+            dom.ollamaNumCtx.value = String(s.llm_backend?.num_ctx ?? 8192);
+            dom.llmMaxSourceChars.value = String(s.llm_backend?.max_source_chars ?? 0);
+            dom.llmTimeout.value = String(s.llm_backend?.llm_timeout ?? 300);
             dom.useLlm.checked = s.use_llm || false;
             dom.researchPurpose.value = s.research_purpose || "";
             dom.fetchDelay.value = s.fetch_delay ?? 2.0;
-            if (dom.repositoryPath) {
-                dom.repositoryPath.value = s.repository_path || "";
-            }
             if (dom.sourcesRunSummary) {
                 dom.sourcesRunSummary.checked = Boolean(s.use_llm);
             }
@@ -184,13 +289,12 @@
             if (s.llm_backend?.model) {
                 addModelOption(s.llm_backend.model, true);
             }
-            await loadRepositoryStatus(false);
         } catch (e) {
-            console.error("Failed to load settings:", e);
+            console.error("Failed to load repo settings:", e);
         }
     }
 
-    async function saveSettings() {
+    async function saveRepoSettings() {
         const settings = {
             llm_backend: {
                 kind: dom.backendKind.value,
@@ -199,20 +303,46 @@
                 model: dom.modelSelect.value,
                 temperature: normalizeTemperature(dom.ollamaTemperature.value),
                 think_mode: normalizeThinkMode(dom.ollamaThinkMode.value),
+                num_ctx: parseInt(dom.ollamaNumCtx.value, 10) || 8192,
+                max_source_chars: parseInt(dom.llmMaxSourceChars.value, 10) || 0,
+                llm_timeout: parseFloat(dom.llmTimeout.value) || 300,
             },
             use_llm: dom.useLlm.checked,
             research_purpose: dom.researchPurpose.value,
-            repository_path: (dom.repositoryPath?.value || "").trim(),
             fetch_delay: parseFloat(dom.fetchDelay.value) || 2.0,
         };
         try {
-            const saved = await apiPut("settings", settings);
-            state.settings = saved;
+            const saved = await apiPut("repository/settings", settings);
+            state.repoSettings = saved;
             dom.settingsStatus.textContent = "Saved";
             setTimeout(() => (dom.settingsStatus.textContent = ""), 2000);
         } catch (e) {
             dom.settingsStatus.textContent = "Error saving";
         }
+    }
+
+    async function loadAppSettings() {
+        try {
+            const s = await apiGet("settings");
+            const lastPath = s.last_repository_path || "";
+            if (lastPath) {
+                dom.openRepoPath.value = lastPath;
+                // Auto-open last repository
+                try {
+                    const status = await apiPost("repository/attach", { path: lastPath });
+                    await onRepoLoaded(status);
+                    return;
+                } catch (e) {
+                    // Couldn't auto-open, show the gate
+                    setGateStatus(`Could not auto-open last repository: ${e.message}`, true);
+                }
+            }
+        } catch (e) {
+            console.error("Failed to load app settings:", e);
+        }
+        // Show gate if we didn't successfully auto-open
+        dom.repoGate.style.display = "";
+        dom.mainApp.style.display = "none";
     }
 
     function updateBackendSettingsVisibility() {
@@ -251,7 +381,7 @@
                 opt.textContent = "No models found";
                 dom.modelSelect.appendChild(opt);
             } else {
-                const savedModel = state.settings?.llm_backend?.model || "";
+                const savedModel = state.repoSettings?.llm_backend?.model || "";
                 resp.models.forEach((m) => {
                     addModelOption(m, m === savedModel);
                 });
@@ -338,73 +468,6 @@
         });
     }
 
-    async function uploadSourceList() {
-        const file = dom.sourceListInput.files && dom.sourceListInput.files[0];
-        if (!file) {
-            setSourceListStatus("Choose a CSV or XLSX file first.", true);
-            return;
-        }
-
-        dom.btnUploadSourceList.disabled = true;
-        dom.btnUploadSourceList.textContent = "Uploading...";
-        setSourceListStatus("");
-
-        try {
-            const formData = new FormData();
-            formData.append("file", file);
-            if (state.jobId) {
-                formData.append("job_id", state.jobId);
-            }
-
-            const resp = await fetch("/api/sources/upload-list", {
-                method: "POST",
-                body: formData,
-            });
-            const data = await resp.json();
-            if (!resp.ok) {
-                throw new Error(data.detail || "Upload failed");
-            }
-
-            state.jobId = data.job_id;
-            state.hasSourceUrls = (data.total_urls_in_job || 0) > 0;
-
-            dom.progressPanel.style.display = "none";
-            dom.resultsPanel.style.display = "none";
-            dom.warningsPanel.style.display = "none";
-            dom.exportPanel.style.display = "";
-
-            // The standalone source list flow doesn't produce citation CSV export.
-            if (!data.merged_with_existing_job) {
-                state.hasExportCsv = false;
-                dom.btnDownloadCsv.disabled = true;
-                dom.btnDownloadSqlite.disabled = true;
-                    }
-
-            resetSourceDownloadUI();
-            dom.btnDownloadSources.disabled =
-                !sourcePhasesSelected() ||
-                (dom.sourcesRunDownload.checked && !state.hasSourceUrls);
-            dom.exportSummary.innerHTML =
-                `<p>Source list loaded: ${data.accepted_rows} URLs accepted ` +
-                `(${data.missing_url_rows} rows missing URL, ` +
-                `${data.estimated_duplicate_urls} estimated duplicates). ` +
-                `Total URLs currently in job: ${data.total_urls_in_job}.</p>`;
-
-            setSourceListStatus("Source list uploaded.");
-            dom.sourceListInput.value = "";
-        } catch (e) {
-            setSourceListStatus(String(e.message || "Upload failed"), true);
-        } finally {
-            dom.btnUploadSourceList.disabled = false;
-            dom.btnUploadSourceList.textContent = "Upload Source List";
-        }
-    }
-
-    function setSourceListStatus(message, isError = false) {
-        dom.sourceListStatus.textContent = message || "";
-        dom.sourceListStatus.style.color = isError ? "var(--error)" : "";
-    }
-
     function setRepositoryStatus(message, isError = false) {
         if (!dom.repositoryStatus) return;
         dom.repositoryStatus.textContent = message || "";
@@ -441,9 +504,6 @@
         if (dom.btnRepoSqlite) {
             dom.btnRepoSqlite.disabled = !hasCitations;
         }
-        if (dom.btnRepoSqliteTaxonomy) {
-            dom.btnRepoSqliteTaxonomy.disabled = !hasCitations;
-        }
     }
 
     function renderRepositoryStatus(status) {
@@ -455,10 +515,6 @@
                 setRepositoryStatus(status.message);
             }
             return;
-        }
-
-        if (dom.repositoryPath && status.path) {
-            dom.repositoryPath.value = status.path;
         }
 
         const health = status.health || {};
@@ -536,40 +592,6 @@
         dom.exportSummary.innerHTML = `<p>${escapeHtml(exportJob.message || "")}</p>`;
         await loadSourceDownloadStatus();
         return exportJob;
-    }
-
-    async function attachRepository() {
-        const path = (dom.repositoryPath?.value || "").trim();
-        if (!path) {
-            setRepositoryStatus("Enter an absolute path first.", true);
-            return;
-        }
-
-        dom.btnAttachRepository.disabled = true;
-        dom.btnAttachRepository.textContent = "Attaching...";
-        setRepositoryStatus("");
-
-        try {
-            const status = await apiPost("repository/attach", { path });
-            renderRepositoryStatus(status);
-            if (status.download_state === "running") {
-                startRepositoryStatusPolling();
-            }
-            try {
-                const exportJob = await activateRepositoryExportJob("all");
-                setRepositoryStatus(`Repository attached and scanned. ${exportJob.message}`);
-            } catch (e) {
-                setRepositoryStatus(
-                    `Repository attached and scanned. ${String(e.message || "No URLs available for export tasks.")}`,
-                    false
-                );
-            }
-        } catch (e) {
-            setRepositoryStatus(String(e.message || "Failed to attach repository"), true);
-        } finally {
-            dom.btnAttachRepository.disabled = false;
-            dom.btnAttachRepository.textContent = "Attach + Scan";
-        }
     }
 
     async function importRepositorySourceList() {
@@ -698,29 +720,16 @@
         dom.mergeStatus.style.color = isError ? "var(--error)" : "";
     }
 
-    function syncMergeOutputPathVisibility() {
-        const mode = document.querySelector('input[name="merge-output-mode"]:checked')?.value || "new";
-        if (dom.mergeOutputPathRow) {
-            dom.mergeOutputPathRow.style.display = mode === "new" ? "" : "none";
-        }
-    }
-
     async function mergeRepositories() {
-        const primaryPath = (dom.mergePrimaryPath?.value || "").trim();
-        const secondaryPath = (dom.mergeSecondaryPath?.value || "").trim();
-        const outputMode = document.querySelector('input[name="merge-output-mode"]:checked')?.value || "new";
-        const outputPath = (dom.mergeOutputPath?.value || "").trim();
+        const raw = (dom.mergeSourcePaths?.value || "").trim();
+        if (!raw) {
+            setMergeStatus("Enter at least one external repository path.", true);
+            return;
+        }
 
-        if (!primaryPath) {
-            setMergeStatus("Enter the primary repository path.", true);
-            return;
-        }
-        if (!secondaryPath) {
-            setMergeStatus("Enter the secondary repository path.", true);
-            return;
-        }
-        if (outputMode === "new" && !outputPath) {
-            setMergeStatus("Enter an output directory for the merged repository.", true);
+        const sourcePaths = raw.split("\n").map(s => s.trim()).filter(Boolean);
+        if (sourcePaths.length === 0) {
+            setMergeStatus("Enter at least one external repository path.", true);
             return;
         }
 
@@ -732,20 +741,16 @@
 
         try {
             const result = await apiPost("repository/merge", {
-                primary_path: primaryPath,
-                secondary_path: secondaryPath,
-                output_mode: outputMode,
-                output_path: outputPath,
+                source_paths: sourcePaths,
             });
             setMergeStatus(result.message || "Merge started. Check repository status for progress.");
-            // Start polling repository status to pick up completion
             startRepositoryStatusPolling();
         } catch (e) {
             setMergeStatus(String(e.message || "Merge failed"), true);
         } finally {
             if (dom.btnMergeRepos) {
                 dom.btnMergeRepos.disabled = false;
-                dom.btnMergeRepos.textContent = "Merge Repositories";
+                dom.btnMergeRepos.textContent = "Merge Into Current Repository";
             }
         }
     }
@@ -847,7 +852,6 @@
             })
             .join("");
 
-        // Collect warnings
         collectWarnings(stages);
     }
 
@@ -878,7 +882,6 @@
     // ---- Results ----
     async function loadResults() {
         try {
-            // Load bibliography preview
             const bibData = await apiGet(
                 `results/${state.jobId}?stage=bibliography`
             );
@@ -886,7 +889,6 @@
             state.hasSourceUrls = entries.some(hasExtractedUrl);
             renderBibliography(bibData);
 
-            // Load citations preview
             const citData = await apiGet(
                 `results/${state.jobId}?stage=citations`
             );
@@ -894,7 +896,6 @@
             renderSentences(citData);
             renderMatches(citData, bibData);
 
-            // Load export summary
             const exportData = await apiGet(
                 `results/${state.jobId}?stage=export`
             );
@@ -1537,8 +1538,6 @@
 
     // ---- Init ----
     function init() {
-        loadSettings();
-        loadProjectProfiles();
         setupUpload();
         setupTabs();
         resetSourceDownloadUI();
@@ -1549,13 +1548,23 @@
         dom.btnDownloadSqlite.disabled = true;
         setRepositoryButtonsEnabled(false, null);
 
-        // Event listeners
+        // Gate event listeners
+        dom.btnOpenRepo?.addEventListener("click", () => {
+            openRepository((dom.openRepoPath?.value || "").trim());
+        });
+        dom.btnCreateRepo?.addEventListener("click", () => {
+            createRepository((dom.createRepoPath?.value || "").trim());
+        });
+        dom.btnSwitchRepo?.addEventListener("click", switchRepository);
+
+        // Settings event listeners
         dom.sourcesRunRating?.addEventListener("change", syncProjectProfileControls);
         dom.btnUploadProfile?.addEventListener("click", uploadProjectProfile);
         dom.backendKind.addEventListener("change", updateBackendSettingsVisibility);
         dom.btnLoadModels.addEventListener("click", loadModels);
-        dom.btnSaveSettings.addEventListener("click", saveSettings);
-        dom.btnAttachRepository?.addEventListener("click", attachRepository);
+        dom.btnSaveSettings.addEventListener("click", saveRepoSettings);
+
+        // Repository event listeners
         dom.btnRepositoryImportList?.addEventListener("click", importRepositorySourceList);
         dom.btnRepositoryImportDocument?.addEventListener("click", importRepositoryDocument);
         dom.btnRepositoryDownload?.addEventListener("click", startRepositoryDownload);
@@ -1573,11 +1582,6 @@
             window.location.href = "/api/repository/export/sqlite";
         });
         dom.btnMergeRepos?.addEventListener("click", mergeRepositories);
-        document.querySelectorAll('input[name="merge-output-mode"]').forEach((radio) => {
-            radio.addEventListener("change", syncMergeOutputPathVisibility);
-        });
-        syncMergeOutputPathVisibility();
-        dom.btnUploadSourceList.addEventListener("click", uploadSourceList);
         dom.btnProcess.addEventListener("click", startProcessing);
         [
             dom.sourcesRunDownload,
@@ -1625,6 +1629,9 @@
                 window.location.href = `/api/sources/${state.jobId}/bundle`;
             }
         });
+
+        // Load app settings and auto-open last repo
+        loadAppSettings();
     }
 
     // Start when DOM is ready

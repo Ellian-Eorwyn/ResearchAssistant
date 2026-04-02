@@ -12,13 +12,20 @@ from backend.pipeline.orchestrator import PipelineOrchestrator
 router = APIRouter()
 
 
+def _job_store(request: Request, job_id: str):
+    repo_service = getattr(request.app.state, "repository_service", None)
+    if repo_service is not None:
+        return repo_service.job_store_for(job_id)
+    return request.app.state.file_store
+
+
 @router.post("/process/{job_id}")
 async def start_processing(
     job_id: str,
     request: Request,
     config: ProcessingConfig = Body(default_factory=ProcessingConfig),
 ) -> dict:
-    store = request.app.state.file_store
+    store = _job_store(request, job_id)
     if not store.job_exists(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -73,7 +80,7 @@ async def start_processing(
 
 @router.get("/status/{job_id}")
 async def get_status(job_id: str, request: Request) -> dict:
-    store = request.app.state.file_store
+    store = _job_store(request, job_id)
     if not store.job_exists(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
 

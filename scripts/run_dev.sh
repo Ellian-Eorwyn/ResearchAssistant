@@ -18,4 +18,16 @@ if [[ ! -x "${VENV_PYTHON}" ]]; then
 fi
 
 cd "${ROOT_DIR}"
+
+if ! command -v npm >/dev/null 2>&1; then
+  echo "[run] error: npm is required to build the React frontend." >&2
+  exit 1
+fi
+
+echo "[run] ensuring frontend dependencies"
+(cd "${ROOT_DIR}/frontend" && npm install)
+
+echo "[run] building frontend bundle"
+(cd "${ROOT_DIR}/frontend" && npm run build)
+
 exec "${VENV_PYTHON}" run.py

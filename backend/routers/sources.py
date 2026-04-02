@@ -7,12 +7,12 @@ import threading
 
 from fastapi import APIRouter, Body, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
 
 from backend.models.bibliography import BibliographyArtifact
 from backend.models.common import PipelineStage
-from backend.models.settings import AppSettings
+from backend.models.settings import RepoSettings
 from backend.models.sources import (
+    SourceDownloadRequest,
     SourceDownloadStatus,
     SourceItemStatus,
     SourceListUploadResponse,
@@ -30,21 +30,11 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-class SourceDownloadRequest(BaseModel):
-    rerun_failed_only: bool = False
-    run_download: bool = True
-    run_llm_cleanup: bool = False
-    run_llm_summary: bool = True
-    run_llm_rating: bool = False
-    force_redownload: bool = False
-    force_llm_cleanup: bool = False
-    force_summary: bool = False
-    force_rating: bool = False
-    project_profile_name: str = ""
-    include_raw_file: bool = True
-    include_rendered_html: bool = True
-    include_rendered_pdf: bool = True
-    include_markdown: bool = True
+def _job_store(request: Request, job_id: str):
+    repo_service = getattr(request.app.state, "repository_service", None)
+    if repo_service is not None:
+        return repo_service.job_store_for(job_id)
+    return request.app.state.file_store
 
 
 @router.post("/sources/upload-list", response_model=SourceListUploadResponse)
@@ -54,6 +44,7 @@ async def upload_source_list(
     job_id: str | None = Form(default=None),
 ) -> SourceListUploadResponse:
     store = request.app.state.file_store
+    repo_service = getattr(request.app.state, "repository_service", None)
     filename = file.filename or "sources.csv"
     content = await file.read()
 
@@ -65,6 +56,8 @@ async def upload_source_list(
     merged_with_existing_job = False
     target_job_id = (job_id or "").strip()
     if target_job_id:
+        if repo_service is not None:
+            store = repo_service.job_store_for(target_job_id)
         if not store.job_exists(target_job_id):
             raise HTTPException(status_code=404, detail="Job not found")
         merged_with_existing_job = True
@@ -123,7 +116,7 @@ async def start_source_download(
     request: Request,
     payload: SourceDownloadRequest = Body(default_factory=SourceDownloadRequest),
 ) -> dict:
-    store = request.app.state.file_store
+    store = _job_store(request, job_id)
     if not store.job_exists(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -153,9 +146,23 @@ async def start_source_download(
     if source_status.get("state") == "running":
         raise HTTPException(status_code=409, detail="Source download is already running")
 
-    if not (payload.run_download or payload.run_llm_cleanup or payload.run_llm_summary or payload.run_llm_rating):
+    repo_service = request.app.state.repository_service
+
+    run_download = bool(payload.run_download or payload.force_redownload)
+    run_llm_cleanup = bool(payload.run_llm_cleanup or payload.force_llm_cleanup)
+    run_llm_title = bool(payload.run_llm_title or payload.force_title)
+    run_llm_summary = bool(payload.run_llm_summary or payload.force_summary)
+    run_llm_rating = bool(payload.run_llm_rating or payload.force_rating)
+
+    if not (
+        run_download
+        or run_llm_cleanup
+        or run_llm_title
+        or run_llm_summary
+        or run_llm_rating
+    ):
         raise HTTPException(status_code=400, detail="Select at least one phase to run")
-    if payload.run_download and not any(
+    if run_download and not any(
         [
             payload.include_raw_file,
             payload.include_rendered_html,
@@ -167,22 +174,62 @@ async def start_source_download(
             status_code=400,
             detail="Select at least one download output type",
         )
-    if not payload.run_download and store.load_artifact(job_id, "06_sources_manifest") is None:
+    existing_manifest = store.load_artifact(job_id, "06_sources_manifest")
+    if not run_download and existing_manifest is None:
+        seeded_rows = 0
+        if repo_service.is_attached:
+            try:
+                seed_result = repo_service.seed_job_output_run(job_id)
+                seeded_rows = int(seed_result.get("seeded_rows") or 0)
+            except ValueError:
+                seeded_rows = 0
+        if seeded_rows > 0:
+            logger.info(
+                "Seeded %d repository rows into job %s for postprocess-only run",
+                seeded_rows,
+                job_id,
+            )
+            existing_manifest = store.load_artifact(job_id, "06_sources_manifest")
+        else:
+            raise HTTPException(
+                status_code=409,
+                detail="No existing output run found. Run download phase first.",
+            )
+
+    if not run_download and existing_manifest is None:
         raise HTTPException(
             status_code=409,
             detail="No existing output run found. Run download phase first.",
         )
 
-    raw_settings = store.load_settings()
-    settings = AppSettings(**raw_settings) if raw_settings else AppSettings()
+    # Load per-repo settings
+    if repo_service.is_attached:
+        settings = repo_service.load_repo_settings()
+    else:
+        settings = RepoSettings()
 
     # Load project profile YAML if rating is requested
+    project_profile_name = ""
     project_profile_yaml = ""
-    if payload.run_llm_rating and payload.project_profile_name:
-        try:
-            project_profile_yaml = store.load_project_profile(payload.project_profile_name)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if run_llm_rating:
+        if repo_service.is_attached:
+            try:
+                project_profile_name, project_profile_yaml = repo_service._load_project_profile_yaml(
+                    payload.project_profile_name,
+                    research_purpose=settings.research_purpose,
+                    default_when_blank=True,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        else:
+            try:
+                project_profile_name, project_profile_yaml = store.resolve_project_profile(
+                    payload.project_profile_name,
+                    research_purpose=settings.research_purpose,
+                    default_when_blank=True,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     jobs = request.app.state.source_download_jobs
     jobs_lock = request.app.state.source_download_lock
@@ -195,14 +242,17 @@ async def start_source_download(
         llm_backend=settings.llm_backend,
         research_purpose=settings.research_purpose,
         fetch_delay=settings.fetch_delay,
-        run_download=payload.run_download,
-        run_llm_cleanup=payload.run_llm_cleanup,
-        run_llm_summary=payload.run_llm_summary,
-        run_llm_rating=payload.run_llm_rating,
+        run_download=run_download,
+        run_llm_cleanup=run_llm_cleanup,
+        run_llm_title=run_llm_title,
+        run_llm_summary=run_llm_summary,
+        run_llm_rating=run_llm_rating,
         force_redownload=payload.force_redownload,
         force_llm_cleanup=payload.force_llm_cleanup,
+        force_title=payload.force_title,
         force_summary=payload.force_summary,
         force_rating=payload.force_rating,
+        project_profile_name=project_profile_name,
         project_profile_yaml=project_profile_yaml,
         output_options=SourceOutputOptions(
             include_raw_file=payload.include_raw_file,
@@ -252,39 +302,108 @@ async def start_source_download(
         "rerun_failed_only": payload.rerun_failed_only,
         "run_download": payload.run_download,
         "run_llm_cleanup": payload.run_llm_cleanup,
+        "run_llm_title": payload.run_llm_title,
         "run_llm_summary": payload.run_llm_summary,
+        "run_llm_rating": payload.run_llm_rating,
     }
 
 
 @router.post("/sources/{job_id}/cancel")
 async def cancel_source_download(job_id: str, request: Request) -> dict:
-    store = request.app.state.file_store
+    store = _job_store(request, job_id)
     if not store.job_exists(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
-
-    status = store.get_source_status(job_id) or {}
-    if status.get("state") != "running":
-        return {"job_id": job_id, "status": "not_running"}
 
     jobs = request.app.state.source_download_jobs
     jobs_lock = request.app.state.source_download_lock
     with jobs_lock:
         orchestrator = jobs.get(job_id)
+    if orchestrator is not None:
+        orchestrator.request_cancel()
+        message = (
+            getattr(getattr(orchestrator, "status", None), "message", "")
+            or "Stop requested. Finishing the current item before stopping."
+        )
+        repo_service = getattr(request.app.state, "repository_service", None)
+        if (
+            repo_service is not None
+            and getattr(orchestrator, "writes_to_repository", False)
+            and hasattr(repo_service, "mark_source_tasks_cancelling")
+        ):
+            repo_service.mark_source_tasks_cancelling(message)
+        return {"job_id": job_id, "status": "cancelling", "message": message}
 
-    if orchestrator is None:
-        return {"job_id": job_id, "status": "running_no_handle"}
+    status = store.get_source_status(job_id) or {}
+    if status.get("state") == "cancelling":
+        return {
+            "job_id": job_id,
+            "status": "cancelling",
+            "message": status.get("message") or "Stop requested.",
+        }
+    if status.get("state") != "running":
+        return {"job_id": job_id, "status": "not_running"}
 
-    orchestrator.request_cancel()
-    return {"job_id": job_id, "status": "cancelling"}
+    return {"job_id": job_id, "status": "running_no_handle"}
 
 
 @router.get("/sources/{job_id}/status")
 async def get_source_download_status(job_id: str, request: Request) -> dict:
-    store = request.app.state.file_store
+    store = _job_store(request, job_id)
     if not store.job_exists(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
 
     status = store.get_source_status(job_id)
+    if status is None:
+        jobs = request.app.state.source_download_jobs
+        jobs_lock = request.app.state.source_download_lock
+        with jobs_lock:
+            orchestrator = jobs.get(job_id)
+        if orchestrator is not None:
+            if orchestrator.status is not None:
+                return orchestrator.status.model_dump(mode="json")
+
+            bibliography = store.load_artifact(job_id, "03_bibliography") or {}
+            if getattr(orchestrator, "target_rows", None):
+                pending_total = len(getattr(orchestrator, "target_rows", []))
+            else:
+                pending_total = len(
+                    [entry for entry in bibliography.get("entries", []) if isinstance(entry, dict)]
+                )
+            pending = SourceDownloadStatus(
+                job_id=job_id,
+                state="cancelling" if getattr(orchestrator, "cancel_requested", False) else "running",
+                total_urls=pending_total,
+                processed_urls=0,
+                cancel_requested=bool(getattr(orchestrator, "cancel_requested", False)),
+                cancel_requested_at=None,
+                stop_after_current_item=False,
+                message=(
+                    "Stop requested | stopping before the next item"
+                    if getattr(orchestrator, "cancel_requested", False)
+                    else "Preparing source task run..."
+                ),
+                run_download=orchestrator.run_download,
+                run_llm_cleanup=orchestrator.run_llm_cleanup,
+                run_llm_title=bool(getattr(orchestrator, "run_llm_title", False)),
+                run_llm_summary=orchestrator.run_llm_summary,
+                run_llm_rating=orchestrator.run_llm_rating,
+                force_redownload=orchestrator.force_redownload,
+                force_llm_cleanup=orchestrator.force_llm_cleanup,
+                force_title=bool(getattr(orchestrator, "force_title", False)),
+                force_summary=orchestrator.force_summary,
+                force_rating=orchestrator.force_rating,
+                output_dir=str(getattr(orchestrator, "status_output_dir", "output_run")),
+                manifest_csv=str(getattr(orchestrator, "status_manifest_csv", "output_run/manifest.csv")),
+                manifest_xlsx=str(getattr(orchestrator, "status_manifest_xlsx", "output_run/manifest.xlsx")),
+                bundle_file=str(getattr(orchestrator, "status_bundle_file", "output_run.zip")),
+                writes_to_repository=bool(getattr(orchestrator, "writes_to_repository", False)),
+                repository_path=str(getattr(orchestrator, "repository_path", "")),
+                selected_scope=str(getattr(orchestrator, "selected_scope", "")),
+                selected_import_id=str(getattr(orchestrator, "selected_import_id", "")),
+                items=[],
+            )
+            return pending.model_dump(mode="json")
+
     if status is None:
         artifact = store.load_artifact(job_id, "06_sources_manifest")
         if artifact is None:
@@ -313,8 +432,10 @@ async def get_source_download_status(job_id: str, request: Request) -> dict:
                 citation_number=row.citation_number,
                 status="completed" if row.fetch_status != "failed" else "failed",
                 fetch_status=row.fetch_status,
+                title_status=row.title_status,
                 llm_cleanup_status=row.llm_cleanup_status,
                 summary_status=row.summary_status,
+                rating_status=row.rating_status,
                 error_message=row.error_message,
             )
             for row in item_rows
@@ -342,7 +463,7 @@ async def get_source_download_status(job_id: str, request: Request) -> dict:
 
 @router.get("/sources/{job_id}/manifest/csv")
 async def download_source_manifest_csv(job_id: str, request: Request):
-    store = request.app.state.file_store
+    store = _job_store(request, job_id)
     if not store.job_exists(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -358,7 +479,7 @@ async def download_source_manifest_csv(job_id: str, request: Request):
 
 @router.get("/sources/{job_id}/manifest/xlsx")
 async def download_source_manifest_xlsx(job_id: str, request: Request):
-    store = request.app.state.file_store
+    store = _job_store(request, job_id)
     if not store.job_exists(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -374,7 +495,7 @@ async def download_source_manifest_xlsx(job_id: str, request: Request):
 
 @router.get("/sources/{job_id}/bundle")
 async def download_source_bundle(job_id: str, request: Request):
-    store = request.app.state.file_store
+    store = _job_store(request, job_id)
     if not store.job_exists(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
 

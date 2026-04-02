@@ -1,0 +1,224 @@
+version: "1.0"
+profile_id: "project_profile"
+profile_name: "Project-Specific Source Relevance Rubric"
+
+project_context:
+  purpose: >
+    Evaluate sources for relevance to the user's project goals. The model should
+    prioritize sources that are practical, applicable, and useful for the stated
+    audience and task, rather than merely topically adjacent.
+  audience: >
+    Define the intended audience here, for example instructors, apprentices,
+    program designers, technical assistance providers, researchers, or policy staff.
+  primary_use_cases:
+    - "Finding the most relevant sources for project goals"
+    - "Summarizing and tagging sources"
+    - "Filtering out weak, niche, obsolete, or low-transferability sources"
+    - "Supporting curriculum, implementation, strategy, or operational decisions"
+
+relevance_guidance:
+  prioritize:
+    - label: "Practical applicability"
+      description: >
+        Prefer sources that support real decisions, implementation, field practice,
+        training, maintenance, commissioning, troubleshooting, equipment selection,
+        certification alignment, or partner engagement.
+    - label: "Broad transferability"
+      description: >
+        Prefer sources whose lessons generalize across many sites, projects, or
+        common use cases, rather than highly unusual or one-off conditions.
+    - label: "Actionable detail"
+      description: >
+        Prefer sources that include procedures, requirements, examples, lessons
+        learned, concrete recommendations, or implementation guidance.
+    - label: "Current usefulness"
+      description: >
+        Prefer sources that remain relevant to current technologies, practices,
+        and stakeholder needs.
+
+  deprioritize:
+    - label: "Obsolete or unavailable technologies"
+      description: >
+        Down-rank sources focused on products, systems, or approaches that are no
+        longer commercially available or no longer useful for current practice.
+    - label: "Highly niche systems"
+      description: >
+        Down-rank sources focused on highly specialized, custom, or narrow systems
+        that are unlikely to be broadly useful to the intended audience.
+    - label: "Policy-heavy but not practice-relevant"
+      description: >
+        Down-rank sources that are primarily about policy, market design, incentives,
+        or regulatory framing when they provide little practical value for the
+        intended hands-on or implementation-oriented purpose.
+    - label: "Overly site-specific"
+      description: >
+        Down-rank sources that are tightly tied to a small number of specific sites,
+        pilots, or unique project conditions unless they extract lessons that clearly
+        generalize to broader practice.
+
+scoring:
+  scale:
+    min: 0.0
+    max: 1.0
+    step: 0.05
+    interpretation: >
+      Scores must be assigned in increments of 0.05 only.
+
+  dimensions:
+    - id: "overall_relevance"
+      name: "Overall relevance"
+      description: >
+        Measures how well the source serves the project's stated purpose.
+        Consider practical value, applicability, transferability, and alignment
+        with the intended audience and task.
+      anchors:
+        high: >
+          The source is strongly aligned with the project purpose and would likely
+          be useful for decision-making, filtering, summarization, or direct use.
+        medium: >
+          The source is partially aligned and contains some useful material, but
+          is not a strong fit overall.
+        low: >
+          The source is only loosely related, mostly tangential, or not useful for
+          the intended purpose.
+
+    - id: "depth_score"
+      name: "Source depth and comprehensiveness"
+      description: >
+        Measures how detailed, thorough, and developed the source is overall,
+        regardless of whether all of that detail is relevant to the project.
+      anchors:
+        1.0: >
+          Exceptionally thorough and well-developed. Substantial technical,
+          procedural, explanatory, or analytical depth.
+        0.75: >
+          Clearly substantial and detailed, though not fully comprehensive.
+        0.5: >
+          Moderately developed. More than a short summary, but limited in depth.
+        0.25: >
+          Thin treatment. Mostly overview or summary-level content.
+        0.0: >
+          Extremely brief, fragmentary, or insubstantial.
+
+    - id: "relevant_detail_score"
+      name: "Relevant detail density"
+      description: >
+        Measures how much of the source's substantive detail is actually useful
+        for the project's purpose. This should distinguish a long but mostly
+        irrelevant document from a long and highly useful one.
+      scoring_instruction: >
+        Score higher when relevant material is substantial and central to the
+        source. Score lower when relevant material is sparse, incidental, or
+        confined to isolated passages.
+      anchors:
+        1.0: >
+          Nearly all substantive detail is directly useful for the project's purpose.
+        0.75: >
+          Most of the detail is relevant, with limited off-scope material.
+        0.5: >
+          Mixed relevance. Contains meaningful useful material, but much of the
+          source is not directly relevant.
+        0.25: >
+          Only a small portion of the source is useful. Most detail is off-scope.
+        0.0: >
+          Almost none of the substantive detail is useful for the project's purpose.
+
+confidence:
+  description: >
+    Each scored dimension must also receive a confidence score using the same
+    0.00 to 1.00 scale in 0.05 increments. Confidence measures how certain the
+    model is that the assigned score is correct.
+  anchors:
+    1.0: >
+      Very high confidence. The source is clear, explicit, and easy to classify.
+    0.75: >
+      Good confidence. Enough evidence exists to support the score with limited ambiguity.
+    0.5: >
+      Moderate confidence. The score is reasonable but some ambiguity remains.
+    0.25: >
+      Low confidence. Evidence is incomplete, partial, or difficult to interpret.
+    0.0: >
+      Very low confidence. There is not enough clear evidence for a reliable score.
+
+model_instructions:
+  required_behavior:
+    - "Use only the content of the source and the imported rubric file."
+    - "Do not infer high relevance merely from document length."
+    - "Do not confuse topic adjacency with project relevance."
+    - "Separate source depth from relevant detail."
+    - "Use 0.05 increments only."
+    - "Assign a confidence score for every scored field."
+    - "When evidence is limited or ambiguous, lower confidence rather than pretending certainty."
+  reasoning_principles:
+    - "A long source may score high on depth and low on relevant detail."
+    - "A short source may score low on depth and high on relevance if it is concise but directly useful."
+    - "A source should be down-ranked if it is obsolete, too niche, too policy-heavy for the use case, or too site-specific to generalize."
+
+flags:
+  - id: "obsolete"
+    description: "Source focuses on outdated or unavailable technologies"
+  - id: "too_niche"
+    description: "Source is too specialized to be broadly useful"
+  - id: "too_policy_heavy"
+    description: "Source is mostly policy-oriented and weak on practical implementation"
+  - id: "too_site_specific"
+    description: "Source is overly tied to a small number of sites or unusual conditions"
+
+output_contract:
+  format: "json"
+  fields:
+    - name: "overall_relevance"
+      type: "number"
+    - name: "overall_relevance_confidence"
+      type: "number"
+    - name: "depth_score"
+      type: "number"
+    - name: "depth_confidence"
+      type: "number"
+    - name: "relevant_detail_score"
+      type: "number"
+    - name: "relevant_detail_confidence"
+      type: "number"
+    - name: "rationale"
+      type: "string"
+    - name: "key_relevant_sections"
+      type: "array"
+      item_type: "string"
+    - name: "tags"
+      type: "array"
+      item_type: "string"
+    - name: "flags"
+      type: "object"
+      description: "Per-flag float scores (0.0-1.0, 0.05 increments)"
+  output_rules:
+    - "All numeric values must be between 0.00 and 1.00"
+    - "All numeric values must be in increments of 0.05"
+    - "Rationale should be concise and evidence-based"
+    - "Key relevant sections should identify where the useful material appears"
+    - "Tags should reflect source content and project usefulness"
+
+examples:
+  - source_type: "short website blurb"
+    example_scores:
+      overall_relevance: 0.2
+      overall_relevance_confidence: 0.9
+      depth_score: 0.15
+      depth_confidence: 0.95
+      relevant_detail_score: 0.2
+      relevant_detail_confidence: 0.9
+  - source_type: "long policy document with limited practical relevance"
+    example_scores:
+      overall_relevance: 0.3
+      overall_relevance_confidence: 0.85
+      depth_score: 0.9
+      depth_confidence: 0.95
+      relevant_detail_score: 0.25
+      relevant_detail_confidence: 0.85
+  - source_type: "technical guide strongly aligned with project purpose"
+    example_scores:
+      overall_relevance: 0.95
+      overall_relevance_confidence: 0.9
+      depth_score: 0.85
+      depth_confidence: 0.9
+      relevant_detail_score: 0.95
+      relevant_detail_confidence: 0.9

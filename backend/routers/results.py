@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse
 from backend.models.export import ExportArtifact
 from backend.models.sources import SourceManifestRow
 from backend.pipeline.stage_export_sqlite import build_wikiclaude_sqlite_db
+from backend.storage.project_profiles import list_project_profiles_in_dir
 
 router = APIRouter()
 
@@ -22,6 +23,13 @@ STAGE_FILES = {
     "export": "05_export",
     "sources": "06_sources_manifest",
 }
+
+
+def _job_store(request: Request, job_id: str):
+    repo_service = getattr(request.app.state, "repository_service", None)
+    if repo_service is not None:
+        return repo_service.job_store_for(job_id)
+    return request.app.state.file_store
 
 
 def _resolve_output_file(output_dir: Path, relative_path: str) -> Path | None:
@@ -64,7 +72,7 @@ async def get_results(
     request: Request,
     stage: str | None = Query(None),
 ) -> dict:
-    store = request.app.state.file_store
+    store = _job_store(request, job_id)
     if not store.job_exists(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -120,7 +128,7 @@ async def get_results(
 
 @router.get("/export/{job_id}/csv")
 async def export_csv(job_id: str, request: Request):
-    store = request.app.state.file_store
+    store = _job_store(request, job_id)
     if not store.job_exists(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -137,7 +145,7 @@ async def export_csv(job_id: str, request: Request):
 
 @router.get("/export/{job_id}/sqlite")
 async def export_sqlite(job_id: str, request: Request):
-    store = request.app.state.file_store
+    store = _job_store(request, job_id)
     if not store.job_exists(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -178,9 +186,11 @@ async def export_sqlite(job_id: str, request: Request):
 
 @router.get("/project-profiles")
 async def list_project_profiles(request: Request) -> list[dict]:
-    """Return the list of available project profile YAML files."""
-    store = request.app.state.file_store
-    return store.list_project_profiles()
+    """Return the list of available project profile YAML files from the attached repo."""
+    service = request.app.state.repository_service
+    if not service.is_attached:
+        return []
+    return list_project_profiles_in_dir(service.project_profiles_dir)
 
 
 @router.post("/project-profiles/upload")
@@ -188,15 +198,18 @@ async def upload_project_profile(
     request: Request,
     file: UploadFile = File(...),
 ) -> dict:
-    """Upload a project profile YAML file."""
-    store = request.app.state.file_store
+    """Upload a project profile YAML file into the attached repo."""
+    service = request.app.state.repository_service
+    if not service.is_attached:
+        raise HTTPException(status_code=400, detail="No repository attached")
+
     filename = file.filename or "profile.yaml"
     if not filename.endswith((".yaml", ".yml")):
         raise HTTPException(status_code=400, detail="File must be a .yaml or .yml file")
 
     safe_name = Path(filename).name
     content = await file.read()
-    dest = store.project_profiles_dir / safe_name
+    dest = service.project_profiles_dir / safe_name
     dest.write_bytes(content)
 
     return {"filename": safe_name, "name": Path(safe_name).stem}
@@ -207,7 +220,7 @@ async def upload_project_profile(
 @router.get("/sources/{job_id}/ratings")
 async def get_source_ratings(job_id: str, request: Request) -> dict:
     """Return all rating JSON files for a job."""
-    store = request.app.state.file_store
+    store = _job_store(request, job_id)
     if not store.job_exists(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -228,7 +241,7 @@ async def get_source_ratings(job_id: str, request: Request) -> dict:
 @router.get("/sources/{job_id}/ratings/{source_id}")
 async def get_source_rating(job_id: str, source_id: str, request: Request) -> dict:
     """Return a single source's rating JSON."""
-    store = request.app.state.file_store
+    store = _job_store(request, job_id)
     if not store.job_exists(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
 

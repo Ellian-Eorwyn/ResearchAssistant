@@ -103,6 +103,43 @@ class SourceDownloadCancellationTests(unittest.TestCase):
         self.assertEqual(status["state"], "cancelled")
         self.assertEqual(status["total_urls"], 2)
         self.assertEqual(status["processed_urls"], 0)
+        self.assertTrue(status["cancel_requested"])
+
+    def test_request_cancel_marks_live_status_cancelling(self):
+        job_id = self.store.create_job()
+        orchestrator = SourceDownloadOrchestrator(job_id=job_id, store=self.store)
+        targets = [
+            SourceTarget(
+                id="000001",
+                source_document_name="doc-a.md",
+                citation_number="1",
+                original_url="https://example.com/a",
+            ),
+        ]
+        runtime_caps = RuntimeCapabilities(
+            trafilatura_available=False,
+            playwright_python_available=False,
+            playwright_browser_available=False,
+            textutil_available=False,
+            tesseract_available=False,
+            llm_vision_enabled=False,
+            runtime_notes=[],
+            runtime_guidance=[],
+        )
+
+        orchestrator._initialize_status(
+            targets=targets,
+            runtime_capabilities=runtime_caps,
+            existing_rows=[],
+        )
+        orchestrator._mark_item_running(targets[0])
+        orchestrator.request_cancel()
+
+        status = self.store.get_source_status(job_id)
+        self.assertEqual(status["state"], "cancelling")
+        self.assertTrue(status["cancel_requested"])
+        self.assertTrue(status["stop_after_current_item"])
+        self.assertIn("finishing current item before stopping", status["message"])
 
 
 if __name__ == "__main__":

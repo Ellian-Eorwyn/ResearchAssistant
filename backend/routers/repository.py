@@ -2,22 +2,145 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+import os
+import platform
+import subprocess
+
+from fastapi import APIRouter, Body, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 
+from backend.models.ingestion_profiles import (
+    IngestionProfile,
+    IngestionProfileActionResponse,
+    IngestionProfileListResponse,
+    IngestionProfileSuggestionActionResponse,
+    IngestionProfileSuggestionListResponse,
+)
 from backend.models.repository import (
     AttachRepositoryRequest,
+    CreateRepositoryRequest,
     RepositoryActionResponse,
+    RepositoryDocumentImportListResponse,
+    RepositorySourceDeleteRequest,
+    RepositorySourceDeleteResponse,
+    RepositorySourceExportRequest,
+    RepositorySourceExportResponse,
     RepositoryExportJobRequest,
     RepositoryExportJobResponse,
     RepositoryImportResponse,
     RepositoryMergeRequest,
     RepositoryMergeResponse,
+    RepositoryProcessDocumentsResponse,
+    RepositoryReprocessDocumentsRequest,
+    RepositoryReprocessDocumentsResponse,
+    RepositorySourceTaskRequest,
+    RepositorySourceTaskResponse,
     RepositoryStatusResponse,
 )
-from backend.models.settings import AppSettings
+from backend.models.settings import RepoSettings
 
 router = APIRouter()
+
+
+def _pick_directory_dialog(mode: str, initial_path: str = "") -> str:
+    """Open a native folder picker and return the selected absolute path."""
+    if mode == "open":
+        title = "Select an existing ResearchAssistant repository"
+    elif mode == "create":
+        title = "Select a folder for the new ResearchAssistant repository"
+    else:
+        title = "Select an export destination folder"
+    normalized_initial = (initial_path or "").strip()
+    initialdir = (
+        normalized_initial
+        if normalized_initial and os.path.isdir(normalized_initial)
+        else os.path.expanduser("~")
+    )
+
+    # Use the OS-native dialog on macOS (no Tk root window side effects).
+    if platform.system().lower() == "darwin":
+        return _pick_directory_dialog_macos(title=title, initialdir=initialdir)
+
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as exc:  # pragma: no cover - environment-specific
+        raise RuntimeError("Native folder picker is unavailable in this runtime.") from exc
+
+    root = tk.Tk()
+    # Keep helper root hidden; the native chooser is shown as a child dialog.
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+    root.update()
+    try:
+        selected = filedialog.askdirectory(
+            parent=root,
+            title=title,
+            initialdir=initialdir,
+            mustexist=(mode in {"open", "export"}),
+        )
+    finally:
+        try:
+            root.attributes("-topmost", False)
+        except Exception:
+            pass
+        root.destroy()
+    return str(selected or "").strip()
+
+
+def _pick_directory_dialog_macos(title: str, initialdir: str) -> str:
+    """Use AppleScript choose-folder dialog so the system file browser is used."""
+    escaped_title = (
+        str(title or "")
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+    )
+    escaped_initialdir = (
+        str(initialdir or os.path.expanduser("~"))
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+    )
+    script_lines = [
+        'tell application "Finder" to activate',
+        f'set defaultFolder to POSIX file "{escaped_initialdir}"',
+        f'set chosenFolder to choose folder with prompt "{escaped_title}" default location defaultFolder',
+        "return POSIX path of chosenFolder",
+    ]
+    try:
+        result = subprocess.run(
+            ["osascript", *sum([["-e", line] for line in script_lines], [])],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception as exc:  # pragma: no cover - environment-specific
+        raise RuntimeError("Native folder picker is unavailable in this runtime.") from exc
+
+    if result.returncode != 0:
+        combined = f"{result.stderr}\n{result.stdout}".strip().lower()
+        if "user canceled" in combined or "cancel" in combined:
+            return ""
+        raise RuntimeError("Native folder picker failed.")
+
+    return str(result.stdout or "").strip()
+
+
+# ---- Create / Open ----
+
+@router.post("/repository/create", response_model=RepositoryStatusResponse)
+async def create_repository(
+    request: Request,
+    payload: CreateRepositoryRequest,
+) -> RepositoryStatusResponse:
+    service = request.app.state.repository_service
+    try:
+        status = service.create(payload.path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return status
 
 
 @router.post("/repository/attach", response_model=RepositoryStatusResponse)
@@ -30,20 +153,246 @@ async def attach_repository(
         status = service.attach(payload.path)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    store = request.app.state.file_store
-    raw_settings = store.load_settings()
-    settings = AppSettings(**raw_settings) if raw_settings else AppSettings()
-    settings.repository_path = status.path
-    store.save_settings(settings.model_dump(mode="json"))
     return status
 
+
+# ---- Per-repo settings ----
+
+@router.get("/repository/settings")
+async def get_repo_settings(request: Request) -> dict:
+    service = request.app.state.repository_service
+    if not service.is_attached:
+        raise HTTPException(status_code=400, detail="No repository attached")
+    return service.load_repo_settings().model_dump(mode="json")
+
+
+@router.put("/repository/settings")
+async def save_repo_settings(
+    request: Request,
+    payload: dict = Body(...),
+) -> dict:
+    service = request.app.state.repository_service
+    if not service.is_attached:
+        raise HTTPException(status_code=400, detail="No repository attached")
+    current = service.load_repo_settings()
+    merged = current.model_dump(mode="json")
+    merged.update(payload or {})
+    settings = RepoSettings(**merged)
+    service.save_repo_settings(settings)
+    return settings.model_dump(mode="json")
+
+
+@router.get("/repository/ingestion-profiles", response_model=IngestionProfileListResponse)
+async def list_ingestion_profiles(request: Request) -> IngestionProfileListResponse:
+    service = request.app.state.repository_service
+    if not service.is_attached:
+        raise HTTPException(status_code=400, detail="No repository attached")
+    return service.list_ingestion_profiles()
+
+
+@router.post("/repository/ingestion-profiles", response_model=IngestionProfileActionResponse)
+async def create_ingestion_profile(
+    request: Request,
+    payload: IngestionProfile,
+) -> IngestionProfileActionResponse:
+    service = request.app.state.repository_service
+    if not service.is_attached:
+        raise HTTPException(status_code=400, detail="No repository attached")
+    try:
+        return service.save_ingestion_profile(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put("/repository/ingestion-profiles/{profile_id}", response_model=IngestionProfileActionResponse)
+async def update_ingestion_profile(
+    profile_id: str,
+    request: Request,
+    payload: IngestionProfile,
+) -> IngestionProfileActionResponse:
+    service = request.app.state.repository_service
+    if not service.is_attached:
+        raise HTTPException(status_code=400, detail="No repository attached")
+    try:
+        updated = payload.model_copy(update={"profile_id": profile_id, "built_in": False})
+        return service.save_ingestion_profile(updated)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/repository/ingestion-profiles/{profile_id}", response_model=IngestionProfileActionResponse)
+async def delete_ingestion_profile(
+    profile_id: str,
+    request: Request,
+) -> IngestionProfileActionResponse:
+    service = request.app.state.repository_service
+    if not service.is_attached:
+        raise HTTPException(status_code=400, detail="No repository attached")
+    try:
+        return service.delete_ingestion_profile(profile_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get(
+    "/repository/ingestion-profile-suggestions",
+    response_model=IngestionProfileSuggestionListResponse,
+)
+async def list_ingestion_profile_suggestions(
+    request: Request,
+) -> IngestionProfileSuggestionListResponse:
+    service = request.app.state.repository_service
+    if not service.is_attached:
+        raise HTTPException(status_code=400, detail="No repository attached")
+    return service.list_ingestion_profile_suggestions()
+
+
+@router.get(
+    "/repository/document-imports",
+    response_model=RepositoryDocumentImportListResponse,
+)
+async def list_repository_document_imports(
+    request: Request,
+) -> RepositoryDocumentImportListResponse:
+    service = request.app.state.repository_service
+    if not service.is_attached:
+        raise HTTPException(status_code=400, detail="No repository attached")
+    return service.list_document_imports()
+
+
+@router.post(
+    "/repository/ingestion-profile-suggestions/{suggestion_id}/accept",
+    response_model=IngestionProfileSuggestionActionResponse,
+)
+async def accept_ingestion_profile_suggestion(
+    suggestion_id: str,
+    request: Request,
+) -> IngestionProfileSuggestionActionResponse:
+    service = request.app.state.repository_service
+    if not service.is_attached:
+        raise HTTPException(status_code=400, detail="No repository attached")
+    try:
+        return service.accept_ingestion_profile_suggestion(suggestion_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post(
+    "/repository/ingestion-profile-suggestions/{suggestion_id}/reject",
+    response_model=IngestionProfileSuggestionActionResponse,
+)
+async def reject_ingestion_profile_suggestion(
+    suggestion_id: str,
+    request: Request,
+) -> IngestionProfileSuggestionActionResponse:
+    service = request.app.state.repository_service
+    if not service.is_attached:
+        raise HTTPException(status_code=400, detail="No repository attached")
+    try:
+        return service.reject_ingestion_profile_suggestion(suggestion_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+# ---- Status ----
 
 @router.get("/repository/status", response_model=RepositoryStatusResponse)
 async def get_repository_status(request: Request) -> RepositoryStatusResponse:
     service = request.app.state.repository_service
     return service.get_status()
 
+
+@router.get("/repository/pick-directory")
+async def pick_repository_directory(
+    mode: str = Query(default="open"),
+    initial_path: str = Query(default=""),
+) -> dict:
+    normalized_mode = (mode or "").strip().lower()
+    if normalized_mode not in {"open", "create", "export"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid mode. Use `open`, `create`, or `export`.",
+        )
+    try:
+        selected = _pick_directory_dialog(normalized_mode, initial_path=initial_path)
+    except RuntimeError as exc:  # pragma: no cover - environment-specific
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
+    except Exception as exc:  # pragma: no cover - environment-specific
+        raise HTTPException(status_code=500, detail=f"Folder picker failed: {exc}") from exc
+    return {"path": selected}
+
+
+@router.get("/repository/dashboard")
+async def get_repository_dashboard(request: Request) -> dict:
+    service = request.app.state.repository_service
+    if not service.is_attached:
+        raise HTTPException(status_code=400, detail="No repository attached")
+    try:
+        return service.get_dashboard()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/repository/manifest")
+async def get_repository_manifest(
+    request: Request,
+    q: str = "",
+    fetch_status: str = "",
+    detected_type: str = "",
+    has_summary: bool | None = Query(default=None),
+    has_rating: bool | None = Query(default=None),
+    rating_overall_min: float | None = Query(default=None),
+    rating_overall_max: float | None = Query(default=None),
+    rating_overall_relevance_min: float | None = Query(default=None),
+    rating_overall_relevance_max: float | None = Query(default=None),
+    rating_depth_score_min: float | None = Query(default=None),
+    rating_depth_score_max: float | None = Query(default=None),
+    rating_relevant_detail_score_min: float | None = Query(default=None),
+    rating_relevant_detail_score_max: float | None = Query(default=None),
+    sort_by: str = "id",
+    sort_dir: str = "asc",
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict:
+    service = request.app.state.repository_service
+    if not service.is_attached:
+        raise HTTPException(status_code=400, detail="No repository attached")
+    try:
+        return service.list_manifest(
+            q=q,
+            fetch_status=fetch_status,
+            detected_type=detected_type,
+            has_summary=has_summary,
+            has_rating=has_rating,
+            rating_overall_min=rating_overall_min,
+            rating_overall_max=rating_overall_max,
+            rating_overall_relevance_min=rating_overall_relevance_min,
+            rating_overall_relevance_max=rating_overall_relevance_max,
+            rating_depth_score_min=rating_depth_score_min,
+            rating_depth_score_max=rating_depth_score_max,
+            rating_relevant_detail_score_min=rating_relevant_detail_score_min,
+            rating_relevant_detail_score_max=rating_relevant_detail_score_max,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+            limit=limit,
+            offset=offset,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/repository/citation-data")
+async def get_repository_citation_data(request: Request) -> dict:
+    service = request.app.state.repository_service
+    if not service.is_attached:
+        raise HTTPException(status_code=400, detail="No repository attached")
+    try:
+        return service.get_citation_data()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# ---- Import ----
 
 @router.post("/repository/import/source-list", response_model=RepositoryImportResponse)
 async def import_repository_source_list(
@@ -73,12 +422,55 @@ async def import_repository_document(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/repository/process-documents", response_model=RepositoryProcessDocumentsResponse)
+async def process_repository_documents(
+    request: Request,
+    files: list[UploadFile] = File(...),
+    profile_override: str = Form(default=""),
+) -> RepositoryProcessDocumentsResponse:
+    service = request.app.state.repository_service
+    settings = service.load_repo_settings()
+
+    prepared_files: list[tuple[str, bytes]] = []
+    for file in files:
+        prepared_files.append((file.filename or "document.md", await file.read()))
+
+    try:
+        return service.process_documents(
+            prepared_files,
+            settings=settings,
+            profile_override=profile_override,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/repository/reprocess-documents",
+    response_model=RepositoryReprocessDocumentsResponse,
+)
+async def reprocess_repository_documents(
+    request: Request,
+    payload: RepositoryReprocessDocumentsRequest,
+) -> RepositoryReprocessDocumentsResponse:
+    service = request.app.state.repository_service
+    settings = service.load_repo_settings()
+    try:
+        return service.reprocess_documents(
+            target_import_ids=payload.target_import_ids,
+            settings=settings,
+            profile_override=payload.profile_override,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# ---- Download / Rebuild ----
+
 @router.post("/repository/download", response_model=RepositoryActionResponse)
 async def start_repository_download(request: Request) -> RepositoryActionResponse:
     service = request.app.state.repository_service
-    store = request.app.state.file_store
-    raw_settings = store.load_settings()
-    settings = AppSettings(**raw_settings) if raw_settings else AppSettings()
+    settings = service.load_repo_settings()
     try:
         return service.start_download(settings=settings)
     except ValueError as exc:
@@ -90,6 +482,100 @@ async def rebuild_repository_outputs(request: Request) -> RepositoryActionRespon
     service = request.app.state.repository_service
     try:
         return service.rebuild()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/repository/clear-citations", response_model=RepositoryActionResponse)
+async def clear_repository_citations(request: Request) -> RepositoryActionResponse:
+    service = request.app.state.repository_service
+    try:
+        return service.clear_citations()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/repository/cleanup", response_model=RepositoryActionResponse)
+async def cleanup_repository_layout(request: Request) -> RepositoryActionResponse:
+    service = request.app.state.repository_service
+    try:
+        return service.cleanup_repository_layout()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/repository/source-tasks", response_model=RepositorySourceTaskResponse)
+async def run_repository_source_tasks(
+    request: Request,
+    payload: RepositorySourceTaskRequest,
+) -> RepositorySourceTaskResponse:
+    service = request.app.state.repository_service
+    settings = service.load_repo_settings()
+    jobs = request.app.state.source_download_jobs
+    jobs_lock = request.app.state.source_download_lock
+    try:
+        return service.start_source_tasks(
+            payload=payload,
+            settings=settings,
+            live_jobs=jobs,
+            live_jobs_lock=jobs_lock,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/repository/sources/{source_id}/files/{kind}")
+async def open_repository_source_file(
+    source_id: str,
+    kind: str,
+    request: Request,
+):
+    service = request.app.state.repository_service
+    try:
+        path, media_type, headers = service.resolve_source_file(source_id=source_id, kind=kind)
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 404 if "not found" in detail.lower() or "no file" in detail.lower() else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+    return FileResponse(
+        path=str(path),
+        media_type=media_type,
+        headers=headers,
+    )
+
+
+@router.post(
+    "/repository/sources/bulk-delete",
+    response_model=RepositorySourceDeleteResponse,
+)
+async def bulk_delete_repository_sources(
+    request: Request,
+    payload: RepositorySourceDeleteRequest,
+) -> RepositorySourceDeleteResponse:
+    service = request.app.state.repository_service
+    try:
+        return service.delete_sources(payload.source_ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/repository/sources/export-files",
+    response_model=RepositorySourceExportResponse,
+)
+async def export_repository_source_files(
+    request: Request,
+    payload: RepositorySourceExportRequest,
+) -> RepositorySourceExportResponse:
+    service = request.app.state.repository_service
+    try:
+        return service.export_source_files(
+            source_ids=payload.source_ids,
+            file_kinds=payload.file_kinds,
+            destination_path=payload.destination_path,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -107,6 +593,8 @@ async def create_repository_export_job(
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+
+# ---- Exports ----
 
 @router.get("/repository/manifest/csv")
 async def download_repository_manifest_csv(request: Request):
@@ -156,30 +644,23 @@ async def download_repository_citations_csv(request: Request):
     )
 
 
+# ---- Merge ----
+
 @router.post("/repository/merge", response_model=RepositoryMergeResponse)
 async def merge_repositories(
     request: Request,
     payload: RepositoryMergeRequest,
 ) -> RepositoryMergeResponse:
     service = request.app.state.repository_service
-    if not payload.primary_path.strip():
-        raise HTTPException(status_code=400, detail="Primary path is required")
-    if not payload.secondary_path.strip():
-        raise HTTPException(status_code=400, detail="Secondary path is required")
-    if payload.output_mode not in ("new", "into_primary"):
-        raise HTTPException(status_code=400, detail="output_mode must be 'new' or 'into_primary'")
-    if payload.output_mode == "new" and not payload.output_path.strip():
-        raise HTTPException(status_code=400, detail="output_path is required when output_mode is 'new'")
+    if not payload.source_paths:
+        raise HTTPException(status_code=400, detail="At least one source path is required")
     try:
-        return service.start_merge(
-            primary_path=payload.primary_path,
-            secondary_path=payload.secondary_path,
-            output_mode=payload.output_mode,
-            output_path=payload.output_path,
-        )
+        return service.start_merge(source_paths=payload.source_paths)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+
+# ---- SQLite ----
 
 @router.get("/repository/export/sqlite")
 async def export_repository_sqlite(request: Request):
@@ -194,5 +675,3 @@ async def export_repository_sqlite(request: Request):
         media_type="application/x-sqlite3",
         filename="wikiclaude_export.db",
     )
-
-

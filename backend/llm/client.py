@@ -19,9 +19,20 @@ class UnifiedLLMClient:
     def __init__(self, config: LLMBackendConfig):
         self.config = config
         self._client = httpx.AsyncClient(timeout=120.0)
+        self._sync_client: httpx.Client | None = None
 
     async def close(self) -> None:
         await self._client.aclose()
+
+    def sync_close(self) -> None:
+        if self._sync_client is not None:
+            self._sync_client.close()
+            self._sync_client = None
+
+    def _get_sync_client(self) -> httpx.Client:
+        if self._sync_client is None:
+            self._sync_client = httpx.Client(timeout=self.config.llm_timeout)
+        return self._sync_client
 
     async def list_models(self) -> list[str]:
         """List available models from the configured backend."""
@@ -65,6 +76,18 @@ class UnifiedLLMClient:
         else:
             return await self._openai_chat(system_prompt, user_prompt, response_format)
 
+    def sync_chat_completion(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        response_format: str | None = "json",
+    ) -> str:
+        """Synchronous chat completion using a shared httpx.Client."""
+        if self.config.kind == "ollama":
+            return self._ollama_chat_sync(system_prompt, user_prompt, response_format)
+        else:
+            return self._openai_chat_sync(system_prompt, user_prompt, response_format)
+
     async def vision_ocr(
         self,
         prompt: str,
@@ -76,28 +99,13 @@ class UnifiedLLMClient:
             return await self._ollama_vision_ocr(prompt, image_bytes)
         return await self._openai_vision_ocr(prompt, image_bytes, mime_type)
 
+    # ---- Async chat methods ----
+
     async def _ollama_chat(
         self, system: str, user: str, fmt: str | None
     ) -> str:
         base = self.config.base_url.rstrip("/")
-        body: dict = {
-            "model": self.config.model,
-            "stream": False,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "options": {
-                "temperature": self.config.temperature,
-                "num_ctx": 8192,
-            },
-        }
-        if fmt == "json":
-            body["format"] = "json"
-        think_value = _ollama_think_value(self.config.think_mode)
-        if think_value is not None:
-            body["think"] = think_value
-
+        body = self._build_ollama_body(system, user, fmt)
         resp = await self._client.post(f"{base}/api/chat", json=body)
         resp.raise_for_status()
         return resp.json()["message"]["content"]
@@ -107,16 +115,7 @@ class UnifiedLLMClient:
     ) -> str:
         base = self.config.base_url.rstrip("/")
         headers = self._openai_headers()
-        body: dict = {
-            "model": self.config.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": 0,
-        }
-        if fmt == "json":
-            body["response_format"] = {"type": "json_object"}
+        body = self._build_openai_body(system, user, fmt)
 
         for path in ["/v1/chat/completions", "/chat/completions"]:
             try:
@@ -133,6 +132,88 @@ class UnifiedLLMClient:
                 raise
 
         raise ValueError("Could not reach chat completions endpoint")
+
+    # ---- Sync chat methods ----
+
+    def _ollama_chat_sync(
+        self, system: str, user: str, fmt: str | None
+    ) -> str:
+        client = self._get_sync_client()
+        base = self.config.base_url.rstrip("/")
+        body = self._build_ollama_body(system, user, fmt)
+        resp = client.post(
+            f"{base}/api/chat", json=body, timeout=self.config.llm_timeout
+        )
+        resp.raise_for_status()
+        return resp.json()["message"]["content"]
+
+    def _openai_chat_sync(
+        self, system: str, user: str, fmt: str | None
+    ) -> str:
+        client = self._get_sync_client()
+        base = self.config.base_url.rstrip("/")
+        headers = self._openai_headers()
+        body = self._build_openai_body(system, user, fmt)
+
+        for path in ["/v1/chat/completions", "/chat/completions"]:
+            try:
+                resp = client.post(
+                    f"{base}{path}",
+                    json=body,
+                    headers=headers,
+                    timeout=self.config.llm_timeout,
+                )
+                if resp.status_code == 404:
+                    continue
+                resp.raise_for_status()
+                return resp.json()["choices"][0]["message"]["content"]
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 404:
+                    continue
+                raise
+
+        raise ValueError("Could not reach chat completions endpoint")
+
+    # ---- Shared body builders ----
+
+    def _build_ollama_body(
+        self, system: str, user: str, fmt: str | None
+    ) -> dict:
+        body: dict = {
+            "model": self.config.model,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "options": {
+                "temperature": self.config.temperature,
+                "num_ctx": self.config.num_ctx,
+            },
+        }
+        if fmt == "json":
+            body["format"] = "json"
+        think_value = _ollama_think_value(self.config.think_mode)
+        if think_value is not None:
+            body["think"] = think_value
+        return body
+
+    def _build_openai_body(
+        self, system: str, user: str, fmt: str | None
+    ) -> dict:
+        body: dict = {
+            "model": self.config.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": 0,
+        }
+        if fmt == "json":
+            body["response_format"] = {"type": "json_object"}
+        return body
+
+    # ---- Vision methods (async only) ----
 
     async def _ollama_vision_ocr(self, prompt: str, image_bytes: bytes) -> str:
         base = self.config.base_url.rstrip("/")

@@ -35,6 +35,8 @@ from backend.llm.prompts import (
     SOURCE_RATING_USER,
     SOURCE_SUMMARY_SYSTEM,
     SOURCE_SUMMARY_USER,
+    SOURCE_TITLE_SYSTEM,
+    SOURCE_TITLE_USER,
 )
 from backend.models.settings import LLMBackendConfig
 from backend.models.sources import (
@@ -46,6 +48,7 @@ from backend.models.sources import (
     SourceManifestArtifact,
     SourceManifestRow,
 )
+from backend.pipeline.standardized_markdown import extract_markdown_title_candidate
 from backend.storage.file_store import FileStore
 
 try:
@@ -65,8 +68,8 @@ PLAYWRIGHT_VIEWPORT_HEIGHT = 1200
 MAX_VISUAL_CAPTURE_SEGMENTS = 40
 MIN_MARKDOWN_SCORE = 180
 MIN_FALLBACK_MARKDOWN_SCORE = 20
-MAX_CLEANUP_SOURCE_CHARS = 24000
-MAX_SUMMARY_SOURCE_CHARS = 20000
+MAX_CLEANUP_SOURCE_CHARS = 24000  # legacy fallback
+MAX_SUMMARY_SOURCE_CHARS = 20000  # legacy fallback
 
 NOTE_RUNTIME_MISSING_TRAFILATURA = "runtime_missing_trafilatura"
 NOTE_RUNTIME_MISSING_PLAYWRIGHT = "runtime_missing_playwright"
@@ -80,6 +83,8 @@ NOTE_OCR_LLM_FALLBACK_USED = "ocr_llm_fallback_used"
 NOTE_DOC_CONVERSION_FAILED = "doc_conversion_failed"
 NOTE_LLM_CLEANUP_FAILED = "llm_cleanup_failed"
 NOTE_LLM_CLEANUP_SKIPPED_LLM_NOT_CONFIGURED = "llm_cleanup_skipped_llm_not_configured"
+NOTE_TITLE_GENERATION_FAILED = "title_generation_failed"
+NOTE_TITLE_SKIPPED_LLM_NOT_CONFIGURED = "title_skipped_llm_not_configured"
 NOTE_SUMMARY_GENERATION_FAILED = "summary_generation_failed"
 NOTE_SUMMARY_SKIPPED_LLM_NOT_CONFIGURED = "summary_skipped_llm_not_configured"
 NOTE_RATING_GENERATION_FAILED = "rating_generation_failed"
@@ -129,6 +134,34 @@ BLOCKED_PAGE_PATTERNS = [
 
 TRACKING_PARAM_EXACT = {"gclid", "fbclid", "msclkid"}
 TRACKING_PARAM_PREFIXES = ("utm_",)
+
+MANIFEST_DERIVED_COLUMNS = [
+    "summary_text",
+    "rating_overall",
+    "rating_confidence",
+    "rating_rationale",
+    "relevant_sections",
+    "rating_dimensions_json",
+    "flag_scores_json",
+    "rating_raw_json",
+]
+
+RATING_DIMENSION_CONTAINER_KEYS = ("ratings", "scores", "dimensions")
+RATING_RESERVED_KEYS = {
+    "confidence",
+    "rationale",
+    "relevant_sections",
+    "relevant_section",
+    "sections",
+    "flags",
+    "ratings",
+    "scores",
+    "dimensions",
+    "overall",
+    "overall_rating",
+    "overall_score",
+    "summary",
+}
 
 
 @dataclass
@@ -354,14 +387,24 @@ class SourceDownloadOrchestrator:
         fetch_delay: float = 2.0,
         run_download: bool = True,
         run_llm_cleanup: bool = False,
+        run_llm_title: bool = False,
         run_llm_summary: bool = True,
         run_llm_rating: bool = False,
         force_redownload: bool = False,
         force_llm_cleanup: bool = False,
+        force_title: bool = False,
         force_summary: bool = False,
         force_rating: bool = False,
+        project_profile_name: str = "",
         project_profile_yaml: str = "",
         output_options: SourceOutputOptions | None = None,
+        target_rows: list[SourceManifestRow] | None = None,
+        output_dir: Path | None = None,
+        writes_to_repository: bool = False,
+        repository_path: str = "",
+        selected_scope: str = "",
+        selected_import_id: str = "",
+        row_persist_callback: Callable[[SourceManifestRow], None] | None = None,
     ):
         self.job_id = job_id
         self.store = store
@@ -370,23 +413,35 @@ class SourceDownloadOrchestrator:
         self.llm_backend = llm_backend or LLMBackendConfig()
         self.research_purpose = (research_purpose or "").strip()
         self.fetch_delay = max(1.0, min(10.0, fetch_delay))
-        self.run_download = bool(run_download)
-        self.run_llm_cleanup = bool(run_llm_cleanup)
-        self.run_llm_summary = bool(run_llm_summary)
-        self.run_llm_rating = bool(run_llm_rating)
         self.force_redownload = bool(force_redownload)
         self.force_llm_cleanup = bool(force_llm_cleanup)
+        self.force_title = bool(force_title)
         self.force_summary = bool(force_summary)
         self.force_rating = bool(force_rating)
+        self.run_download = bool(run_download or self.force_redownload)
+        self.run_llm_cleanup = bool(run_llm_cleanup or self.force_llm_cleanup)
+        self.run_llm_title = bool(run_llm_title or self.force_title)
+        self.run_llm_summary = bool(run_llm_summary or self.force_summary)
+        self.run_llm_rating = bool(run_llm_rating or self.force_rating)
+        self.project_profile_name = (project_profile_name or "").strip()
         self.project_profile_yaml = (project_profile_yaml or "").strip()
         self.output_options = output_options or SourceOutputOptions()
-        self.output_dir = self.store.get_sources_output_dir(job_id)
-        self.logs_dir = self.output_dir / "logs"
+        self.target_rows = [row.model_copy(deep=True) for row in (target_rows or [])]
+        self.execution_output_dir = self.store.get_sources_output_dir(job_id)
+        self.output_dir = output_dir or self.execution_output_dir
+        self.writes_to_repository = bool(writes_to_repository)
+        self.repository_path = (repository_path or "").strip()
+        self.selected_scope = (selected_scope or "").strip()
+        self.selected_import_id = (selected_import_id or "").strip()
+        self.row_persist_callback = row_persist_callback
+        self.logs_dir = self.execution_output_dir / "logs"
         self.log_file = self.logs_dir / "source_download.jsonl"
         self.status: SourceDownloadStatus | None = None
         self._status_items: dict[str, SourceItemStatus] = {}
         self.duplicate_urls_removed = 0
         self._cancel_event = threading.Event()
+        self._llm_client: UnifiedLLMClient | None = None
+        self._incremental_save_counter: int = 0
         self.runtime_capabilities = RuntimeCapabilities(
             trafilatura_available=trafilatura is not None,
             playwright_python_available=False,
@@ -397,14 +452,100 @@ class SourceDownloadOrchestrator:
             runtime_notes=[],
             runtime_guidance=[],
         )
+        if self.writes_to_repository:
+            self.status_output_dir = "repository"
+            self.status_manifest_csv = "manifest.csv"
+            self.status_manifest_xlsx = "manifest.xlsx"
+            self.status_bundle_file = ""
+        else:
+            self.status_output_dir = "output_run"
+            self.status_manifest_csv = "output_run/manifest.csv"
+            self.status_manifest_xlsx = "output_run/manifest.xlsx"
+            self.status_bundle_file = "output_run.zip"
 
     def request_cancel(self) -> None:
         self._cancel_event.set()
+        self._mark_status_cancelling()
+
+    @property
+    def cancel_requested(self) -> bool:
+        return self._cancel_event.is_set()
+
+    def _has_running_item(self) -> bool:
+        return any(item.status == "running" for item in self._status_items.values())
+
+    def _mark_status_cancelling(self) -> None:
+        if not self.status:
+            return
+        if self.status.state in {"completed", "failed", "cancelled"}:
+            return
+        self.status.state = "cancelling"
+        self.status.cancel_requested = True
+        if not self.status.cancel_requested_at:
+            self.status.cancel_requested_at = _utc_now_iso()
+        self.status.stop_after_current_item = self._has_running_item()
+        self.status.message = self._compose_status_message("Stop requested")
+        self._save_status()
+
+    def _effective_max_source_chars(self) -> int:
+        """Return the max source chars to send to the LLM, auto-scaled or manual."""
+        manual = getattr(self.llm_backend, "max_source_chars", 0)
+        if manual > 0:
+            return manual
+        num_ctx = getattr(self.llm_backend, "num_ctx", 8192)
+        # Reserve ~1500 tokens for prompts + response, ~3 chars per token
+        return min((num_ctx - 1500) * 3, 60000)
+
+    def _truncate_for_llm(self, text: str, max_chars: int) -> str:
+        """Truncate text keeping start and end sections for better LLM context."""
+        if len(text) <= max_chars:
+            return text
+        head_chars = int(max_chars * 0.6)
+        tail_chars = int(max_chars * 0.3)
+        separator = "\n\n[... middle section truncated for length ...]\n\n"
+        return text[:head_chars] + separator + text[-tail_chars:]
+
+    def _maybe_incremental_save(
+        self,
+        rows_by_id: dict[str, SourceManifestRow],
+        targets: list,
+    ) -> None:
+        """Save an incremental manifest snapshot every 5 processed sources."""
+        self._incremental_save_counter += 1
+        if self._incremental_save_counter % 5 == 0:
+            self._save_incremental_manifest(rows_by_id, targets)
+
+    def _save_incremental_manifest(
+        self,
+        rows_by_id: dict[str, SourceManifestRow],
+        targets: list,
+    ) -> None:
+        """Save a JSON artifact snapshot of current progress."""
+        rows = [rows_by_id[t.id] for t in targets if t.id in rows_by_id]
+        if not rows:
+            return
+        counts = _count_fetch_outcomes(rows)
+        artifact = SourceManifestArtifact(
+            rows=rows,
+            total_urls=len(rows),
+            success_count=counts["success"],
+            failed_count=counts["failed"],
+            partial_count=counts["partial"],
+        )
+        self.store.save_artifact(
+            self.job_id, "06_sources_manifest", artifact.model_dump()
+        )
 
     def run(self) -> None:
         """Execute source downloads sequentially with per-URL fault isolation."""
         try:
-            if not (self.run_download or self.run_llm_cleanup or self.run_llm_summary or self.run_llm_rating):
+            if not (
+                self.run_download
+                or self.run_llm_cleanup
+                or self.run_llm_title
+                or self.run_llm_summary
+                or self.run_llm_rating
+            ):
                 raise RuntimeError("Select at least one phase to run")
             if self.run_download and not any(
                 [
@@ -441,18 +582,25 @@ class SourceDownloadOrchestrator:
                     "rerun_failed_only": self.rerun_failed_only,
                     "run_download": self.run_download,
                     "run_llm_cleanup": self.run_llm_cleanup,
+                    "run_llm_title": self.run_llm_title,
                     "run_llm_summary": self.run_llm_summary,
                     "run_llm_rating": self.run_llm_rating,
                     "force_redownload": self.force_redownload,
                     "force_llm_cleanup": self.force_llm_cleanup,
+                    "force_title": self.force_title,
                     "force_summary": self.force_summary,
                     "force_rating": self.force_rating,
+                    "project_profile_name": self.project_profile_name,
                     "output_options": self.output_options.model_dump(mode="json"),
                     "runtime_notes": self.runtime_capabilities.runtime_notes,
                     "runtime_guidance": self.runtime_capabilities.runtime_guidance,
                     "timestamp": _utc_now_iso(),
                 }
             )
+
+            # Create a shared LLM client for all LLM calls in this run
+            if self.use_llm and llm_backend_ready_for_chat(self.llm_backend):
+                self._llm_client = UnifiedLLMClient(self.llm_backend)
 
             timeout = httpx.Timeout(HTTP_TIMEOUT_SECONDS, connect=12.0)
             renderer_startup_error = ""
@@ -491,6 +639,7 @@ class SourceDownloadOrchestrator:
                                 row = self._process_existing_row(target, existing_row)
                                 rows_by_id[row.id] = row
                                 self._mark_item_finished(row)
+                                self._maybe_incremental_save(rows_by_id, targets)
                             else:
                                 self._mark_item_skipped(target.id, existing_row)
                             continue
@@ -502,6 +651,7 @@ class SourceDownloadOrchestrator:
                                     row = self._process_existing_row(target, existing_row)
                                     rows_by_id[row.id] = row
                                     self._mark_item_finished(row)
+                                    self._maybe_incremental_save(rows_by_id, targets)
                                 else:
                                     self._mark_item_skipped(target.id, existing_row)
                                 continue
@@ -514,7 +664,9 @@ class SourceDownloadOrchestrator:
                                 existing_row=existing_row,
                             )
                             rows_by_id[row.id] = row
+                            self._persist_sink_row(row)
                             self._mark_item_finished(row)
+                            self._maybe_incremental_save(rows_by_id, targets)
                         else:
                             if existing_row is None:
                                 self._mark_item_skipped(target.id, existing_row)
@@ -522,12 +674,17 @@ class SourceDownloadOrchestrator:
                             self._mark_item_running(target)
                             row = self._process_existing_row(target, existing_row)
                             rows_by_id[row.id] = row
+                            self._persist_sink_row(row)
                             self._mark_item_finished(row)
+                            self._maybe_incremental_save(rows_by_id, targets)
 
                         if idx < last_idx and not self._cancel_event.is_set():
                             self._cancel_event.wait(self.fetch_delay)
             finally:
                 renderer.close()
+                if self._llm_client is not None:
+                    self._llm_client.sync_close()
+                    self._llm_client = None
 
             final_rows = [rows_by_id[t.id] for t in targets if t.id in rows_by_id]
             counts = _count_fetch_outcomes(final_rows)
@@ -540,14 +697,18 @@ class SourceDownloadOrchestrator:
             )
             output_summary = summarize_output_rows(final_rows)
 
-            csv_content = build_manifest_csv(final_rows)
-            xlsx_bytes = build_manifest_xlsx(final_rows)
+            csv_content = build_manifest_csv(final_rows, base_dir=self.output_dir)
+            xlsx_bytes = build_manifest_xlsx(final_rows, base_dir=self.output_dir)
             self.store.save_sources_manifest_csv(self.job_id, csv_content)
             self.store.save_sources_manifest_xlsx(self.job_id, xlsx_bytes)
             self.store.save_artifact(
                 self.job_id, "06_sources_manifest", artifact.model_dump()
             )
-            bundle_path = self.store.build_sources_bundle(self.job_id)
+            bundle_path = (
+                self.store.build_sources_bundle(self.job_id)
+                if not self.writes_to_repository
+                else None
+            )
 
             if cancelled:
                 self._mark_status_cancelled(artifact, bundle_path, output_summary)
@@ -560,7 +721,7 @@ class SourceDownloadOrchestrator:
                         "failed_count": artifact.failed_count,
                         "partial_count": artifact.partial_count,
                         "output_summary": output_summary.model_dump(mode="json"),
-                        "bundle_file": str(bundle_path),
+                        "bundle_file": str(bundle_path) if bundle_path else "",
                         "timestamp": _utc_now_iso(),
                     }
                 )
@@ -575,7 +736,7 @@ class SourceDownloadOrchestrator:
                         "failed_count": artifact.failed_count,
                         "partial_count": artifact.partial_count,
                         "output_summary": output_summary.model_dump(mode="json"),
-                        "bundle_file": str(bundle_path),
+                        "bundle_file": str(bundle_path) if bundle_path else "",
                         "timestamp": _utc_now_iso(),
                     }
                 )
@@ -592,6 +753,18 @@ class SourceDownloadOrchestrator:
             )
 
     def _build_targets(self) -> list[SourceTarget]:
+        if self.target_rows:
+            return [
+                SourceTarget(
+                    id=row.id,
+                    source_document_name=row.source_document_name,
+                    citation_number=row.citation_number,
+                    original_url=row.original_url or row.final_url,
+                )
+                for row in self.target_rows
+                if (row.original_url or row.final_url)
+            ]
+
         bib = self.store.load_artifact(self.job_id, "03_bibliography")
         if bib is None:
             raise RuntimeError("Bibliography artifact not found")
@@ -639,6 +812,8 @@ class SourceDownloadOrchestrator:
         return deduped_targets
 
     def _load_previous_rows(self) -> list[SourceManifestRow]:
+        if self.target_rows:
+            return [row.model_copy(deep=True) for row in self.target_rows]
         previous = self.store.load_artifact(self.job_id, "06_sources_manifest")
         if not previous:
             return []
@@ -669,14 +844,18 @@ class SourceDownloadOrchestrator:
             phase_bits.append("download")
         if self.run_llm_cleanup:
             phase_bits.append("llm cleanup")
+        if self.run_llm_title:
+            phase_bits.append("title")
         if self.run_llm_summary:
             phase_bits.append("summary")
+        if self.run_llm_rating:
+            phase_bits.append("rating")
         phase_text = ", ".join(phase_bits) if phase_bits else "none"
-        base_message = self._compose_status_message(f"Running phases: {phase_text}")
+        cancel_requested = self._cancel_event.is_set()
         self._status_items = {i.id: i for i in items}
         self.status = SourceDownloadStatus(
             job_id=self.job_id,
-            state="running",
+            state="cancelling" if cancel_requested else "running",
             total_urls=len(targets),
             processed_urls=0,
             success_count=0,
@@ -686,34 +865,62 @@ class SourceDownloadOrchestrator:
             duplicate_urls_removed=self.duplicate_urls_removed,
             started_at=_utc_now_iso(),
             completed_at=None,
+            cancel_requested=cancel_requested,
+            cancel_requested_at=_utc_now_iso() if cancel_requested else None,
+            stop_after_current_item=False,
             current_item_id="",
             current_url="",
-            message=base_message,
+            message="",
             runtime_notes=runtime_capabilities.runtime_notes,
             runtime_guidance=runtime_capabilities.runtime_guidance,
             rerun_failed_only=self.rerun_failed_only,
             run_download=self.run_download,
             run_llm_cleanup=self.run_llm_cleanup,
+            run_llm_title=self.run_llm_title,
             run_llm_summary=self.run_llm_summary,
+            run_llm_rating=self.run_llm_rating,
             force_redownload=self.force_redownload,
             force_llm_cleanup=self.force_llm_cleanup,
+            force_title=self.force_title,
             force_summary=self.force_summary,
+            force_rating=self.force_rating,
+            project_profile_name=self.project_profile_name,
             output_options=self.output_options,
             output_summary=summarize_output_rows(existing_rows),
-            output_dir="output_run",
-            manifest_csv="output_run/manifest.csv",
-            manifest_xlsx="output_run/manifest.xlsx",
-            bundle_file="output_run.zip",
+            output_dir=self.status_output_dir,
+            manifest_csv=self.status_manifest_csv,
+            manifest_xlsx=self.status_manifest_xlsx,
+            bundle_file=self.status_bundle_file,
+            writes_to_repository=self.writes_to_repository,
+            repository_path=self.repository_path,
+            selected_scope=self.selected_scope,
+            selected_import_id=self.selected_import_id,
             items=items,
+        )
+        self.status.message = self._compose_status_message(
+            "Stop requested" if cancel_requested else f"Running phases: {phase_text}"
         )
         self._save_status()
 
     def _ensure_output_dirs(self) -> None:
-        for sub in ["originals", "rendered", "markdown", "summaries", "metadata", "logs"]:
+        self.execution_output_dir.mkdir(parents=True, exist_ok=True)
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        if self.writes_to_repository:
+            return
+        for sub in ["originals", "rendered", "markdown", "summaries", "ratings", "metadata", "logs"]:
             (self.output_dir / sub).mkdir(parents=True, exist_ok=True)
 
     def _compose_status_message(self, message: str) -> str:
         details: list[str] = []
+        if (
+            self.status is not None
+            and self.status.cancel_requested
+            and self.status.state == "cancelling"
+        ):
+            if self.status.stop_after_current_item:
+                details.append("finishing current item before stopping")
+            else:
+                details.append("stopping before the next item")
         if self.duplicate_urls_removed > 0:
             details.append(f"removed {self.duplicate_urls_removed} duplicate URLs")
         if self.runtime_capabilities.runtime_notes:
@@ -733,6 +940,42 @@ class SourceDownloadOrchestrator:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         with self.log_file.open("a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    def _persist_sink_row(self, row: SourceManifestRow) -> None:
+        if self.row_persist_callback is None:
+            return
+        self.row_persist_callback(row.model_copy(deep=True))
+
+    def _source_file_rel(self, row: SourceManifestRow, filename: str, subdir: str) -> Path:
+        if self.writes_to_repository:
+            return Path("sources") / row.id / filename
+        return Path(subdir) / filename
+
+    def _raw_file_rel(self, row: SourceManifestRow, suffix: str) -> Path:
+        return self._source_file_rel(row, f"{row.id}_source{suffix}", "originals")
+
+    def _rendered_html_rel(self, row: SourceManifestRow) -> Path:
+        return self._source_file_rel(row, f"{row.id}_rendered.html", "rendered")
+
+    def _rendered_pdf_rel(self, row: SourceManifestRow) -> Path:
+        return self._source_file_rel(row, f"{row.id}_rendered.pdf", "rendered")
+
+    def _markdown_rel(self, row: SourceManifestRow) -> Path:
+        return self._source_file_rel(row, f"{row.id}_clean.md", "markdown")
+
+    def _llm_cleanup_rel(self, row: SourceManifestRow) -> Path:
+        return self._source_file_rel(row, f"{row.id}_llm_clean.md", "markdown")
+
+    def _summary_rel(self, row: SourceManifestRow) -> Path:
+        return self._source_file_rel(row, f"{row.id}_summary.md", "summaries")
+
+    def _rating_rel(self, row: SourceManifestRow) -> Path:
+        return self._source_file_rel(row, f"{row.id}_rating.json", "ratings")
+
+    def _metadata_rel(self, row: SourceManifestRow) -> Path:
+        if self.writes_to_repository:
+            return Path("sources") / row.id / f"{row.id}_metadata.json"
+        return Path("metadata") / f"{row.id}.json"
 
     def _should_skip_successful_target(
         self, target: SourceTarget, rows_by_id: dict[str, SourceManifestRow]
@@ -769,7 +1012,12 @@ class SourceDownloadOrchestrator:
     def _should_run_llm_postprocess(self, existing_row: SourceManifestRow | None) -> bool:
         if existing_row is None:
             return False
-        return self.run_llm_cleanup or self.run_llm_summary
+        return (
+            self.run_llm_cleanup
+            or self.run_llm_title
+            or self.run_llm_summary
+            or self.run_llm_rating
+        )
 
     def _process_existing_row(
         self,
@@ -807,6 +1055,9 @@ class SourceDownloadOrchestrator:
         if item:
             item.status = "skipped"
             item.fetch_status = existing_row.fetch_status if existing_row else "skipped"
+            item.title_status = (
+                existing_row.title_status if existing_row else item.title_status
+            )
             item.llm_cleanup_status = (
                 existing_row.llm_cleanup_status if existing_row else item.llm_cleanup_status
             )
@@ -841,6 +1092,7 @@ class SourceDownloadOrchestrator:
         item = self._status_items.get(row.id)
         if item:
             item.fetch_status = row.fetch_status
+            item.title_status = row.title_status
             item.llm_cleanup_status = row.llm_cleanup_status
             item.summary_status = row.summary_status
             item.rating_status = row.rating_status
@@ -871,17 +1123,27 @@ class SourceDownloadOrchestrator:
                 runtime_notes=self.runtime_capabilities.runtime_notes,
                 runtime_guidance=self.runtime_capabilities.runtime_guidance,
                 completed_at=_utc_now_iso(),
+                project_profile_name=self.project_profile_name,
+                output_dir=self.status_output_dir,
+                manifest_csv=self.status_manifest_csv,
+                manifest_xlsx=self.status_manifest_xlsx,
+                bundle_file=self.status_bundle_file,
+                writes_to_repository=self.writes_to_repository,
+                repository_path=self.repository_path,
+                selected_scope=self.selected_scope,
+                selected_import_id=self.selected_import_id,
             )
         else:
             self.status.state = "failed"
             self.status.message = self._compose_status_message(error_message)
             self.status.completed_at = _utc_now_iso()
+            self.status.stop_after_current_item = False
         self._save_status()
 
     def _mark_status_completed(
         self,
         artifact: SourceManifestArtifact,
-        bundle_path: Path,
+        bundle_path: Path | None,
         output_summary: SourceOutputSummary,
     ) -> None:
         if not self.status:
@@ -892,20 +1154,21 @@ class SourceDownloadOrchestrator:
         self.status.failed_count = artifact.failed_count
         self.status.partial_count = artifact.partial_count
         self.status.completed_at = _utc_now_iso()
+        self.status.stop_after_current_item = False
         self.status.current_item_id = ""
         self.status.current_url = ""
         self.status.message = self._compose_status_message(
             f"Completed: {artifact.success_count} success, "
             f"{artifact.partial_count} partial, {artifact.failed_count} failed"
         )
-        self.status.bundle_file = bundle_path.name
+        self.status.bundle_file = bundle_path.name if bundle_path else ""
         self.status.output_summary = output_summary
         self._save_status()
 
     def _mark_status_cancelled(
         self,
         artifact: SourceManifestArtifact,
-        bundle_path: Path,
+        bundle_path: Path | None,
         output_summary: SourceOutputSummary,
     ) -> None:
         if not self.status:
@@ -918,17 +1181,26 @@ class SourceDownloadOrchestrator:
                     item.fetch_status = "cancelled"
 
         self.status.state = "cancelled"
+        self.status.cancel_requested = True
+        if not self.status.cancel_requested_at:
+            self.status.cancel_requested_at = _utc_now_iso()
         self.status.completed_at = _utc_now_iso()
         self.status.current_item_id = ""
         self.status.current_url = ""
-        self.status.bundle_file = bundle_path.name
+        self.status.bundle_file = bundle_path.name if bundle_path else ""
         self.status.success_count = artifact.success_count
         self.status.failed_count = artifact.failed_count
         self.status.partial_count = artifact.partial_count
         self.status.processed_urls = min(self.status.processed_urls, self.status.total_urls)
-        self.status.message = self._compose_status_message(
-            f"Cancelled after {self.status.processed_urls}/{self.status.total_urls} URLs"
+        detail = (
+            "Stopped after the current item"
+            if self.status.stop_after_current_item
+            else "Stopped before the next item"
         )
+        self.status.message = self._compose_status_message(
+            f"{detail}: {self.status.processed_urls}/{self.status.total_urls} URLs processed"
+        )
+        self.status.stop_after_current_item = False
         self.status.output_summary = output_summary
         self._save_status()
 
@@ -1012,7 +1284,7 @@ class SourceDownloadOrchestrator:
         notes: list[str],
     ) -> None:
         if self.output_options.include_raw_file:
-            rel_path = Path("originals") / f"{row.id}_source.pdf"
+            rel_path = self._raw_file_rel(row, ".pdf")
             row.raw_file = rel_path.as_posix()
             self._write_binary(rel_path, response.content)
         row.sha256 = hashlib.sha256(response.content).hexdigest()
@@ -1032,7 +1304,7 @@ class SourceDownloadOrchestrator:
             notes.extend(conversion_notes)
 
             if markdown_text:
-                markdown_rel = Path("markdown") / f"{row.id}_clean.md"
+                markdown_rel = self._markdown_rel(row)
                 self._write_text(markdown_rel, markdown_text)
                 row.markdown_file = markdown_rel.as_posix()
                 row.markdown_char_count = len(markdown_text)
@@ -1054,7 +1326,7 @@ class SourceDownloadOrchestrator:
         raw_html = decode_html(response)
         if raw_html:
             if self.output_options.include_raw_file:
-                raw_rel = Path("originals") / f"{row.id}_source.html"
+                raw_rel = self._raw_file_rel(row, ".html")
                 self._write_text(raw_rel, raw_html)
                 row.raw_file = raw_rel.as_posix()
             row.sha256 = hashlib.sha256(raw_html.encode("utf-8")).hexdigest()
@@ -1068,7 +1340,7 @@ class SourceDownloadOrchestrator:
             )
             notes.extend(rendered_pdf_notes)
             if rendered_pdf:
-                rendered_pdf_rel = Path("rendered") / f"{row.id}_rendered.pdf"
+                rendered_pdf_rel = self._rendered_pdf_rel(row)
                 self._write_binary(rendered_pdf_rel, rendered_pdf)
                 row.rendered_pdf_file = rendered_pdf_rel.as_posix()
             elif rendered_pdf_error:
@@ -1110,7 +1382,7 @@ class SourceDownloadOrchestrator:
                 notes.append(normalize_render_error_note(render_error))
             elif rendered_html:
                 if self.output_options.include_rendered_html:
-                    rendered_rel = Path("rendered") / f"{row.id}_rendered.html"
+                    rendered_rel = self._rendered_html_rel(row)
                     self._write_text(rendered_rel, rendered_html)
                     row.rendered_file = rendered_rel.as_posix()
 
@@ -1140,7 +1412,7 @@ class SourceDownloadOrchestrator:
                 row.fetch_method = "playwright"
 
             if markdown_to_write:
-                markdown_rel = Path("markdown") / f"{row.id}_clean.md"
+                markdown_rel = self._markdown_rel(row)
                 self._write_text(markdown_rel, markdown_to_write)
                 row.markdown_file = markdown_rel.as_posix()
                 row.markdown_char_count = len(markdown_to_write)
@@ -1190,7 +1462,7 @@ class SourceDownloadOrchestrator:
             content_disposition=response.headers.get("content-disposition", ""),
         )
         if self.output_options.include_raw_file:
-            rel_path = Path("originals") / f"{row.id}_source{extension}"
+            rel_path = self._raw_file_rel(row, extension)
             row.raw_file = rel_path.as_posix()
             self._write_binary(rel_path, response.content)
         row.sha256 = hashlib.sha256(response.content).hexdigest()
@@ -1214,7 +1486,7 @@ class SourceDownloadOrchestrator:
         notes.extend(conversion_notes)
 
         if markdown_text:
-            markdown_rel = Path("markdown") / f"{row.id}_clean.md"
+            markdown_rel = self._markdown_rel(row)
             self._write_text(markdown_rel, markdown_text)
             row.markdown_file = markdown_rel.as_posix()
             row.markdown_char_count = len(markdown_text)
@@ -1238,7 +1510,7 @@ class SourceDownloadOrchestrator:
         notes: list[str],
     ) -> None:
         if self.output_options.include_raw_file:
-            rel_path = Path("originals") / f"{row.id}_source.bin"
+            rel_path = self._raw_file_rel(row, ".bin")
             self._write_binary(rel_path, response.content)
             row.raw_file = rel_path.as_posix()
         row.sha256 = hashlib.sha256(response.content).hexdigest()
@@ -1259,10 +1531,11 @@ class SourceDownloadOrchestrator:
             row.fetched_at = _utc_now_iso()
 
         self._generate_markdown_cleanup(row, notes)
+        self._generate_source_title(row, notes)
         self._generate_source_summary(row, notes)
         self._generate_source_rating(row, notes)
         row.notes = "; ".join(dict.fromkeys(n for n in notes if n))
-        metadata_rel = Path("metadata") / f"{row.id}.json"
+        metadata_rel = self._metadata_rel(row)
         row.metadata_file = metadata_rel.as_posix()
 
         metadata_payload = {
@@ -1289,6 +1562,7 @@ class SourceDownloadOrchestrator:
             "notes": row.notes,
             "sha256": row.sha256,
             "title": row.title,
+            "title_status": row.title_status,
             "canonical_url": row.canonical_url,
             "extraction_method": row.extraction_method,
             "markdown_char_count": row.markdown_char_count,
@@ -1348,8 +1622,8 @@ class SourceDownloadOrchestrator:
             return
 
         source_text = markdown_text.strip()
-        if len(source_text) > MAX_CLEANUP_SOURCE_CHARS:
-            source_text = source_text[:MAX_CLEANUP_SOURCE_CHARS]
+        max_chars = self._effective_max_source_chars()
+        source_text = self._truncate_for_llm(source_text, max_chars)
 
         research_purpose = self.research_purpose or (
             "No explicit research purpose was provided. Preserve factual content and clarity."
@@ -1360,10 +1634,10 @@ class SourceDownloadOrchestrator:
         )
 
         try:
-            cleanup_response = run_async_in_sync(
-                self._run_llm_cleanup_completion,
+            cleanup_response = self._llm_client.sync_chat_completion(
                 system_prompt=SOURCE_MARKDOWN_CLEANUP_SYSTEM,
                 user_prompt=user_prompt,
+                response_format=None,
             ).strip()
             needs_cleanup, cleaned_markdown = parse_cleanup_response(cleanup_response)
             row.llm_cleanup_needed = needs_cleanup
@@ -1374,7 +1648,7 @@ class SourceDownloadOrchestrator:
                     row.llm_cleanup_status = "failed"
                     notes.append(NOTE_LLM_CLEANUP_FAILED)
                     return
-                cleanup_rel = Path("markdown") / f"{row.id}_llm_clean.md"
+                cleanup_rel = self._llm_cleanup_rel(row)
                 self._write_text(cleanup_rel, normalized)
                 row.llm_cleanup_file = cleanup_rel.as_posix()
                 row.llm_cleanup_status = "cleaned"
@@ -1385,6 +1659,94 @@ class SourceDownloadOrchestrator:
             row.llm_cleanup_needed = False
             notes.append(NOTE_LLM_CLEANUP_FAILED)
             logger.warning("Markdown cleanup failed for %s: %s", row.id, exc)
+
+    def _generate_source_title(
+        self,
+        row: SourceManifestRow,
+        notes: list[str],
+    ) -> None:
+        if not self.run_llm_title:
+            if row.title:
+                row.title_status = row.title_status or "existing"
+            elif not row.title_status:
+                row.title_status = "not_requested"
+            return
+
+        if row.title and not self.force_title:
+            row.title_status = row.title_status or "existing"
+            return
+
+        title_source_path = ""
+        if row.llm_cleanup_file and _has_output_file(self.output_dir, row.llm_cleanup_file):
+            title_source_path = row.llm_cleanup_file
+        elif row.markdown_file:
+            title_source_path = row.markdown_file
+
+        if not title_source_path:
+            row.title_status = "missing_markdown"
+            return
+
+        markdown_text = self._read_text(Path(title_source_path))
+        if not markdown_text.strip():
+            row.title_status = "missing_markdown"
+            return
+
+        candidate_title = extract_markdown_title_candidate(markdown_text)
+        if candidate_title:
+            row.title = candidate_title
+            row.title_status = "extracted"
+            return
+
+        if not self.use_llm:
+            row.title_status = "skipped_llm_disabled"
+            return
+        if not llm_backend_ready_for_chat(self.llm_backend):
+            row.title_status = "skipped_llm_not_configured"
+            notes.append(NOTE_TITLE_SKIPPED_LLM_NOT_CONFIGURED)
+            return
+
+        source_text = markdown_text.strip()
+        max_chars = self._effective_max_source_chars()
+        source_text = self._truncate_for_llm(source_text, max_chars)
+        research_purpose = self.research_purpose or (
+            "No explicit research purpose was provided. Prefer the document title when present."
+        )
+        user_prompt = SOURCE_TITLE_USER.format(
+            research_purpose=research_purpose,
+            existing_title=row.title or "",
+            candidate_title=candidate_title or "",
+            source_markdown=source_text,
+        )
+
+        try:
+            raw_response = self._llm_client.sync_chat_completion(
+                system_prompt=SOURCE_TITLE_SYSTEM,
+                user_prompt=user_prompt,
+                response_format="json",
+            ).strip()
+            payload = json.loads(raw_response)
+            if not isinstance(payload, dict):
+                notes.append(NOTE_TITLE_GENERATION_FAILED)
+                row.title_status = "failed"
+                return
+
+            generated_title = normalize_generated_title(
+                _stringify_manifest_value(payload.get("title"))
+            )
+            if not generated_title:
+                notes.append(NOTE_TITLE_GENERATION_FAILED)
+                row.title_status = "failed"
+                return
+
+            basis = str(payload.get("basis") or "").strip().lower()
+            if basis != "document_title":
+                generated_title = limit_title_words(generated_title, 10)
+            row.title = generated_title
+            row.title_status = "generated"
+        except Exception as exc:
+            notes.append(NOTE_TITLE_GENERATION_FAILED)
+            row.title_status = "failed"
+            logger.warning("Title generation failed for %s: %s", row.id, exc)
 
     def _generate_source_summary(
         self,
@@ -1428,8 +1790,8 @@ class SourceDownloadOrchestrator:
             return
 
         source_text = markdown_text.strip()
-        if len(source_text) > MAX_SUMMARY_SOURCE_CHARS:
-            source_text = source_text[:MAX_SUMMARY_SOURCE_CHARS]
+        max_chars = self._effective_max_source_chars()
+        source_text = self._truncate_for_llm(source_text, max_chars)
 
         research_purpose = self.research_purpose or (
             "No explicit research purpose was provided. "
@@ -1441,10 +1803,10 @@ class SourceDownloadOrchestrator:
         )
 
         try:
-            summary = run_async_in_sync(
-                self._run_llm_summary,
+            summary = self._llm_client.sync_chat_completion(
                 system_prompt=SOURCE_SUMMARY_SYSTEM,
                 user_prompt=user_prompt,
+                response_format=None,
             ).strip()
             summary = normalize_summary_paragraph(summary)
             if not summary:
@@ -1452,7 +1814,7 @@ class SourceDownloadOrchestrator:
                 row.summary_status = "failed"
                 return
 
-            summary_rel = Path("summaries") / f"{row.id}_summary.md"
+            summary_rel = self._summary_rel(row)
             self._write_text(summary_rel, summary + "\n")
             row.summary_file = summary_rel.as_posix()
             row.summary_status = "generated"
@@ -1461,35 +1823,6 @@ class SourceDownloadOrchestrator:
             row.summary_status = "failed"
             logger.warning("Summary generation failed for %s: %s", row.id, exc)
 
-    async def _run_llm_cleanup_completion(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-    ) -> str:
-        client = UnifiedLLMClient(self.llm_backend)
-        try:
-            return await client.chat_completion(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                response_format=None,
-            )
-        finally:
-            await client.close()
-
-    async def _run_llm_summary(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-    ) -> str:
-        client = UnifiedLLMClient(self.llm_backend)
-        try:
-            return await client.chat_completion(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                response_format=None,
-            )
-        finally:
-            await client.close()
 
     def _generate_source_rating(
         self,
@@ -1537,8 +1870,8 @@ class SourceDownloadOrchestrator:
             return
 
         source_text = markdown_text.strip()
-        if len(source_text) > MAX_SUMMARY_SOURCE_CHARS:
-            source_text = source_text[:MAX_SUMMARY_SOURCE_CHARS]
+        max_chars = self._effective_max_source_chars()
+        source_text = self._truncate_for_llm(source_text, max_chars)
 
         research_purpose = self.research_purpose or (
             "No explicit research purpose was provided. "
@@ -1553,10 +1886,10 @@ class SourceDownloadOrchestrator:
         )
 
         try:
-            raw_response = run_async_in_sync(
-                self._run_llm_rating,
+            raw_response = self._llm_client.sync_chat_completion(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
+                response_format="json",
             ).strip()
 
             rating_data = json.loads(raw_response)
@@ -1565,7 +1898,7 @@ class SourceDownloadOrchestrator:
                 row.rating_status = "failed"
                 return
 
-            rating_rel = Path("ratings") / f"{row.id}_rating.json"
+            rating_rel = self._rating_rel(row)
             self._write_text(
                 rating_rel,
                 json.dumps(rating_data, ensure_ascii=False, indent=2) + "\n",
@@ -1577,20 +1910,7 @@ class SourceDownloadOrchestrator:
             row.rating_status = "failed"
             logger.warning("Rating generation failed for %s: %s", row.id, exc)
 
-    async def _run_llm_rating(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-    ) -> str:
-        client = UnifiedLLMClient(self.llm_backend)
-        try:
-            return await client.chat_completion(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                response_format="json",
-            )
-        finally:
-            await client.close()
+
 
     def _write_binary(self, rel_path: Path, content: bytes) -> None:
         dest = self.output_dir / rel_path
@@ -1729,20 +2049,22 @@ class SourceDownloadOrchestrator:
             await client.close()
 
 
-def build_manifest_csv(rows: list[SourceManifestRow]) -> str:
+def build_manifest_csv(rows: list[SourceManifestRow], base_dir: Path | None = None) -> str:
+    fieldnames, records = _build_manifest_records(rows, base_dir=base_dir)
     output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=SOURCE_MANIFEST_COLUMNS)
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
     writer.writeheader()
-    for row in rows:
-        writer.writerow(_serialize_manifest_row(row))
+    for record in records:
+        writer.writerow(record)
     return output.getvalue()
 
 
-def build_manifest_xlsx(rows: list[SourceManifestRow]) -> bytes:
+def build_manifest_xlsx(rows: list[SourceManifestRow], base_dir: Path | None = None) -> bytes:
+    fieldnames, records = _build_manifest_records(rows, base_dir=base_dir)
     wb = Workbook()
     ws = wb.active
     ws.title = "manifest"
-    ws.append(SOURCE_MANIFEST_COLUMNS)
+    ws.append(fieldnames)
     ws.freeze_panes = "A2"
 
     link_columns = {
@@ -1752,16 +2074,16 @@ def build_manifest_xlsx(rows: list[SourceManifestRow]) -> bytes:
         "markdown_file",
         "llm_cleanup_file",
         "summary_file",
+        "rating_file",
         "metadata_file",
     }
-    col_idx = {name: idx + 1 for idx, name in enumerate(SOURCE_MANIFEST_COLUMNS)}
+    col_idx = {name: idx + 1 for idx, name in enumerate(fieldnames)}
 
-    for row in rows:
-        data = _serialize_manifest_row(row)
-        ws.append([data[c] for c in SOURCE_MANIFEST_COLUMNS])
+    for record in records:
+        ws.append([record.get(column, "") for column in fieldnames])
         row_idx = ws.max_row
         for link_col in link_columns:
-            value = data.get(link_col, "")
+            value = record.get(link_col, "")
             if not value:
                 continue
             cell = ws.cell(row=row_idx, column=col_idx[link_col])
@@ -1769,8 +2091,13 @@ def build_manifest_xlsx(rows: list[SourceManifestRow]) -> bytes:
             cell.hyperlink = value
             cell.style = "Hyperlink"
 
-    for idx, column in enumerate(SOURCE_MANIFEST_COLUMNS, start=1):
-        width = 40 if column.endswith("_url") else 24
+    for idx, column in enumerate(fieldnames, start=1):
+        if column.endswith("_url"):
+            width = 40
+        elif column in {"summary_text", "rating_rationale", "relevant_sections", "rating_raw_json"}:
+            width = 56
+        else:
+            width = 24
         ws.column_dimensions[get_column_letter(idx)].width = width
 
     stream = io.BytesIO()
@@ -1778,16 +2105,238 @@ def build_manifest_xlsx(rows: list[SourceManifestRow]) -> bytes:
     return stream.getvalue()
 
 
-def _serialize_manifest_row(row: SourceManifestRow) -> dict[str, str | int | bool]:
+def build_manifest_record(
+    row: SourceManifestRow,
+    base_dir: Path | None = None,
+) -> dict[str, str | int | float | bool]:
     data = row.model_dump()
-    serialized: dict[str, str | int | bool] = {}
+    serialized: dict[str, str | int | float | bool] = {}
     for column in SOURCE_MANIFEST_COLUMNS:
         value = data.get(column)
         if value is None:
             serialized[column] = ""
         else:
             serialized[column] = value
+
+    derived = _derive_manifest_fields(row, base_dir=base_dir)
+    serialized.update(derived["base"])
+    serialized.update(derived["dynamic"])
     return serialized
+
+
+def _build_manifest_records(
+    rows: list[SourceManifestRow],
+    base_dir: Path | None = None,
+) -> tuple[list[str], list[dict[str, str | int | float | bool]]]:
+    records: list[dict[str, str | int | float | bool]] = []
+    dynamic_columns: list[str] = []
+    dynamic_seen: set[str] = set()
+
+    for row in rows:
+        record = build_manifest_record(row, base_dir=base_dir)
+        records.append(record)
+        for column in record.keys():
+            if column in SOURCE_MANIFEST_COLUMNS or column in MANIFEST_DERIVED_COLUMNS:
+                continue
+            if column in dynamic_seen:
+                continue
+            dynamic_seen.add(column)
+            dynamic_columns.append(column)
+
+    fieldnames = SOURCE_MANIFEST_COLUMNS + MANIFEST_DERIVED_COLUMNS + sorted(dynamic_columns)
+    return fieldnames, records
+
+
+def _derive_manifest_fields(
+    row: SourceManifestRow,
+    base_dir: Path | None = None,
+) -> dict[str, dict[str, str | int | float | bool]]:
+    summary_text = _load_manifest_text(base_dir, row.summary_file)
+    rating_payload = _load_manifest_json(base_dir, row.rating_file)
+
+    if summary_text == "" and isinstance(rating_payload, dict):
+        summary_text = _stringify_manifest_value(rating_payload.get("summary"))
+
+    rating_overall = _extract_rating_overall(rating_payload)
+    rating_confidence = _extract_rating_confidence(rating_payload)
+    rating_rationale = _stringify_manifest_value(
+        rating_payload.get("rationale") if isinstance(rating_payload, dict) else ""
+    )
+    relevant_sections = _format_relevant_sections(
+        rating_payload.get("relevant_sections")
+        if isinstance(rating_payload, dict)
+        else ""
+    )
+    if not relevant_sections and isinstance(rating_payload, dict):
+        relevant_sections = _format_relevant_sections(
+            rating_payload.get("sections") or rating_payload.get("relevant_section")
+        )
+
+    rating_dimensions = _extract_rating_dimensions(rating_payload)
+    flag_scores = _extract_flag_scores(rating_payload)
+
+    base: dict[str, str | int | float | bool] = {
+        "summary_text": summary_text,
+        "rating_overall": rating_overall,
+        "rating_confidence": rating_confidence,
+        "rating_rationale": rating_rationale,
+        "relevant_sections": relevant_sections,
+        "rating_dimensions_json": _json_or_blank(rating_dimensions),
+        "flag_scores_json": _json_or_blank(flag_scores),
+        "rating_raw_json": _json_or_blank(rating_payload),
+    }
+
+    dynamic: dict[str, str | int | float | bool] = {}
+    for key, value in rating_dimensions.items():
+        dynamic[f"rating_{_manifest_slug(key)}"] = _normalize_manifest_scalar(value)
+    for key, value in flag_scores.items():
+        dynamic[f"flag_{_manifest_slug(key)}"] = _normalize_manifest_scalar(value)
+    return {"base": base, "dynamic": dynamic}
+
+
+def _load_manifest_text(base_dir: Path | None, rel_path: str | None) -> str:
+    full_path = _resolve_manifest_path(base_dir, rel_path)
+    if full_path is None or not full_path.is_file():
+        return ""
+    try:
+        return full_path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def _load_manifest_json(base_dir: Path | None, rel_path: str | None) -> dict[str, Any]:
+    full_path = _resolve_manifest_path(base_dir, rel_path)
+    if full_path is None or not full_path.is_file():
+        return {}
+    try:
+        payload = json.loads(full_path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _resolve_manifest_path(base_dir: Path | None, rel_path: str | None) -> Path | None:
+    value = str(rel_path or "").strip()
+    if not value:
+        return None
+    candidate = Path(value)
+    if candidate.is_absolute():
+        return candidate
+    if base_dir is None:
+        return None
+    return base_dir / candidate
+
+
+def _extract_rating_overall(payload: dict[str, Any]) -> str | int | float | bool:
+    for key in ("overall_score", "overall_rating", "overall"):
+        if key in payload:
+            return _normalize_manifest_scalar(payload.get(key))
+    return ""
+
+
+def _extract_rating_confidence(payload: dict[str, Any]) -> str | int | float | bool:
+    if not isinstance(payload, dict):
+        return ""
+    return _normalize_manifest_scalar(payload.get("confidence"))
+
+
+def _extract_rating_dimensions(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    extracted: dict[str, Any] = {}
+    for container_key in RATING_DIMENSION_CONTAINER_KEYS:
+        container = payload.get(container_key)
+        if not isinstance(container, dict):
+            continue
+        for key, value in container.items():
+            extracted[str(key)] = value
+    if extracted:
+        return extracted
+    for key, value in payload.items():
+        if key in RATING_RESERVED_KEYS or isinstance(value, (dict, list)):
+            continue
+        extracted[str(key)] = value
+    return extracted
+
+
+def _extract_flag_scores(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    flags = payload.get("flags")
+    if not isinstance(flags, dict):
+        return {}
+    return {str(key): value for key, value in flags.items()}
+
+
+def _format_relevant_sections(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts = [_format_relevant_section_item(item) for item in value]
+        return "\n\n".join(part for part in parts if part)
+    if isinstance(value, dict):
+        return _format_relevant_section_item(value)
+    return _stringify_manifest_value(value)
+
+
+def _format_relevant_section_item(item: Any) -> str:
+    if item is None:
+        return ""
+    if isinstance(item, str):
+        return item.strip()
+    if isinstance(item, dict):
+        ordered_keys = ["section", "title", "heading", "quote", "excerpt", "text", "content"]
+        parts: list[str] = []
+        for key in ordered_keys:
+            piece = _stringify_manifest_value(item.get(key))
+            if not piece:
+                continue
+            if key in {"section", "title", "heading"}:
+                parts.append(piece)
+            else:
+                parts.append(piece)
+        if parts:
+            return "\n".join(parts)
+        return json.dumps(item, ensure_ascii=False, sort_keys=True)
+    return _stringify_manifest_value(item)
+
+
+def _stringify_manifest_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return str(value)
+
+
+def _json_or_blank(value: Any) -> str:
+    if value in ({}, [], "", None):
+        return ""
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return str(value)
+
+
+def _normalize_manifest_scalar(value: Any) -> str | int | float | bool:
+    if value is None:
+        return ""
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    return _stringify_manifest_value(value)
+
+
+def _manifest_slug(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower())
+    normalized = normalized.strip("_")
+    return normalized or "value"
 
 
 def _count_fetch_outcomes(rows: list[SourceManifestRow]) -> dict[str, int]:
@@ -2048,6 +2597,20 @@ def normalize_summary_paragraph(text: str) -> str:
     if len(sentences) > 4:
         sentences = sentences[:4]
     return " ".join(sentences).strip()
+
+
+def normalize_generated_title(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", (text or "")).strip()
+    cleaned = cleaned.strip("\"'`")
+    cleaned = re.sub(r"^[Tt]itle:\s*", "", cleaned)
+    return cleaned.strip()
+
+
+def limit_title_words(text: str, max_words: int) -> str:
+    words = [word for word in re.split(r"\s+", (text or "").strip()) if word]
+    if len(words) <= max_words:
+        return " ".join(words)
+    return " ".join(words[:max_words]).strip()
 
 
 def split_sentences(text: str) -> list[str]:

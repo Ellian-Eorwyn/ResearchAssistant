@@ -1,0 +1,255 @@
+version: "1.0"
+profile_id: "default_project_profile"
+profile_name: "Default Generic Source Relevance Rubric"
+
+project_context:
+  purpose: >
+    Evaluate sources for relevance to the active research purpose rather than
+    to any one fixed project domain. The model should favor sources that
+    directly support the user's stated goal, task, deliverable, decision,
+    audience, or method.
+  research_purpose: "{{research_purpose}}"
+  audience: >
+    Infer the likely audience, stakeholders, decision-makers, implementers,
+    researchers, or operators from the research purpose. Use that inferred
+    audience consistently when judging overall relevance and relevant detail.
+  primary_use_cases:
+    - "Finding the most relevant sources for the stated research purpose"
+    - "Summarizing and tagging sources against the user's actual project goal"
+    - "Filtering out sources that are only adjacent, generic, obsolete, or off-task"
+    - "Supporting project-specific strategy, implementation, design, operational, or synthesis decisions"
+
+runtime_specialization:
+  instructions:
+    - >
+      Before scoring, extract the concrete project needs implied by the
+      research purpose. This includes the likely domain, audience, deliverable,
+      decision context, methods, and the kind of evidence the user needs.
+    - >
+      Interpret relevance through those inferred project needs instead of using
+      a one-size-fits-all standard.
+    - >
+      When the research purpose is broad or ambiguous, keep scores conservative
+      and lower confidence rather than inventing a narrow project framing.
+    - >
+      Research purpose to specialize against: {{research_purpose}}
+
+relevance_guidance:
+  prioritize:
+    - label: "Direct task alignment"
+      description: >
+        Prefer sources that directly help with the specific task, deliverable,
+        decision, or research question implied by the stated research purpose.
+    - label: "Audience fit"
+      description: >
+        Prefer sources whose level, framing, and recommendations are useful for
+        the intended audience inferred from the research purpose.
+    - label: "Actionable or decision-useful detail"
+      description: >
+        Prefer sources that provide procedures, evidence, methods, examples,
+        evaluation criteria, tradeoffs, lessons learned, or implementation
+        guidance that would help the project move forward.
+    - label: "Transferable evidence"
+      description: >
+        Prefer sources whose findings or guidance can generalize to the user's
+        stated project context instead of depending on unusually narrow
+        conditions.
+    - label: "Current usefulness"
+      description: >
+        Prefer sources that remain useful for current practice, current
+        evidence, or the present-day state of the topic.
+
+  deprioritize:
+    - label: "Topic adjacency without project fit"
+      description: >
+        Down-rank sources that are on a nearby topic but do not materially help
+        with the actual research purpose, task, audience, or deliverable.
+    - label: "Off-audience or off-level framing"
+      description: >
+        Down-rank sources that may be strong in general but are mismatched to
+        the likely audience, level of detail, or decision context needed here.
+    - label: "Obsolete or superseded information"
+      description: >
+        Down-rank sources that focus on outdated evidence, technologies,
+        practices, or assumptions unless the research purpose explicitly calls
+        for historical treatment.
+    - label: "Overly niche or one-off cases"
+      description: >
+        Down-rank sources that are so specialized, site-specific, or unusual
+        that their usefulness does not transfer well to the stated project.
+    - label: "High-level context with limited practical value"
+      description: >
+        Down-rank sources that provide mostly background, framing, or abstract
+        discussion when the research purpose appears to require direct evidence,
+        methods, or implementation detail.
+
+scoring:
+  scale:
+    min: 0.0
+    max: 1.0
+    step: 0.05
+    interpretation: >
+      Scores must be assigned in increments of 0.05 only.
+
+  dimensions:
+    - id: "overall_relevance"
+      name: "Overall relevance"
+      description: >
+        Measures how well the source serves the current project's stated
+        purpose. Consider alignment to the inferred audience, task,
+        deliverable, decision context, and usefulness for the research purpose.
+      anchors:
+        high: >
+          The source is strongly aligned with the research purpose and would
+          likely be useful for direct project work, decision-making,
+          synthesis, filtering, or implementation.
+        medium: >
+          The source is partially aligned and contains some useful material,
+          but it is not a strong fit overall.
+        low: >
+          The source is only loosely related, mostly tangential, or not useful
+          for the stated purpose.
+
+    - id: "depth_score"
+      name: "Source depth and comprehensiveness"
+      description: >
+        Measures how detailed, thorough, and developed the source is overall,
+        regardless of whether all of that detail is relevant to the project.
+      anchors:
+        1.0: >
+          Exceptionally thorough and well-developed. Substantial technical,
+          procedural, explanatory, or analytical depth.
+        0.75: >
+          Clearly substantial and detailed, though not fully comprehensive.
+        0.5: >
+          Moderately developed. More than a short summary, but limited in depth.
+        0.25: >
+          Thin treatment. Mostly overview or summary-level content.
+        0.0: >
+          Extremely brief, fragmentary, or insubstantial.
+
+    - id: "relevant_detail_score"
+      name: "Relevant detail density"
+      description: >
+        Measures how much of the source's substantive detail is actually useful
+        for the project's purpose. This should distinguish a long but mostly
+        irrelevant document from a long and highly useful one.
+      scoring_instruction: >
+        Score higher when material that is directly useful for the research
+        purpose is substantial and central to the source. Score lower when
+        useful material is sparse, incidental, or confined to isolated passages.
+      anchors:
+        1.0: >
+          Nearly all substantive detail is directly useful for the project's purpose.
+        0.75: >
+          Most of the detail is relevant, with limited off-scope material.
+        0.5: >
+          Mixed relevance. Contains meaningful useful material, but much of the
+          source is not directly relevant.
+        0.25: >
+          Only a small portion of the source is useful. Most detail is off-scope.
+        0.0: >
+          Almost none of the substantive detail is useful for the project's purpose.
+
+confidence:
+  description: >
+    Each scored dimension must also receive a confidence score using the same
+    0.00 to 1.00 scale in 0.05 increments. Confidence measures how certain the
+    model is that the assigned score is correct.
+  anchors:
+    1.0: >
+      Very high confidence. The source is clear, explicit, and easy to classify.
+    0.75: >
+      Good confidence. Enough evidence exists to support the score with limited ambiguity.
+    0.5: >
+      Moderate confidence. The score is reasonable but some ambiguity remains.
+    0.25: >
+      Low confidence. Evidence is incomplete, partial, or difficult to interpret.
+    0.0: >
+      Very low confidence. There is not enough clear evidence for a reliable score.
+
+model_instructions:
+  required_behavior:
+    - "Use only the content of the source, the imported rubric file, and the stated research purpose when this default profile asks you to specialize relevance."
+    - "Infer the likely audience, task, deliverable, and decision context from the research purpose before scoring relevance."
+    - "Do not infer high relevance merely from document length."
+    - "Do not confuse topic adjacency with project relevance."
+    - "Separate source depth from relevant detail."
+    - "Use 0.05 increments only."
+    - "Assign a confidence score for every scored field."
+    - "When evidence is limited or ambiguous, lower confidence rather than pretending certainty."
+  reasoning_principles:
+    - "A long source may score high on depth and low on relevant detail."
+    - "A short source may score low on depth and high on relevance if it is concise but directly useful."
+    - "A source should be down-ranked if it is mostly off-scope, obsolete, too niche, too abstract for the task, or too site-specific to generalize."
+
+flags:
+  - id: "off_scope"
+    description: "Source is mostly outside the actual research purpose or task"
+  - id: "obsolete"
+    description: "Source relies on outdated evidence, technologies, or practices"
+  - id: "too_niche"
+    description: "Source is too specialized to transfer well to the project"
+  - id: "too_high_level"
+    description: "Source is mostly background or framing and weak on decision-useful detail"
+  - id: "too_site_specific"
+    description: "Source is overly tied to a small number of sites or unusual conditions"
+
+output_contract:
+  format: "json"
+  fields:
+    - name: "overall_relevance"
+      type: "number"
+    - name: "overall_relevance_confidence"
+      type: "number"
+    - name: "depth_score"
+      type: "number"
+    - name: "depth_confidence"
+      type: "number"
+    - name: "relevant_detail_score"
+      type: "number"
+    - name: "relevant_detail_confidence"
+      type: "number"
+    - name: "rationale"
+      type: "string"
+    - name: "key_relevant_sections"
+      type: "array"
+      item_type: "string"
+    - name: "tags"
+      type: "array"
+      item_type: "string"
+    - name: "flags"
+      type: "object"
+      description: "Per-flag float scores (0.0-1.0, 0.05 increments)"
+  output_rules:
+    - "All numeric values must be between 0.00 and 1.00"
+    - "All numeric values must be in increments of 0.05"
+    - "Rationale should be concise and evidence-based"
+    - "Key relevant sections should identify where the useful material appears"
+    - "Tags should reflect source content and project usefulness"
+
+examples:
+  - source_type: "short tangential web blurb"
+    example_scores:
+      overall_relevance: 0.2
+      overall_relevance_confidence: 0.85
+      depth_score: 0.15
+      depth_confidence: 0.95
+      relevant_detail_score: 0.15
+      relevant_detail_confidence: 0.9
+  - source_type: "long report with mixed usefulness"
+    example_scores:
+      overall_relevance: 0.45
+      overall_relevance_confidence: 0.8
+      depth_score: 0.9
+      depth_confidence: 0.95
+      relevant_detail_score: 0.4
+      relevant_detail_confidence: 0.8
+  - source_type: "well-matched guide or study for the stated purpose"
+    example_scores:
+      overall_relevance: 0.95
+      overall_relevance_confidence: 0.9
+      depth_score: 0.85
+      depth_confidence: 0.9
+      relevant_detail_score: 0.95
+      relevant_detail_confidence: 0.9

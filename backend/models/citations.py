@@ -11,6 +11,7 @@ class InTextCitation(BaseModel):
     raw_marker: str  # e.g. "[1]", "[2, 3]", "[4-7]"
     ref_numbers: list[int]
     page_number: int | None = None
+    block_index: int | None = None
     char_offset_start: int
     char_offset_end: int
     style: str = "bracket"  # bracket | superscript

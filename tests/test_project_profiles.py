@@ -5,14 +5,16 @@ import unittest
 from pathlib import Path
 
 from backend.storage.file_store import FileStore
+from backend.storage.project_profiles import DEFAULT_PROJECT_PROFILE_FILENAME
 
 
 class ProjectProfileTests(unittest.TestCase):
-    def test_list_empty_profiles(self):
+    def test_list_profiles_includes_default_profile(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = FileStore(Path(tmp))
             profiles = store.list_project_profiles()
-            self.assertEqual(profiles, [])
+            filenames = {profile["filename"] for profile in profiles}
+            self.assertIn(DEFAULT_PROJECT_PROFILE_FILENAME, filenames)
 
     def test_list_profiles_finds_yaml_files(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -31,6 +33,22 @@ class ProjectProfileTests(unittest.TestCase):
             (store.project_profiles_dir / "my_profile.yaml").write_text(content)
             loaded = store.load_project_profile("my_profile.yaml")
             self.assertEqual(loaded, content)
+
+    def test_resolve_default_project_profile_renders_research_purpose(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = FileStore(Path(tmp))
+            filename, loaded = store.resolve_project_profile(
+                "",
+                research_purpose="Find implementation evidence for EV charging workforce training.",
+                default_when_blank=True,
+            )
+            self.assertEqual(filename, DEFAULT_PROJECT_PROFILE_FILENAME)
+            self.assertIn(
+                "Find implementation evidence for EV charging workforce training.",
+                loaded,
+            )
+            self.assertNotIn("{{research_purpose}}", loaded)
+            self.assertIn('id: "overall_relevance"', loaded)
 
     def test_load_project_profile_path_traversal(self):
         with tempfile.TemporaryDirectory() as tmp:

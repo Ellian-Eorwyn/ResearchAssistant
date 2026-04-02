@@ -1,8 +1,8 @@
-"""Settings router: manage app settings and LLM model listing."""
+"""Settings router: manage app-level settings and LLM model listing."""
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Body, HTTPException, Query, Request
+from fastapi import APIRouter, Body, Query, Request
 
 from backend.llm.client import UnifiedLLMClient
 from backend.models.settings import AppSettings, LLMBackendConfig, ModelsResponse
@@ -12,9 +12,10 @@ router = APIRouter()
 
 @router.get("/settings", response_model=AppSettings)
 async def get_settings(request: Request) -> AppSettings:
-    store = request.app.state.file_store
-    raw = store.load_settings()
-    return AppSettings(**raw) if raw else AppSettings()
+    service = request.app.state.repository_service
+    if service.is_attached:
+        return AppSettings(last_repository_path=str(service.path))
+    return AppSettings()
 
 
 @router.put("/settings", response_model=AppSettings)
@@ -22,14 +23,10 @@ async def save_settings(
     request: Request,
     payload: dict = Body(...),
 ) -> AppSettings:
-    store = request.app.state.file_store
-    current_raw = store.load_settings()
-    current = AppSettings(**current_raw) if current_raw else AppSettings()
-    merged = current.model_dump(mode="json")
-    merged.update(payload or {})
-    settings = AppSettings(**merged)
-    store.save_settings(settings.model_dump())
-    return settings
+    service = request.app.state.repository_service
+    if service.is_attached:
+        return AppSettings(last_repository_path=str(service.path))
+    return AppSettings(**(payload or {}))
 
 
 @router.get("/models", response_model=ModelsResponse)

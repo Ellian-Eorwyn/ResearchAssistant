@@ -48,16 +48,42 @@ Source content:
 
 Return exactly one paragraph with 3-4 sentences."""
 
+SOURCE_TITLE_SYSTEM = """You are resolving the title of a research source from extracted markdown.
+Prefer the document's actual title when it appears in front matter, the first heading, or other clearly labeled metadata.
+If the source has no clear title, generate a concise fallback title of 10 words or fewer that names the producing organization and the topic.
+Do not invent citations, dates, or organizations not supported by the text.
+Return JSON only."""
+
+SOURCE_TITLE_USER = """Research purpose:
+{research_purpose}
+
+Existing title from metadata, if any:
+{existing_title}
+
+Candidate title from front matter or headings, if any:
+{candidate_title}
+
+Source content:
+{source_markdown}
+
+Return JSON in exactly this shape:
+{{
+  "title": "Resolved title text",
+  "basis": "document_title" | "generated"
+}}"""
+
 SOURCE_RATING_SYSTEM = """You are evaluating a source using an imported project profile.
 Use the project profile as the governing rubric for:
 - what counts as relevant
 - what should be deprioritized
 - how to score each dimension
 - how to assign confidence
+- how to specialize generic guidance using the stated research purpose when the profile tells you to
 
 Evaluate the source only using:
 1. the source content
 2. the imported project profile
+3. the stated research purpose when the profile explicitly uses it to tailor relevance
 
 Return output only in the required JSON structure.
 
@@ -95,3 +121,63 @@ Respond in exactly this format:
 NEEDS_CLEANUP: yes|no
 CLEANED_MARKDOWN:
 <markdown text when NEEDS_CLEANUP is yes; otherwise leave empty>"""
+
+DOCUMENT_NORMALIZATION_SYSTEM = """You normalize extracted research documents into structured citation-aware markdown blocks.
+Preserve factual meaning and document structure.
+Do not invent sources or links.
+Always return JSON only."""
+
+DOCUMENT_NORMALIZATION_USER = """Normalize this document into structured blocks and a numbered works-cited list.
+
+Required output rules:
+- Body citations must be represented only as numeric references.
+- Use bracketed numeric citations like [1] and [1, 3].
+- Do not include a works cited heading in the body blocks.
+- Every works_cited entry must include a number, citation_text, and url when one can be resolved.
+- If a DOI appears without a direct URL, convert it to https://doi.org/<doi>.
+- If a citation marker in the body cannot be resolved, include it in unresolved_markers.
+- If you can infer parsing guidance that would help similar documents in the future, include a profile_suggestion object.
+- If Document scope says this is a partial body chunk, normalize only the provided chunk, do not speculate about omitted sections, and return an empty works_cited array.
+- Do not warn merely because content outside the provided chunk is not shown.
+
+Selected ingestion profile:
+{profile_json}
+
+Document filename:
+{filename}
+
+Research purpose:
+{research_purpose}
+
+Current deterministic analysis:
+{analysis_json}
+
+Known bibliography entries from deterministic extraction:
+{bibliography_context}
+
+Document scope:
+{document_scope}
+
+Document text:
+{document_text}
+
+Return JSON with exactly these top-level keys:
+{{
+  "title_candidate": "",
+  "blocks": [
+    {{"kind": "heading" | "paragraph" | "list_item" | "table_row", "level": 1, "text": "", "citations": [1, 2]}}
+  ],
+  "works_cited": [
+    {{"number": 1, "citation_text": "", "url": "", "doi": ""}}
+  ],
+  "warnings": [""],
+  "unresolved_markers": [""],
+  "profile_suggestion": {{
+    "label": "",
+    "description": "",
+    "reference_heading_patterns": [""],
+    "citation_marker_patterns": [""],
+    "bibliography_split_patterns": [""],
+    "llm_guidance": ""
+  }}
+}}"""

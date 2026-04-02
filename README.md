@@ -4,6 +4,8 @@ ResearchAssistant is a local-first web application for citation extraction and s
 
 It helps you go from research documents to structured citation data, then optionally download and package cited source URLs (PDF/HTML/document pages) into a reproducible local dataset.
 
+For a teammate-focused overview of capabilities, workflows, and interfaces, see `docs/technical_teammate_overview.md`.
+
 ## What The Application Can Do
 
 ### 1) Extract citation evidence from uploaded documents
@@ -74,15 +76,39 @@ This command:
 
 Re-running is safe.
 
+Install frontend dependencies once:
+
+```bash
+cd frontend
+npm install
+```
+
 ### 2) Run the app
 
 ```bash
 ./scripts/run_dev.sh
 ```
 
-The app launches on `http://127.0.0.1:8000` and opens your browser automatically.
+This command builds the React frontend (`frontend/dist`) and then launches the app on `http://127.0.0.1:7995`.
 
-### 3) Standard workflow (document extraction)
+### 3) Frontend hot-reload mode (optional)
+
+In one terminal run the backend:
+
+```bash
+.venv/bin/python run.py
+```
+
+In a second terminal run the Vite frontend dev server:
+
+```bash
+cd frontend
+npm run dev
+```
+
+Then open the Vite URL shown in the terminal (default `http://127.0.0.1:5173`), which proxies `/api` to the local backend.
+
+### 4) Standard workflow (document extraction)
 
 1. Upload one or more research files in **Upload Documents**.
 2. Optional: upload a CSV/XLSX source list in **Upload Source URL Spreadsheet**.
@@ -93,7 +119,7 @@ The app launches on `http://127.0.0.1:8000` and opens your browser automatically
 7. Download `citations.csv` or `wikiclaude_export.db` from the Export panel.
 8. Optional: click **Download Sources** to build source manifests and output bundle.
 
-### 4) Attached Repository workflow (incremental mode)
+### 5) Attached Repository workflow (incremental mode)
 
 1. Enter an absolute folder path in **Attached Repository** and click **Attach + Scan**.
 2. Import URLs from a spreadsheet or references from a document.
@@ -161,6 +187,7 @@ Targeted fixes:
 ```bash
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m playwright install chromium
+cd frontend && npm install && npm run build
 ```
 
 If source extraction quality is limited for some URLs, the app may show runtime guidance in the UI (for optional local tools like Playwright browser binaries, `textutil`, or `tesseract`).
@@ -169,4 +196,12 @@ If source extraction quality is limited for some URLs, the app may show runtime 
 
 ```bash
 .venv/bin/python -m unittest discover -s tests
+```
+
+Frontend checks:
+
+```bash
+cd frontend
+npm test
+npm run build
 ```

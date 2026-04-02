@@ -51,10 +51,10 @@ def build_export(
         row = ExportRow(
             source_document=cit.document_filename if cit else "",
             page_in_source=str(cit.page_number or "") if cit else "",
-            citing_sentence=sent.text if sent else "",
+            citing_sentence="",
             citing_paragraph=sent.paragraph if sent else "",
-            context_before=sent.context_before if sent else "",
-            context_after=sent.context_after if sent else "",
+            context_before="",
+            context_after="",
             citation_raw=cit.raw_marker if cit else "",
             citation_ref_numbers=str(match.ref_number),
             cited_authors="; ".join(bib.authors) if bib else "",
@@ -90,6 +90,7 @@ def write_csv(artifact: ExportArtifact) -> str:
     writer.writeheader()
 
     for row in artifact.rows:
-        writer.writerow(row.model_dump())
+        payload = row.model_dump(mode="json")
+        writer.writerow({column: payload.get(column, "") for column in EXPORT_COLUMNS})
 
     return output.getvalue()

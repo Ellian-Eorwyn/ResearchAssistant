@@ -9,10 +9,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from backend.models.common import PipelineStage, StageStatus
+from backend.storage.project_profiles import (
+    list_project_profiles_in_dir,
+    resolve_project_profile_yaml,
+    sync_bundled_project_profiles,
+)
 
 
 class FileStore:
-    def __init__(self, base_dir: Path):
+    def __init__(self, base_dir: Path, *, sync_project_profiles: bool = True):
         self.base_dir = base_dir
         self.uploads_dir = base_dir / "uploads"
         self.artifacts_dir = base_dir / "artifacts"
@@ -21,9 +26,15 @@ class FileStore:
         self.project_profiles_dir = base_dir / "project_profiles"
         for d in [self.uploads_dir, self.artifacts_dir, self.exports_dir, self.project_profiles_dir]:
             d.mkdir(parents=True, exist_ok=True)
+        if sync_project_profiles:
+            sync_bundled_project_profiles(self.project_profiles_dir)
 
-    def create_job(self) -> str:
+    def create_job(self, *, prefix: str = "") -> str:
+        normalized_prefix = str(prefix or "").strip()
         job_id = uuid.uuid4().hex[:12]
+        if normalized_prefix:
+            safe_prefix = normalized_prefix.rstrip("_")
+            job_id = f"{safe_prefix}_{job_id}"
         (self.uploads_dir / job_id).mkdir(exist_ok=True)
         (self.artifacts_dir / job_id).mkdir(exist_ok=True)
         (self.exports_dir / job_id).mkdir(exist_ok=True)
@@ -134,6 +145,9 @@ class FileStore:
             json.dumps(settings, default=str, ensure_ascii=False, indent=2)
         )
 
+    def delete_settings(self) -> None:
+        self.settings_path.unlink(missing_ok=True)
+
     def get_job_status(self, job_id: str) -> dict | None:
         path = self.artifacts_dir / job_id / "_status.json"
         if not path.exists():
@@ -164,25 +178,45 @@ class FileStore:
 
     def list_project_profiles(self) -> list[dict]:
         """List available project profile YAML files."""
-        profiles = []
-        for ext in ("*.yaml", "*.yml"):
-            for p in sorted(self.project_profiles_dir.glob(ext)):
-                if p.is_file():
-                    profiles.append({"name": p.stem, "filename": p.name})
-        return profiles
+        return list_project_profiles_in_dir(self.project_profiles_dir)
 
     def load_project_profile(self, filename: str) -> str:
         """Read and return raw YAML text for a project profile.
 
         Raises ValueError if the file is not found or path traversal is attempted.
         """
-        safe_name = Path(filename).name
-        if safe_name != filename:
-            raise ValueError(f"Invalid profile filename: {filename}")
-        path = self.project_profiles_dir / safe_name
-        if not path.is_file():
-            raise ValueError(f"Project profile not found: {filename}")
-        return path.read_text(encoding="utf-8")
+        _, profile_yaml = resolve_project_profile_yaml(self.project_profiles_dir, filename)
+        return profile_yaml
+
+    def resolve_project_profile(
+        self,
+        filename: str,
+        *,
+        research_purpose: str = "",
+        default_when_blank: bool = False,
+    ) -> tuple[str, str]:
+        return resolve_project_profile_yaml(
+            self.project_profiles_dir,
+            filename,
+            research_purpose=research_purpose,
+            default_when_blank=default_when_blank,
+        )
+
+    def sync_project_profiles_to(self, target_dir: Path) -> None:
+        sync_bundled_project_profiles(self.project_profiles_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            if self.project_profiles_dir.resolve() == target_dir.resolve():
+                return
+        except OSError:
+            pass
+
+        for profile in list_project_profiles_in_dir(self.project_profiles_dir):
+            source_path = self.project_profiles_dir / profile["filename"]
+            destination = target_dir / profile["filename"]
+            if destination.exists():
+                continue
+            shutil.copy2(source_path, destination)
 
     def job_exists(self, job_id: str) -> bool:
         return (self.artifacts_dir / job_id).is_dir()

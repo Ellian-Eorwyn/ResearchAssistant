@@ -97,7 +97,11 @@ class PipelineOrchestrator:
 
             for doc, refs_section in zip(documents, refs_sections_by_doc):
                 doc_sections = [refs_section] if refs_section else []
-                doc_bib = parse_bibliography(doc_sections)
+                doc_bib = parse_bibliography(
+                    doc_sections,
+                    use_llm=self.config.use_llm,
+                    llm_backend=self.config.llm_backend,
+                )
 
                 # Enrich/create entries from inline citation URLs (Markdown docs)
                 if doc.inline_citation_urls:

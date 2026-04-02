@@ -21,6 +21,7 @@ class SourceManifestRow(BaseModel):
     detected_type: str = ""  # pdf | html | document | unsupported
     fetch_method: str = ""  # http | playwright
     title: str = ""
+    title_status: str = ""  # not_requested | existing | extracted | generated | failed | skipped_*
     raw_file: str = ""
     rendered_file: str = ""
     rendered_pdf_file: str = ""
@@ -58,6 +59,7 @@ SOURCE_MANIFEST_COLUMNS = [
     "detected_type",
     "fetch_method",
     "title",
+    "title_status",
     "raw_file",
     "rendered_file",
     "rendered_pdf_file",
@@ -94,6 +96,7 @@ class SourceItemStatus(BaseModel):
     citation_number: str = ""
     status: str = "pending"  # pending | running | completed | failed | skipped | cancelled
     fetch_status: str = ""
+    title_status: str = ""
     llm_cleanup_status: str = ""
     summary_status: str = ""
     rating_status: str = ""
@@ -108,6 +111,25 @@ class RuntimeGuidance(BaseModel):
 
 
 class SourceOutputOptions(BaseModel):
+    include_raw_file: bool = True
+    include_rendered_html: bool = True
+    include_rendered_pdf: bool = True
+    include_markdown: bool = True
+
+
+class SourceDownloadRequest(BaseModel):
+    rerun_failed_only: bool = False
+    run_download: bool = True
+    run_llm_cleanup: bool = False
+    run_llm_title: bool = False
+    run_llm_summary: bool = True
+    run_llm_rating: bool = False
+    force_redownload: bool = False
+    force_llm_cleanup: bool = False
+    force_title: bool = False
+    force_summary: bool = False
+    force_rating: bool = False
+    project_profile_name: str = ""
     include_raw_file: bool = True
     include_rendered_html: bool = True
     include_rendered_pdf: bool = True
@@ -133,7 +155,7 @@ class SourceOutputSummary(BaseModel):
 
 class SourceDownloadStatus(BaseModel):
     job_id: str
-    state: str = "pending"  # pending | running | completed | failed | cancelled
+    state: str = "pending"  # pending | running | cancelling | completed | failed | cancelled
     total_urls: int = 0
     processed_urls: int = 0
     success_count: int = 0
@@ -143,6 +165,9 @@ class SourceDownloadStatus(BaseModel):
     duplicate_urls_removed: int = 0
     started_at: str | None = None
     completed_at: str | None = None
+    cancel_requested: bool = False
+    cancel_requested_at: str | None = None
+    stop_after_current_item: bool = False
     current_item_id: str = ""
     current_url: str = ""
     message: str = ""
@@ -151,10 +176,12 @@ class SourceDownloadStatus(BaseModel):
     rerun_failed_only: bool = False
     run_download: bool = True
     run_llm_cleanup: bool = False
+    run_llm_title: bool = False
     run_llm_summary: bool = True
     run_llm_rating: bool = False
     force_redownload: bool = False
     force_llm_cleanup: bool = False
+    force_title: bool = False
     force_summary: bool = False
     force_rating: bool = False
     project_profile_name: str = ""
@@ -164,6 +191,10 @@ class SourceDownloadStatus(BaseModel):
     manifest_csv: str = ""
     manifest_xlsx: str = ""
     bundle_file: str = ""
+    writes_to_repository: bool = False
+    repository_path: str = ""
+    selected_scope: str = ""
+    selected_import_id: str = ""
     items: list[SourceItemStatus] = Field(default_factory=list)
 
 
