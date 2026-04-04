@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.models.settings import LLMBackendConfig, RepoSettings
-from backend.routers import pipeline, repository, results, settings, sources, upload
+from backend.routers import agent, pipeline, repository, results, settings, sources, upload
 from backend.storage.attached_repository import AttachedRepositoryService
 from backend.storage.file_store import FileStore
 
@@ -95,6 +95,7 @@ def create_app() -> FastAPI:
     app.include_router(sources.router, prefix="/api", tags=["sources"])
     app.include_router(settings.router, prefix="/api", tags=["settings"])
     app.include_router(repository.router, prefix="/api", tags=["repository"])
+    app.include_router(agent.router, prefix="/api", tags=["agent"])
 
     # Health check
     @app.get("/api/health")

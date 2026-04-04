@@ -14,16 +14,15 @@ const NAV_GROUPS: Array<{ label: string; items: NavEntry[] }> = [
     label: "Project",
     items: [
       { label: "Overview", to: "/project/overview" },
-      { label: "Documents", to: "/project/documents" },
-      { label: "Source Lists", to: "/project/source-lists" },
+      { label: "Ingest", to: "/project/ingest" },
       { label: "Merge Repositories", to: "/project/merge" },
     ],
   },
   {
     label: "Processing",
     items: [
-      { label: "Citation Extraction", to: "/processing/citation-extraction" },
-      { label: "Source Capture", to: "/processing/source-capture" },
+      { label: "Repository Processing", to: "/processing/source-capture" },
+      { label: "Citation Extraction (Legacy)", to: "/processing/citation-extraction" },
       { label: "Job History", to: "/processing/job-history" },
     ],
   },
@@ -95,8 +94,8 @@ export function AppShell() {
       const processed = sourceStatus?.processed_urls || 0;
       const total = sourceStatus?.total_urls || 0;
       return sourceStopping
-        ? `Source Capture stopping ${processed}/${total}`
-        : `Source Capture ${processed}/${total}`;
+        ? `Repository Processing stopping ${processed}/${total}`
+        : `Repository Processing ${processed}/${total}`;
     }
     if (processingRunning) {
       const preprocessState = String(
@@ -105,7 +104,7 @@ export function AppShell() {
       if (preprocessState === "pending" || preprocessState === "running") {
         return (
           processingStatus?.repository_preprocess_message ||
-          "Citation Extraction preprocessing"
+          "Legacy Citation Extraction preprocessing"
         );
       }
       const finalizeState = String(
@@ -114,11 +113,11 @@ export function AppShell() {
       if (finalizeState === "pending" || finalizeState === "running") {
         return (
           processingStatus?.repository_finalize_message ||
-          "Citation Extraction finalizing"
+          "Legacy Citation Extraction finalizing"
         );
       }
       const pct = Math.round(processingStatus?.progress_pct || 0);
-      return `Citation Extraction ${pct}%`;
+      return `Legacy Citation Extraction ${pct}%`;
     }
     return "Idle";
   }, [
@@ -158,7 +157,7 @@ export function AppShell() {
     if (!selectedPath) return;
     const created = await createRepository(selectedPath);
     if (created) {
-      navigate("/project/documents");
+      navigate("/project/ingest");
     }
   }, [
     createRepository,
@@ -230,7 +229,7 @@ export function AppShell() {
             </div>
           </div>
 
-          <Button className="mb-4 w-full" variant="primary" onClick={() => navigate("/project/documents")}>New Research</Button>
+          <Button className="mb-4 w-full" variant="primary" onClick={() => navigate("/project/ingest")}>New Research</Button>
 
           <nav className="space-y-4 pb-6">
             {NAV_GROUPS.map((group) => (

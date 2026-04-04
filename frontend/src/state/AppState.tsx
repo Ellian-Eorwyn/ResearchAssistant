@@ -51,11 +51,13 @@ const DEFAULT_SETTINGS: RepoSettings = {
 const DEFAULT_SOURCE_TASKS: RepositorySourceTaskRequest = {
   rerun_failed_only: false,
   run_download: true,
+  run_catalog: true,
   run_llm_cleanup: false,
   run_llm_title: false,
   run_llm_summary: false,
   run_llm_rating: false,
   force_redownload: false,
+  force_catalog: false,
   force_llm_cleanup: false,
   force_title: false,
   force_summary: false,
@@ -125,6 +127,8 @@ interface AppStateValue {
   addFiles: (incoming: FileList | File[]) => void;
   removeFileAtIndex: (index: number) => void;
   clearFiles: () => void;
+  ingestSeedFiles: (files: File[]) => Promise<void>;
+  ingestRepositoryDocuments: (files: File[]) => Promise<void>;
   importSourceList: (file: File | null) => Promise<void>;
   mergeRepositories: (sourcePaths: string[]) => Promise<void>;
   rebuildRepositoryOutputs: () => Promise<void>;
@@ -317,6 +321,7 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       setSettingsDraft(settings);
       setSourceTaskDraft((prev) => ({
         ...prev,
+        run_catalog: Boolean(settings.use_llm) || prev.run_catalog,
         run_llm_summary: Boolean(settings.use_llm),
       }));
     } catch (error) {
@@ -638,6 +643,64 @@ export function AppStateProvider({ children }: PropsWithChildren) {
 
   const clearFiles = useCallback(() => setFiles([]), []);
 
+  const ingestSeedFiles = useCallback(
+    async (incomingFiles: File[]) => {
+      const files = incomingFiles.filter(Boolean);
+      if (files.length === 0) {
+        setRepoError("Choose at least one seed file first.");
+        return;
+      }
+      setRepoError("");
+      setRepoMessage("Importing seed links and reports...");
+      try {
+        const response = await api.ingestRepositorySeedFiles(files);
+        await refreshDashboard();
+        setHasSourceUrls((response.total_sources || 0) > 0);
+        setSourceTaskDraft((prev) => ({
+          ...prev,
+          scope: "import",
+          import_id: response.import_id,
+        }));
+        setRepoMessage(
+          response.message ||
+            `Imported ${response.accepted_new} new seed sources (${response.duplicates_skipped} duplicates skipped).`,
+        );
+      } catch (error) {
+        setRepoError(String((error as Error).message || "Seed ingest failed"));
+      }
+    },
+    [refreshDashboard],
+  );
+
+  const ingestRepositoryDocuments = useCallback(
+    async (incomingFiles: File[]) => {
+      const files = incomingFiles.filter(Boolean);
+      if (files.length === 0) {
+        setRepoError("Choose at least one repository document first.");
+        return;
+      }
+      setRepoError("");
+      setRepoMessage("Adding documents to the repository...");
+      try {
+        const response = await api.ingestRepositoryDocuments(files);
+        await refreshDashboard();
+        setHasSourceUrls((response.total_sources || 0) > 0);
+        setSourceTaskDraft((prev) => ({
+          ...prev,
+          scope: "import",
+          import_id: response.import_id,
+        }));
+        setRepoMessage(
+          response.message ||
+            `Added ${response.accepted_new} repository documents (${response.duplicates_skipped} duplicates skipped).`,
+        );
+      } catch (error) {
+        setRepoError(String((error as Error).message || "Repository document ingest failed"));
+      }
+    },
+    [refreshDashboard],
+  );
+
   const importSourceList = useCallback(
     async (file: File | null) => {
       if (!file) {
@@ -797,6 +860,7 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       const normalizedPayload = {
         ...sourceTaskDraft,
         run_download: Boolean(sourceTaskDraft.run_download || sourceTaskDraft.force_redownload),
+        run_catalog: Boolean(sourceTaskDraft.run_catalog || sourceTaskDraft.force_catalog || sourceTaskDraft.run_llm_title || sourceTaskDraft.force_title),
         run_llm_cleanup: Boolean(
           sourceTaskDraft.run_llm_cleanup || sourceTaskDraft.force_llm_cleanup,
         ),
@@ -808,6 +872,7 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       };
       if (
         !normalizedPayload.run_download &&
+        !normalizedPayload.run_catalog &&
         !normalizedPayload.run_llm_cleanup &&
         !normalizedPayload.run_llm_title &&
         !normalizedPayload.run_llm_summary &&
@@ -831,6 +896,7 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       setSourceTaskDraft((prev) => ({
         ...prev,
         run_download: normalizedPayload.run_download,
+        run_catalog: normalizedPayload.run_catalog,
         run_llm_cleanup: normalizedPayload.run_llm_cleanup,
         run_llm_title: normalizedPayload.run_llm_title,
         run_llm_summary: normalizedPayload.run_llm_summary,
@@ -1104,6 +1170,8 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       addFiles,
       removeFileAtIndex,
       clearFiles,
+      ingestSeedFiles,
+      ingestRepositoryDocuments,
       importSourceList,
       mergeRepositories,
       rebuildRepositoryOutputs,
@@ -1169,6 +1237,8 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       addFiles,
       removeFileAtIndex,
       clearFiles,
+      ingestSeedFiles,
+      ingestRepositoryDocuments,
       importSourceList,
       mergeRepositories,
       rebuildRepositoryOutputs,

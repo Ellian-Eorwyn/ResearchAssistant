@@ -31,6 +31,13 @@ const DEFAULT_FILTERS: RepositoryBrowserFilters = {
   q: "",
   fetchStatus: "",
   detectedType: "",
+  sourceKind: "",
+  documentType: "",
+  organizationType: "",
+  organizationName: "",
+  authorNames: "",
+  publicationDate: "",
+  tagsText: "",
   hasSummary: "",
   hasRating: "",
   ratingOverallRelevanceMin: "",
@@ -408,6 +415,54 @@ export function RepositoryBrowserPage() {
             placeholder="pdf / html / document"
             value={filters.detectedType}
             onChange={(event) => patchFilters({ detectedType: event.target.value })}
+          />
+          <InputField
+            label="Source Kind"
+            placeholder="url / uploaded_document"
+            value={filters.sourceKind}
+            onChange={(event) => patchFilters({ sourceKind: event.target.value })}
+          />
+        </div>
+
+        <div className="mt-3 grid gap-3 lg:grid-cols-4">
+          <InputField
+            label="Document Type"
+            placeholder="report / journal article / web page"
+            value={filters.documentType}
+            onChange={(event) => patchFilters({ documentType: event.target.value })}
+          />
+          <InputField
+            label="Organization Type"
+            placeholder="agency / company / university"
+            value={filters.organizationType}
+            onChange={(event) => patchFilters({ organizationType: event.target.value })}
+          />
+          <InputField
+            label="Organization"
+            placeholder="publisher or institution"
+            value={filters.organizationName}
+            onChange={(event) => patchFilters({ organizationName: event.target.value })}
+          />
+          <InputField
+            label="Authors"
+            placeholder="author names"
+            value={filters.authorNames}
+            onChange={(event) => patchFilters({ authorNames: event.target.value })}
+          />
+        </div>
+
+        <div className="mt-3 grid gap-3 lg:grid-cols-4">
+          <InputField
+            label="Publication Date"
+            placeholder="2024 or 2024-03-15"
+            value={filters.publicationDate}
+            onChange={(event) => patchFilters({ publicationDate: event.target.value })}
+          />
+          <InputField
+            label="Tags"
+            placeholder="policy, housing, retrofit"
+            value={filters.tagsText}
+            onChange={(event) => patchFilters({ tagsText: event.target.value })}
           />
           <SelectField
             label="Page Size"

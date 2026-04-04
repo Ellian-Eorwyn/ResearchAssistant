@@ -29,6 +29,8 @@ from openpyxl.utils import get_column_letter
 
 from backend.llm.client import UnifiedLLMClient
 from backend.llm.prompts import (
+    SOURCE_CATALOG_SYSTEM,
+    SOURCE_CATALOG_USER,
     SOURCE_MARKDOWN_CLEANUP_SYSTEM,
     SOURCE_MARKDOWN_CLEANUP_USER,
     SOURCE_RATING_SYSTEM,
@@ -47,6 +49,7 @@ from backend.models.sources import (
     SourceItemStatus,
     SourceManifestArtifact,
     SourceManifestRow,
+    SourcePhaseMetadata,
 )
 from backend.pipeline.standardized_markdown import extract_markdown_title_candidate
 from backend.storage.file_store import FileStore
@@ -91,6 +94,17 @@ NOTE_RATING_GENERATION_FAILED = "rating_generation_failed"
 NOTE_RATING_SKIPPED_LLM_NOT_CONFIGURED = "rating_skipped_llm_not_configured"
 NOTE_VISUAL_CAPTURE_FAILED = "visual_capture_failed"
 NOTE_VISUAL_CAPTURE_SEGMENTED = "visual_capture_segmented"
+PHASE_FETCH = "fetch"
+PHASE_CONVERT = "convert"
+PHASE_CATALOG = "catalog"
+PHASE_TAG = "tag"
+PHASE_SUMMARIZE = "summarize"
+
+PROMPT_VERSION_CLEANUP = "source_markdown_cleanup.v1"
+PROMPT_VERSION_CATALOG = "source_catalog.v1"
+PROMPT_VERSION_TITLE = "source_title.v1"
+PROMPT_VERSION_SUMMARY = "source_summary.v1"
+PROMPT_VERSION_RATING = "source_rating.v1"
 
 INSTALL_BOOTSTRAP_COMMAND = "./scripts/bootstrap_venv.sh"
 INSTALL_REQUIREMENTS_COMMAND = ".venv/bin/python -m pip install -r requirements.txt"
@@ -386,11 +400,15 @@ class SourceDownloadOrchestrator:
         research_purpose: str = "",
         fetch_delay: float = 2.0,
         run_download: bool = True,
+        run_convert: bool = False,
+        run_catalog: bool = False,
         run_llm_cleanup: bool = False,
         run_llm_title: bool = False,
         run_llm_summary: bool = True,
         run_llm_rating: bool = False,
         force_redownload: bool = False,
+        force_convert: bool = False,
+        force_catalog: bool = False,
         force_llm_cleanup: bool = False,
         force_title: bool = False,
         force_summary: bool = False,
@@ -404,6 +422,7 @@ class SourceDownloadOrchestrator:
         repository_path: str = "",
         selected_scope: str = "",
         selected_import_id: str = "",
+        selected_phases: list[str] | None = None,
         row_persist_callback: Callable[[SourceManifestRow], None] | None = None,
     ):
         self.job_id = job_id
@@ -414,18 +433,22 @@ class SourceDownloadOrchestrator:
         self.research_purpose = (research_purpose or "").strip()
         self.fetch_delay = max(1.0, min(10.0, fetch_delay))
         self.force_redownload = bool(force_redownload)
+        self.force_convert = bool(force_convert)
+        self.force_catalog = bool(force_catalog or force_title)
         self.force_llm_cleanup = bool(force_llm_cleanup)
         self.force_title = bool(force_title)
         self.force_summary = bool(force_summary)
         self.force_rating = bool(force_rating)
+        self.output_options = output_options or SourceOutputOptions()
         self.run_download = bool(run_download or self.force_redownload)
+        self.run_convert = bool(run_convert or (self.run_download and self.output_options.include_markdown))
+        self.run_catalog = bool(run_catalog or self.force_catalog or run_llm_title)
         self.run_llm_cleanup = bool(run_llm_cleanup or self.force_llm_cleanup)
         self.run_llm_title = bool(run_llm_title or self.force_title)
         self.run_llm_summary = bool(run_llm_summary or self.force_summary)
         self.run_llm_rating = bool(run_llm_rating or self.force_rating)
         self.project_profile_name = (project_profile_name or "").strip()
         self.project_profile_yaml = (project_profile_yaml or "").strip()
-        self.output_options = output_options or SourceOutputOptions()
         self.target_rows = [row.model_copy(deep=True) for row in (target_rows or [])]
         self.execution_output_dir = self.store.get_sources_output_dir(job_id)
         self.output_dir = output_dir or self.execution_output_dir
@@ -433,6 +456,11 @@ class SourceDownloadOrchestrator:
         self.repository_path = (repository_path or "").strip()
         self.selected_scope = (selected_scope or "").strip()
         self.selected_import_id = (selected_import_id or "").strip()
+        self.selected_phases = [
+            phase
+            for phase in (selected_phases or [])
+            if phase in {PHASE_FETCH, PHASE_CONVERT, PHASE_CATALOG, PHASE_TAG, PHASE_SUMMARIZE}
+        ]
         self.row_persist_callback = row_persist_callback
         self.logs_dir = self.execution_output_dir / "logs"
         self.log_file = self.logs_dir / "source_download.jsonl"
@@ -442,6 +470,7 @@ class SourceDownloadOrchestrator:
         self._cancel_event = threading.Event()
         self._llm_client: UnifiedLLMClient | None = None
         self._incremental_save_counter: int = 0
+        self._phase_states: dict[str, SourcePhaseMetadata] = {}
         self.runtime_capabilities = RuntimeCapabilities(
             trafilatura_available=trafilatura is not None,
             playwright_python_available=False,
@@ -473,6 +502,41 @@ class SourceDownloadOrchestrator:
 
     def _has_running_item(self) -> bool:
         return any(item.status == "running" for item in self._status_items.values())
+
+    def _requested_phase_names(self) -> list[str]:
+        if self.selected_phases:
+            return list(self.selected_phases)
+        phases: list[str] = []
+        if self.run_download:
+            phases.append(PHASE_FETCH)
+        if self.run_convert:
+            phases.append(PHASE_CONVERT)
+        if self.run_catalog:
+            phases.append(PHASE_CATALOG)
+        if self.run_llm_rating:
+            phases.append(PHASE_TAG)
+        if self.run_llm_summary:
+            phases.append(PHASE_SUMMARIZE)
+        return phases
+
+    def _initial_phase_states(self) -> dict[str, SourcePhaseMetadata]:
+        states: dict[str, SourcePhaseMetadata] = {}
+        for phase in self._requested_phase_names():
+            states[phase] = SourcePhaseMetadata(phase=phase, status="pending")
+        self._phase_states = states
+        return {key: value.model_copy(deep=True) for key, value in states.items()}
+
+    def _set_phase_state(self, phase: str, status: str) -> None:
+        if phase not in self._phase_states:
+            self._phase_states[phase] = SourcePhaseMetadata(phase=phase, status=status)
+        else:
+            self._phase_states[phase].status = status
+        if self.status is not None:
+            self.status.phase_states = {
+                key: value.model_copy(deep=True)
+                for key, value in self._phase_states.items()
+            }
+            self._save_status()
 
     def _mark_status_cancelling(self) -> None:
         if not self.status:
@@ -541,6 +605,8 @@ class SourceDownloadOrchestrator:
         try:
             if not (
                 self.run_download
+                or self.run_convert
+                or self.run_catalog
                 or self.run_llm_cleanup
                 or self.run_llm_title
                 or self.run_llm_summary
@@ -581,16 +647,21 @@ class SourceDownloadOrchestrator:
                     "total_urls": len(targets),
                     "rerun_failed_only": self.rerun_failed_only,
                     "run_download": self.run_download,
+                    "run_convert": self.run_convert,
+                    "run_catalog": self.run_catalog,
                     "run_llm_cleanup": self.run_llm_cleanup,
                     "run_llm_title": self.run_llm_title,
                     "run_llm_summary": self.run_llm_summary,
                     "run_llm_rating": self.run_llm_rating,
                     "force_redownload": self.force_redownload,
+                    "force_convert": self.force_convert,
+                    "force_catalog": self.force_catalog,
                     "force_llm_cleanup": self.force_llm_cleanup,
                     "force_title": self.force_title,
                     "force_summary": self.force_summary,
                     "force_rating": self.force_rating,
                     "project_profile_name": self.project_profile_name,
+                    "selected_phases": self._requested_phase_names(),
                     "output_options": self.output_options.model_dump(mode="json"),
                     "runtime_notes": self.runtime_capabilities.runtime_notes,
                     "runtime_guidance": self.runtime_capabilities.runtime_guidance,
@@ -762,7 +833,6 @@ class SourceDownloadOrchestrator:
                     original_url=row.original_url or row.final_url,
                 )
                 for row in self.target_rows
-                if (row.original_url or row.final_url)
             ]
 
         bib = self.store.load_artifact(self.job_id, "03_bibliography")
@@ -831,21 +901,27 @@ class SourceDownloadOrchestrator:
         runtime_capabilities: RuntimeCapabilities,
         existing_rows: list[SourceManifestRow],
     ) -> None:
+        existing_by_id = {row.id: row for row in existing_rows}
         items = [
             SourceItemStatus(
                 id=t.id,
                 original_url=t.original_url,
                 citation_number=t.citation_number,
+                source_kind=existing_by_id.get(t.id, SourceManifestRow(id=t.id)).source_kind,
             )
             for t in targets
         ]
         phase_bits: list[str] = []
         if self.run_download:
             phase_bits.append("download")
+        if self.run_convert:
+            phase_bits.append("convert")
+        if self.run_catalog:
+            phase_bits.append("catalog")
         if self.run_llm_cleanup:
             phase_bits.append("llm cleanup")
         if self.run_llm_title:
-            phase_bits.append("title")
+            phase_bits.append("title alias")
         if self.run_llm_summary:
             phase_bits.append("summary")
         if self.run_llm_rating:
@@ -875,11 +951,15 @@ class SourceDownloadOrchestrator:
             runtime_guidance=runtime_capabilities.runtime_guidance,
             rerun_failed_only=self.rerun_failed_only,
             run_download=self.run_download,
+            run_convert=self.run_convert,
+            run_catalog=self.run_catalog,
             run_llm_cleanup=self.run_llm_cleanup,
             run_llm_title=self.run_llm_title,
             run_llm_summary=self.run_llm_summary,
             run_llm_rating=self.run_llm_rating,
             force_redownload=self.force_redownload,
+            force_convert=self.force_convert,
+            force_catalog=self.force_catalog,
             force_llm_cleanup=self.force_llm_cleanup,
             force_title=self.force_title,
             force_summary=self.force_summary,
@@ -895,8 +975,10 @@ class SourceDownloadOrchestrator:
             repository_path=self.repository_path,
             selected_scope=self.selected_scope,
             selected_import_id=self.selected_import_id,
+            selected_phases=self._requested_phase_names(),
             items=items,
         )
+        self.status.phase_states = self._initial_phase_states()
         self.status.message = self._compose_status_message(
             "Stop requested" if cancel_requested else f"Running phases: {phase_text}"
         )
@@ -946,6 +1028,96 @@ class SourceDownloadOrchestrator:
             return
         self.row_persist_callback(row.model_copy(deep=True))
 
+    def _begin_row_phase(
+        self,
+        row: SourceManifestRow,
+        phase: str,
+        *,
+        model: str = "",
+        profile_name: str = "",
+        prompt_version: str = "",
+    ) -> None:
+        metadata = row.phase_metadata.get(phase) or SourcePhaseMetadata(phase=phase)
+        metadata.phase = phase
+        metadata.status = "running"
+        metadata.error = ""
+        metadata.error_code = ""
+        metadata.started_at = _utc_now_iso()
+        metadata.completed_at = ""
+        if model:
+            metadata.model = model
+        if profile_name:
+            metadata.profile_name = profile_name
+        if prompt_version:
+            metadata.prompt_version = prompt_version
+        row.phase_metadata[phase] = metadata
+
+    def _complete_row_phase(
+        self,
+        row: SourceManifestRow,
+        phase: str,
+        *,
+        status: str,
+        content_digest: str = "",
+        error: str = "",
+        error_code: str = "",
+        stale: bool = False,
+        model: str = "",
+        profile_name: str = "",
+        prompt_version: str = "",
+    ) -> None:
+        metadata = row.phase_metadata.get(phase) or SourcePhaseMetadata(phase=phase)
+        metadata.phase = phase
+        metadata.status = status
+        metadata.error = error
+        metadata.error_code = error_code
+        if not metadata.started_at:
+            metadata.started_at = _utc_now_iso()
+        metadata.completed_at = _utc_now_iso()
+        metadata.stale = bool(stale)
+        if content_digest:
+            metadata.content_digest = content_digest
+        if model:
+            metadata.model = model
+        if profile_name:
+            metadata.profile_name = profile_name
+        if prompt_version:
+            metadata.prompt_version = prompt_version
+        row.phase_metadata[phase] = metadata
+
+    def _mark_downstream_stale(self, row: SourceManifestRow, markdown_digest: str) -> None:
+        for phase, status_field in (
+            (PHASE_CATALOG, "catalog_status"),
+            (PHASE_SUMMARIZE, "summary_status"),
+            (PHASE_TAG, "rating_status"),
+        ):
+            metadata = row.phase_metadata.get(phase)
+            if metadata is None:
+                continue
+            if not metadata.content_digest or metadata.content_digest == markdown_digest:
+                metadata.stale = False
+                row.phase_metadata[phase] = metadata
+                continue
+            metadata.status = "stale"
+            metadata.stale = True
+            metadata.completed_at = _utc_now_iso()
+            row.phase_metadata[phase] = metadata
+            setattr(row, status_field, "stale")
+
+    def _effective_markdown_rel_path(self, row: SourceManifestRow) -> str:
+        if row.llm_cleanup_file and _has_output_file(self.output_dir, row.llm_cleanup_file):
+            return row.llm_cleanup_file
+        return row.markdown_file
+
+    def _effective_markdown_digest(self, row: SourceManifestRow) -> str:
+        rel_path = self._effective_markdown_rel_path(row)
+        if not rel_path:
+            return ""
+        text = self._read_text(Path(rel_path))
+        if not text.strip():
+            return ""
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
     def _source_file_rel(self, row: SourceManifestRow, filename: str, subdir: str) -> Path:
         if self.writes_to_repository:
             return Path("sources") / row.id / filename
@@ -965,6 +1137,9 @@ class SourceDownloadOrchestrator:
 
     def _llm_cleanup_rel(self, row: SourceManifestRow) -> Path:
         return self._source_file_rel(row, f"{row.id}_llm_clean.md", "markdown")
+
+    def _catalog_rel(self, row: SourceManifestRow) -> Path:
+        return self._source_file_rel(row, f"{row.id}_catalog.json", "metadata")
 
     def _summary_rel(self, row: SourceManifestRow) -> Path:
         return self._source_file_rel(row, f"{row.id}_summary.md", "summaries")
@@ -1002,7 +1177,7 @@ class SourceDownloadOrchestrator:
             checks.append(bool(existing_row.rendered_file))
         if self.output_options.include_rendered_pdf:
             checks.append(bool(existing_row.rendered_pdf_file))
-        if self.output_options.include_markdown:
+        if self.run_convert:
             checks.append(bool(existing_row.markdown_file))
 
         if not checks:
@@ -1013,7 +1188,9 @@ class SourceDownloadOrchestrator:
         if existing_row is None:
             return False
         return (
-            self.run_llm_cleanup
+            self.run_convert
+            or self.run_catalog
+            or self.run_llm_cleanup
             or self.run_llm_title
             or self.run_llm_summary
             or self.run_llm_rating
@@ -1037,6 +1214,14 @@ class SourceDownloadOrchestrator:
             "original_url": row.original_url,
             "started_at": _utc_now_iso(),
         }
+        if self.run_convert:
+            self._set_phase_state(PHASE_CONVERT, "running")
+        if self.run_catalog:
+            self._set_phase_state(PHASE_CATALOG, "running")
+        if self.run_llm_summary:
+            self._set_phase_state(PHASE_SUMMARIZE, "running")
+        if self.run_llm_rating:
+            self._set_phase_state(PHASE_TAG, "running")
         return self._finalize_row(
             row=row,
             notes=notes,
@@ -1055,6 +1240,9 @@ class SourceDownloadOrchestrator:
         if item:
             item.status = "skipped"
             item.fetch_status = existing_row.fetch_status if existing_row else "skipped"
+            item.catalog_status = (
+                existing_row.catalog_status if existing_row else item.catalog_status
+            )
             item.title_status = (
                 existing_row.title_status if existing_row else item.title_status
             )
@@ -1092,21 +1280,30 @@ class SourceDownloadOrchestrator:
         item = self._status_items.get(row.id)
         if item:
             item.fetch_status = row.fetch_status
+            item.catalog_status = row.catalog_status
             item.title_status = row.title_status
             item.llm_cleanup_status = row.llm_cleanup_status
             item.summary_status = row.summary_status
             item.rating_status = row.rating_status
             item.error_message = row.error_message
-            if self.run_download and row.fetch_status == "failed":
+            overall = _row_task_outcome(row, self._requested_phase_names())
+            if overall == "failed":
                 item.status = "failed"
+            elif overall == "partial":
+                item.status = "completed"
+            elif overall == "skipped":
+                item.status = "skipped"
             else:
                 item.status = "completed"
 
         self.status.processed_urls += 1
-        if row.fetch_status == "success":
+        overall = _row_task_outcome(row, self._requested_phase_names())
+        if overall == "success":
             self.status.success_count += 1
-        elif row.fetch_status == "partial":
+        elif overall == "partial":
             self.status.partial_count += 1
+        elif overall == "skipped":
+            self.status.skipped_count += 1
         else:
             self.status.failed_count += 1
         self.status.message = self._compose_status_message(
@@ -1132,12 +1329,21 @@ class SourceDownloadOrchestrator:
                 repository_path=self.repository_path,
                 selected_scope=self.selected_scope,
                 selected_import_id=self.selected_import_id,
+                selected_phases=self._requested_phase_names(),
             )
         else:
             self.status.state = "failed"
             self.status.message = self._compose_status_message(error_message)
             self.status.completed_at = _utc_now_iso()
             self.status.stop_after_current_item = False
+        for phase in self._requested_phase_names():
+            self._phase_states.setdefault(phase, SourcePhaseMetadata(phase=phase))
+            if self._phase_states[phase].status in {"pending", "running"}:
+                self._phase_states[phase].status = "failed"
+        self.status.phase_states = {
+            key: value.model_copy(deep=True)
+            for key, value in self._phase_states.items()
+        }
         self._save_status()
 
     def _mark_status_completed(
@@ -1163,6 +1369,14 @@ class SourceDownloadOrchestrator:
         )
         self.status.bundle_file = bundle_path.name if bundle_path else ""
         self.status.output_summary = output_summary
+        for phase in self._requested_phase_names():
+            self._phase_states.setdefault(phase, SourcePhaseMetadata(phase=phase))
+            if self._phase_states[phase].status in {"pending", "running"}:
+                self._phase_states[phase].status = "completed"
+        self.status.phase_states = {
+            key: value.model_copy(deep=True)
+            for key, value in self._phase_states.items()
+        }
         self._save_status()
 
     def _mark_status_cancelled(
@@ -1202,6 +1416,14 @@ class SourceDownloadOrchestrator:
         )
         self.status.stop_after_current_item = False
         self.status.output_summary = output_summary
+        for phase in self._requested_phase_names():
+            self._phase_states.setdefault(phase, SourcePhaseMetadata(phase=phase))
+            if self._phase_states[phase].status in {"pending", "running"}:
+                self._phase_states[phase].status = "cancelled"
+        self.status.phase_states = {
+            key: value.model_copy(deep=True)
+            for key, value in self._phase_states.items()
+        }
         self._save_status()
 
     def _process_target(
@@ -1225,6 +1447,8 @@ class SourceDownloadOrchestrator:
                 original_url=target.original_url,
             )
         notes: list[str] = parse_notes(row.notes)
+        self._set_phase_state(PHASE_FETCH, "running")
+        self._begin_row_phase(row, PHASE_FETCH)
         event: dict = {
             "event": "source_processed",
             "job_id": self.job_id,
@@ -1233,11 +1457,41 @@ class SourceDownloadOrchestrator:
             "started_at": _utc_now_iso(),
         }
 
+        if existing_row is not None and existing_row.source_kind == "uploaded_document":
+            row.fetch_status = "not_applicable"
+            row.error_message = ""
+            if not row.notes:
+                notes.append("local_document")
+            self._complete_row_phase(
+                row,
+                PHASE_FETCH,
+                status="skipped",
+                content_digest=row.sha256,
+                error="not_applicable: uploaded repository document",
+                error_code="not_applicable",
+            )
+            if self.run_convert:
+                self._set_phase_state(PHASE_CONVERT, "running")
+            if self.run_catalog:
+                self._set_phase_state(PHASE_CATALOG, "running")
+            if self.run_llm_summary:
+                self._set_phase_state(PHASE_SUMMARIZE, "running")
+            if self.run_llm_rating:
+                self._set_phase_state(PHASE_TAG, "running")
+            return self._finalize_row(row, notes, event, update_fetched_at=False)
+
         normalized_url, url_error = normalize_url(target.original_url)
         if url_error:
             row.fetch_status = "failed"
             row.error_message = f"invalid_url: {url_error}"
             notes.append("invalid_url")
+            self._complete_row_phase(
+                row,
+                PHASE_FETCH,
+                status="failed",
+                error=row.error_message,
+                error_code="invalid_url",
+            )
             return self._finalize_row(row, notes, event)
 
         try:
@@ -1247,12 +1501,26 @@ class SourceDownloadOrchestrator:
             row.final_url = normalized_url
             row.error_message = f"timeout: {exc}"
             notes.append("timeout")
+            self._complete_row_phase(
+                row,
+                PHASE_FETCH,
+                status="failed",
+                error=row.error_message,
+                error_code="timeout",
+            )
             return self._finalize_row(row, notes, event)
         except httpx.RequestError as exc:
             row.fetch_status = "failed"
             row.final_url = normalized_url
             row.error_message = f"network_failure: {type(exc).__name__}: {exc}"
             notes.append("network_failure")
+            self._complete_row_phase(
+                row,
+                PHASE_FETCH,
+                status="failed",
+                error=row.error_message,
+                error_code="network_failure",
+            )
             return self._finalize_row(row, notes, event)
 
         row.final_url = str(response.url)
@@ -1275,6 +1543,38 @@ class SourceDownloadOrchestrator:
         else:
             self._handle_unsupported_response(row, response, notes)
 
+        fetch_error_code = _phase_error_code(row.error_message)
+        fetch_status = "completed"
+        fetch_error = ""
+        if (
+            (row.http_status or 0) >= 400
+            or fetch_error_code in {
+                "invalid_url",
+                "timeout",
+                "network_failure",
+                "blocked_request",
+                "unsupported_content",
+            }
+        ):
+            fetch_status = "failed"
+            fetch_error = row.error_message
+        self._complete_row_phase(
+            row,
+            PHASE_FETCH,
+            status=fetch_status,
+            content_digest=row.sha256,
+            error=fetch_error,
+            error_code=fetch_error_code if fetch_status == "failed" else "",
+        )
+        if self.run_convert:
+            self._set_phase_state(PHASE_CONVERT, "running")
+        if self.run_catalog:
+            self._set_phase_state(PHASE_CATALOG, "running")
+        if self.run_llm_summary:
+            self._set_phase_state(PHASE_SUMMARIZE, "running")
+        if self.run_llm_rating:
+            self._set_phase_state(PHASE_TAG, "running")
+
         return self._finalize_row(row, notes, event)
 
     def _handle_pdf_response(
@@ -1294,7 +1594,7 @@ class SourceDownloadOrchestrator:
             notes.append(reason)
             row.error_message = f"{reason}: http_status_{response.status_code}"
         else:
-            if not self.output_options.include_markdown:
+            if not self.run_convert:
                 row.fetch_status = "success"
                 return
 
@@ -1356,7 +1656,7 @@ class SourceDownloadOrchestrator:
         raw_markdown = ""
         raw_used_fallback = False
         raw_score = 0
-        if self.output_options.include_markdown:
+        if self.run_convert:
             raw_markdown, raw_used_fallback, raw_notes = extract_markdown_with_fallback(
                 raw_html,
                 self.runtime_capabilities,
@@ -1372,7 +1672,7 @@ class SourceDownloadOrchestrator:
         should_render = False
         if not blocked_by_challenge:
             should_render = self.output_options.include_rendered_html or (
-                self.output_options.include_markdown
+                self.run_convert
                 and (response.status_code >= 400 or raw_score < MIN_MARKDOWN_SCORE)
             )
         if should_render:
@@ -1391,7 +1691,7 @@ class SourceDownloadOrchestrator:
                 if not row.canonical_url:
                     row.canonical_url = extract_canonical_url(rendered_html)
 
-                if self.output_options.include_markdown:
+                if self.run_convert:
                     rendered_markdown, rendered_used_fallback, rendered_notes = (
                         extract_markdown_with_fallback(
                             rendered_html,
@@ -1401,7 +1701,7 @@ class SourceDownloadOrchestrator:
                     notes.extend(rendered_notes)
                     rendered_score = markdown_score(rendered_markdown)
 
-        if self.output_options.include_markdown:
+        if self.run_convert:
             markdown_to_write = raw_markdown
             used_fallback = raw_used_fallback
             extraction_method = "raw_html" if raw_markdown else ""
@@ -1433,7 +1733,7 @@ class SourceDownloadOrchestrator:
             row.error_message = f"{reason}: http_status_{response.status_code}"
             return
 
-        if not self.output_options.include_markdown:
+        if not self.run_convert:
             row.fetch_status = "success"
             return
 
@@ -1475,7 +1775,7 @@ class SourceDownloadOrchestrator:
             return
 
         notes.append("download_only")
-        if not self.output_options.include_markdown:
+        if not self.run_convert:
             row.fetch_status = "success"
             return
 
@@ -1520,6 +1820,113 @@ class SourceDownloadOrchestrator:
             f"unsupported_content: content_type={row.content_type or 'unknown'}"
         )
 
+    def _generate_markdown_from_existing_artifacts(
+        self,
+        row: SourceManifestRow,
+        notes: list[str],
+    ) -> None:
+        if row.markdown_file and not self.force_convert and _has_output_file(self.output_dir, row.markdown_file):
+            return
+
+        raw_path = Path(row.raw_file) if row.raw_file else None
+        raw_exists = bool(raw_path and _has_output_file(self.output_dir, row.raw_file))
+        rendered_html_path = (
+            Path(row.rendered_file)
+            if row.rendered_file and _has_output_file(self.output_dir, row.rendered_file)
+            else None
+        )
+
+        if row.detected_type == "pdf":
+            if not raw_exists or raw_path is None:
+                row.error_message = "convert_missing_prerequisite: raw_file_not_found"
+                return
+            markdown_text, extraction_method, conversion_notes = self._convert_pdf_to_markdown(
+                self._read_binary(raw_path)
+            )
+            notes.extend(conversion_notes)
+            if not markdown_text:
+                row.error_message = "extraction_failure: markdown not generated"
+                return
+            markdown_rel = self._markdown_rel(row)
+            self._write_text(markdown_rel, markdown_text)
+            row.markdown_file = markdown_rel.as_posix()
+            row.markdown_char_count = len(markdown_text)
+            row.extraction_method = extraction_method
+            return
+
+        if row.detected_type == "document":
+            if not raw_exists or raw_path is None:
+                row.error_message = "convert_missing_prerequisite: raw_file_not_found"
+                return
+            markdown_text, extraction_method, conversion_notes = self._convert_document_to_markdown(
+                extension=raw_path.suffix.lower(),
+                binary_content=self._read_binary(raw_path),
+            )
+            notes.extend(conversion_notes)
+            if not markdown_text:
+                row.error_message = "extraction_failure: markdown not generated"
+                return
+            markdown_rel = self._markdown_rel(row)
+            self._write_text(markdown_rel, markdown_text)
+            row.markdown_file = markdown_rel.as_posix()
+            row.markdown_char_count = len(markdown_text)
+            row.extraction_method = extraction_method
+            if not row.title:
+                row.title = first_nonempty_line(markdown_text)[:500]
+            return
+
+        if row.detected_type == "html":
+            raw_markdown = ""
+            raw_used_fallback = False
+            raw_score = 0
+            if raw_exists and raw_path is not None:
+                raw_html = self._read_text(raw_path)
+                raw_markdown, raw_used_fallback, raw_notes = extract_markdown_with_fallback(
+                    raw_html,
+                    self.runtime_capabilities,
+                )
+                notes.extend(raw_notes)
+                raw_score = markdown_score(raw_markdown)
+
+            rendered_markdown = ""
+            rendered_used_fallback = False
+            rendered_score = 0
+            if rendered_html_path is not None:
+                rendered_html = self._read_text(rendered_html_path)
+                rendered_markdown, rendered_used_fallback, rendered_notes = (
+                    extract_markdown_with_fallback(
+                        rendered_html,
+                        self.runtime_capabilities,
+                    )
+                )
+                notes.extend(rendered_notes)
+                rendered_score = markdown_score(rendered_markdown)
+
+            markdown_to_write = raw_markdown
+            used_fallback = raw_used_fallback
+            extraction_method = "raw_html" if raw_markdown else ""
+            if rendered_score > raw_score:
+                markdown_to_write = rendered_markdown
+                used_fallback = rendered_used_fallback
+                extraction_method = "rendered_html"
+
+            if not markdown_to_write:
+                row.error_message = "convert_missing_prerequisite: markdown_source_not_found"
+                return
+
+            markdown_rel = self._markdown_rel(row)
+            self._write_text(markdown_rel, markdown_to_write)
+            row.markdown_file = markdown_rel.as_posix()
+            row.markdown_char_count = len(markdown_to_write)
+            row.extraction_method = (
+                f"{extraction_method}_fallback" if used_fallback else extraction_method
+            )
+            return
+
+        if row.markdown_file and _has_output_file(self.output_dir, row.markdown_file):
+            return
+        row.error_message = "convert_missing_prerequisite: unsupported_or_missing_artifact"
+
     def _finalize_row(
         self,
         row: SourceManifestRow,
@@ -1530,8 +1937,41 @@ class SourceDownloadOrchestrator:
         if update_fetched_at or not row.fetched_at:
             row.fetched_at = _utc_now_iso()
 
-        self._generate_markdown_cleanup(row, notes)
-        self._generate_source_title(row, notes)
+        previous_convert_digest = ""
+        if row.phase_metadata.get(PHASE_CONVERT) is not None:
+            previous_convert_digest = row.phase_metadata[PHASE_CONVERT].content_digest
+
+        if self.run_convert:
+            self._begin_row_phase(row, PHASE_CONVERT, prompt_version="convert.pipeline.v1")
+            self._generate_markdown_from_existing_artifacts(row, notes)
+            self._generate_markdown_cleanup(row, notes)
+            current_markdown_digest = self._effective_markdown_digest(row)
+            convert_error = ""
+            convert_error_code = ""
+            convert_status = "completed"
+            if not current_markdown_digest:
+                convert_status = "failed"
+                convert_error = row.error_message or "convert_missing_prerequisite: no markdown available"
+                convert_error_code = _phase_error_code(convert_error) or "convert_missing_prerequisite"
+            elif self.run_llm_cleanup and row.llm_cleanup_status == "failed":
+                convert_status = "failed"
+                convert_error = "llm_cleanup_failed: cleanup did not produce usable markdown"
+                convert_error_code = "llm_cleanup_failed"
+            self._complete_row_phase(
+                row,
+                PHASE_CONVERT,
+                status=convert_status,
+                content_digest=current_markdown_digest,
+                error=convert_error,
+                error_code=convert_error_code,
+                prompt_version="convert.pipeline.v1",
+            )
+            if current_markdown_digest:
+                self._mark_downstream_stale(row, current_markdown_digest)
+            if previous_convert_digest and current_markdown_digest and previous_convert_digest == current_markdown_digest:
+                row.phase_metadata[PHASE_CONVERT].stale = False
+
+        self._generate_source_catalog(row, notes)
         self._generate_source_summary(row, notes)
         self._generate_source_rating(row, notes)
         row.notes = "; ".join(dict.fromkeys(n for n in notes if n))
@@ -1548,6 +1988,7 @@ class SourceDownloadOrchestrator:
             "detected_type": row.detected_type,
             "fetch_method": row.fetch_method,
             "fetch_status": row.fetch_status,
+            "source_kind": row.source_kind,
             "error_message": row.error_message,
             "output_files": {
                 "raw_file": row.raw_file,
@@ -1555,6 +1996,7 @@ class SourceDownloadOrchestrator:
                 "rendered_pdf_file": row.rendered_pdf_file,
                 "markdown_file": row.markdown_file,
                 "llm_cleanup_file": row.llm_cleanup_file,
+                "catalog_file": row.catalog_file,
                 "summary_file": row.summary_file,
                 "rating_file": row.rating_file,
                 "metadata_file": row.metadata_file,
@@ -1563,13 +2005,25 @@ class SourceDownloadOrchestrator:
             "sha256": row.sha256,
             "title": row.title,
             "title_status": row.title_status,
+            "author_names": row.author_names,
+            "publication_date": row.publication_date,
+            "publication_year": row.publication_year,
+            "document_type": row.document_type,
+            "organization_name": row.organization_name,
+            "organization_type": row.organization_type,
             "canonical_url": row.canonical_url,
             "extraction_method": row.extraction_method,
             "markdown_char_count": row.markdown_char_count,
             "llm_cleanup_needed": row.llm_cleanup_needed,
             "llm_cleanup_status": row.llm_cleanup_status,
+            "catalog_status": row.catalog_status,
             "summary_status": row.summary_status,
             "rating_status": row.rating_status,
+            "tags_text": row.tags_text,
+            "phase_metadata": {
+                key: value.model_dump(mode="json")
+                for key, value in row.phase_metadata.items()
+            },
         }
         self._write_text(
             metadata_rel,
@@ -1660,19 +2114,202 @@ class SourceDownloadOrchestrator:
             notes.append(NOTE_LLM_CLEANUP_FAILED)
             logger.warning("Markdown cleanup failed for %s: %s", row.id, exc)
 
-    def _generate_source_title(
+    def _generate_source_catalog(
         self,
         row: SourceManifestRow,
         notes: list[str],
     ) -> None:
-        if not self.run_llm_title:
+        should_run_catalog = bool(self.run_catalog or self.run_llm_title or self.force_catalog or self.force_title)
+        if not should_run_catalog:
+            if row.catalog_file and _has_output_file(self.output_dir, row.catalog_file):
+                row.catalog_status = row.catalog_status or "existing"
+            elif not row.catalog_status:
+                row.catalog_status = "not_requested"
             if row.title:
                 row.title_status = row.title_status or "existing"
             elif not row.title_status:
                 row.title_status = "not_requested"
             return
 
-        if row.title and not self.force_title:
+        source_digest = self._effective_markdown_digest(row)
+        self._begin_row_phase(
+            row,
+            PHASE_CATALOG,
+            model=self.llm_backend.model,
+            prompt_version=PROMPT_VERSION_CATALOG,
+        )
+        catalog_source_path = self._effective_markdown_rel_path(row)
+        if not catalog_source_path or not source_digest:
+            row.catalog_status = "missing_markdown"
+            if not row.title_status:
+                row.title_status = "missing_markdown"
+            self._complete_row_phase(
+                row,
+                PHASE_CATALOG,
+                status="failed",
+                error="missing_markdown: no markdown available for cataloging",
+                error_code="missing_markdown",
+                prompt_version=PROMPT_VERSION_CATALOG,
+            )
+            return
+
+        if (
+            row.catalog_file
+            and not self.force_catalog
+            and not self.force_title
+            and _has_output_file(self.output_dir, row.catalog_file)
+            and row.phase_metadata.get(PHASE_CATALOG) is not None
+            and row.phase_metadata[PHASE_CATALOG].content_digest == source_digest
+        ):
+            row.catalog_status = "existing"
+            if row.title:
+                row.title_status = row.title_status or "existing"
+            self._complete_row_phase(
+                row,
+                PHASE_CATALOG,
+                status="completed",
+                content_digest=source_digest,
+                model=self.llm_backend.model,
+                prompt_version=PROMPT_VERSION_CATALOG,
+            )
+            return
+
+        markdown_text = self._read_text(Path(catalog_source_path))
+        if not markdown_text.strip():
+            row.catalog_status = "missing_markdown"
+            if not row.title_status:
+                row.title_status = "missing_markdown"
+            self._complete_row_phase(
+                row,
+                PHASE_CATALOG,
+                status="failed",
+                error="missing_markdown: empty markdown input",
+                error_code="missing_markdown",
+                prompt_version=PROMPT_VERSION_CATALOG,
+            )
+            return
+
+        deterministic = _build_deterministic_catalog_metadata(row=row, markdown_text=markdown_text)
+        _merge_catalog_payload_into_row(row, deterministic, overwrite_existing=bool(self.force_catalog))
+        self._generate_source_title(row, notes)
+
+        catalog_payload: dict[str, Any] = {
+            "title": row.title,
+            "title_status": row.title_status,
+            "author_names": row.author_names,
+            "publication_date": row.publication_date,
+            "publication_year": row.publication_year,
+            "document_type": row.document_type,
+            "organization_name": row.organization_name,
+            "organization_type": row.organization_type,
+            "source_kind": row.source_kind,
+            "evidence_snippets": deterministic.get("evidence_snippets", []),
+        }
+
+        llm_used = False
+        llm_error = ""
+        if self.use_llm and llm_backend_ready_for_chat(self.llm_backend):
+            needs_llm = bool(
+                self.force_catalog
+                or _catalog_missing_core_fields(row)
+                or row.title_status in {"failed", "missing_markdown", ""}
+            )
+            if needs_llm:
+                max_chars = self._effective_max_source_chars()
+                source_text = self._truncate_for_llm(markdown_text.strip(), max_chars)
+                research_purpose = self.research_purpose or (
+                    "No explicit research purpose was provided. Resolve source metadata conservatively."
+                )
+                existing_metadata = {
+                    "title": row.title,
+                    "author_names": row.author_names,
+                    "publication_date": row.publication_date,
+                    "publication_year": row.publication_year,
+                    "document_type": row.document_type,
+                    "organization_name": row.organization_name,
+                    "organization_type": row.organization_type,
+                }
+                user_prompt = SOURCE_CATALOG_USER.format(
+                    research_purpose=research_purpose,
+                    source_kind=row.source_kind,
+                    original_url=row.original_url or row.final_url or "",
+                    existing_metadata_json=json.dumps(existing_metadata, ensure_ascii=False),
+                    source_markdown=source_text,
+                )
+                try:
+                    raw_response = self._llm_client.sync_chat_completion(
+                        system_prompt=SOURCE_CATALOG_SYSTEM,
+                        user_prompt=user_prompt,
+                        response_format="json",
+                    ).strip()
+                    payload = json.loads(raw_response)
+                    if isinstance(payload, dict):
+                        _merge_catalog_payload_into_row(
+                            row,
+                            payload,
+                            overwrite_existing=bool(self.force_catalog),
+                        )
+                        evidence = payload.get("evidence_snippets")
+                        if isinstance(evidence, list):
+                            catalog_payload["evidence_snippets"] = _dedupe_strings(
+                                [*catalog_payload.get("evidence_snippets", []), *[str(item) for item in evidence]]
+                            )
+                        llm_used = True
+                    else:
+                        llm_error = "catalog_generation_failed: invalid JSON payload"
+                except Exception as exc:
+                    llm_error = f"catalog_generation_failed: {type(exc).__name__}: {exc}"
+                    logger.warning("Catalog generation failed for %s: %s", row.id, exc)
+
+        catalog_payload.update(
+            {
+                "title": row.title,
+                "title_status": row.title_status,
+                "author_names": row.author_names,
+                "publication_date": row.publication_date,
+                "publication_year": row.publication_year,
+                "document_type": row.document_type,
+                "organization_name": row.organization_name,
+                "organization_type": row.organization_type,
+                "source_kind": row.source_kind,
+            }
+        )
+        catalog_rel = self._catalog_rel(row)
+        self._write_text(
+            catalog_rel,
+            json.dumps(catalog_payload, ensure_ascii=False, indent=2) + "\n",
+        )
+        row.catalog_file = catalog_rel.as_posix()
+        row.catalog_status = "generated"
+        if llm_error:
+            notes.append("catalog_generation_failed")
+        self._complete_row_phase(
+            row,
+            PHASE_CATALOG,
+            status="completed",
+            content_digest=source_digest,
+            error=llm_error,
+            error_code=_phase_error_code(llm_error),
+            model=self.llm_backend.model if llm_used else "",
+            prompt_version=PROMPT_VERSION_CATALOG,
+        )
+
+    def _generate_source_title(
+        self,
+        row: SourceManifestRow,
+        notes: list[str],
+    ) -> None:
+        should_resolve_title = bool(
+            self.run_llm_title or self.run_catalog or self.force_catalog or self.force_title
+        )
+        if not should_resolve_title:
+            if row.title:
+                row.title_status = row.title_status or "existing"
+            elif not row.title_status:
+                row.title_status = "not_requested"
+            return
+
+        if row.title and not (self.force_title or self.force_catalog):
             row.title_status = row.title_status or "existing"
             return
 
@@ -1760,33 +2397,79 @@ class SourceDownloadOrchestrator:
                 row.summary_status = "not_requested"
             return
 
-        summary_source_path = ""
-        if row.llm_cleanup_file and _has_output_file(self.output_dir, row.llm_cleanup_file):
-            summary_source_path = row.llm_cleanup_file
-        elif row.markdown_file:
-            summary_source_path = row.markdown_file
-
-        if not summary_source_path:
+        source_digest = self._effective_markdown_digest(row)
+        self._begin_row_phase(
+            row,
+            PHASE_SUMMARIZE,
+            model=self.llm_backend.model,
+            prompt_version=PROMPT_VERSION_SUMMARY,
+        )
+        summary_source_path = self._effective_markdown_rel_path(row)
+        if not summary_source_path or not source_digest:
             row.summary_status = "missing_markdown"
+            self._complete_row_phase(
+                row,
+                PHASE_SUMMARIZE,
+                status="failed",
+                error="missing_markdown: no markdown available for summarization",
+                error_code="missing_markdown",
+                prompt_version=PROMPT_VERSION_SUMMARY,
+            )
             return
         if not self.use_llm:
-            row.summary_status = "skipped_llm_disabled"
+            row.summary_status = "failed"
+            self._complete_row_phase(
+                row,
+                PHASE_SUMMARIZE,
+                status="failed",
+                content_digest=source_digest,
+                error="llm_disabled: summarization requires an enabled LLM backend",
+                error_code="llm_disabled",
+                prompt_version=PROMPT_VERSION_SUMMARY,
+            )
             return
         if not llm_backend_ready_for_chat(self.llm_backend):
-            row.summary_status = "skipped_llm_not_configured"
+            row.summary_status = "failed"
             notes.append(NOTE_SUMMARY_SKIPPED_LLM_NOT_CONFIGURED)
+            self._complete_row_phase(
+                row,
+                PHASE_SUMMARIZE,
+                status="failed",
+                content_digest=source_digest,
+                error="llm_not_configured: summarization requires a chat-capable model",
+                error_code="llm_not_configured",
+                prompt_version=PROMPT_VERSION_SUMMARY,
+            )
             return
         if (
             row.summary_file
             and not self.force_summary
             and _has_output_file(self.output_dir, row.summary_file)
+            and row.phase_metadata.get(PHASE_SUMMARIZE) is not None
+            and row.phase_metadata[PHASE_SUMMARIZE].content_digest == source_digest
         ):
             row.summary_status = "existing"
+            self._complete_row_phase(
+                row,
+                PHASE_SUMMARIZE,
+                status="completed",
+                content_digest=source_digest,
+                model=self.llm_backend.model,
+                prompt_version=PROMPT_VERSION_SUMMARY,
+            )
             return
 
         markdown_text = self._read_text(Path(summary_source_path))
         if not markdown_text.strip():
             row.summary_status = "missing_markdown"
+            self._complete_row_phase(
+                row,
+                PHASE_SUMMARIZE,
+                status="failed",
+                error="missing_markdown: empty markdown input",
+                error_code="missing_markdown",
+                prompt_version=PROMPT_VERSION_SUMMARY,
+            )
             return
 
         source_text = markdown_text.strip()
@@ -1818,9 +2501,27 @@ class SourceDownloadOrchestrator:
             self._write_text(summary_rel, summary + "\n")
             row.summary_file = summary_rel.as_posix()
             row.summary_status = "generated"
+            self._complete_row_phase(
+                row,
+                PHASE_SUMMARIZE,
+                status="completed",
+                content_digest=source_digest,
+                model=self.llm_backend.model,
+                prompt_version=PROMPT_VERSION_SUMMARY,
+            )
         except Exception as exc:
             notes.append(NOTE_SUMMARY_GENERATION_FAILED)
             row.summary_status = "failed"
+            self._complete_row_phase(
+                row,
+                PHASE_SUMMARIZE,
+                status="failed",
+                content_digest=source_digest,
+                error=f"summary_generation_failed: {type(exc).__name__}: {exc}",
+                error_code="summary_generation_failed",
+                model=self.llm_backend.model,
+                prompt_version=PROMPT_VERSION_SUMMARY,
+            )
             logger.warning("Summary generation failed for %s: %s", row.id, exc)
 
 
@@ -1836,37 +2537,104 @@ class SourceDownloadOrchestrator:
                 row.rating_status = "not_requested"
             return
 
+        source_digest = self._effective_markdown_digest(row)
+        self._begin_row_phase(
+            row,
+            PHASE_TAG,
+            model=self.llm_backend.model,
+            profile_name=self.project_profile_name,
+            prompt_version=PROMPT_VERSION_RATING,
+        )
         if not self.project_profile_yaml:
-            row.rating_status = "skipped_no_profile"
+            row.rating_status = "failed"
+            self._complete_row_phase(
+                row,
+                PHASE_TAG,
+                status="failed",
+                content_digest=source_digest,
+                error="missing_project_profile: rating requires a project profile",
+                error_code="missing_project_profile",
+                model=self.llm_backend.model,
+                profile_name=self.project_profile_name,
+                prompt_version=PROMPT_VERSION_RATING,
+            )
             return
 
-        rating_source_path = ""
-        if row.llm_cleanup_file and _has_output_file(self.output_dir, row.llm_cleanup_file):
-            rating_source_path = row.llm_cleanup_file
-        elif row.markdown_file:
-            rating_source_path = row.markdown_file
-
-        if not rating_source_path:
+        rating_source_path = self._effective_markdown_rel_path(row)
+        if not rating_source_path or not source_digest:
             row.rating_status = "missing_markdown"
+            self._complete_row_phase(
+                row,
+                PHASE_TAG,
+                status="failed",
+                error="missing_markdown: no markdown available for relevance tagging",
+                error_code="missing_markdown",
+                model=self.llm_backend.model,
+                profile_name=self.project_profile_name,
+                prompt_version=PROMPT_VERSION_RATING,
+            )
             return
         if not self.use_llm:
-            row.rating_status = "skipped_llm_disabled"
+            row.rating_status = "failed"
+            self._complete_row_phase(
+                row,
+                PHASE_TAG,
+                status="failed",
+                content_digest=source_digest,
+                error="llm_disabled: relevance tagging requires an enabled LLM backend",
+                error_code="llm_disabled",
+                model=self.llm_backend.model,
+                profile_name=self.project_profile_name,
+                prompt_version=PROMPT_VERSION_RATING,
+            )
             return
         if not llm_backend_ready_for_chat(self.llm_backend):
-            row.rating_status = "skipped_llm_not_configured"
+            row.rating_status = "failed"
             notes.append(NOTE_RATING_SKIPPED_LLM_NOT_CONFIGURED)
+            self._complete_row_phase(
+                row,
+                PHASE_TAG,
+                status="failed",
+                content_digest=source_digest,
+                error="llm_not_configured: relevance tagging requires a chat-capable model",
+                error_code="llm_not_configured",
+                model=self.llm_backend.model,
+                profile_name=self.project_profile_name,
+                prompt_version=PROMPT_VERSION_RATING,
+            )
             return
         if (
             row.rating_file
             and not self.force_rating
             and _has_output_file(self.output_dir, row.rating_file)
+            and row.phase_metadata.get(PHASE_TAG) is not None
+            and row.phase_metadata[PHASE_TAG].content_digest == source_digest
         ):
             row.rating_status = "existing"
+            self._complete_row_phase(
+                row,
+                PHASE_TAG,
+                status="completed",
+                content_digest=source_digest,
+                model=self.llm_backend.model,
+                profile_name=self.project_profile_name,
+                prompt_version=PROMPT_VERSION_RATING,
+            )
             return
 
         markdown_text = self._read_text(Path(rating_source_path))
         if not markdown_text.strip():
             row.rating_status = "missing_markdown"
+            self._complete_row_phase(
+                row,
+                PHASE_TAG,
+                status="failed",
+                error="missing_markdown: empty markdown input",
+                error_code="missing_markdown",
+                model=self.llm_backend.model,
+                profile_name=self.project_profile_name,
+                prompt_version=PROMPT_VERSION_RATING,
+            )
             return
 
         source_text = markdown_text.strip()
@@ -1898,6 +2666,16 @@ class SourceDownloadOrchestrator:
                 row.rating_status = "failed"
                 return
 
+            raw_tags = rating_data.get("tags")
+            if isinstance(raw_tags, list):
+                row.tags_text = "; ".join(
+                    _dedupe_strings([str(item).strip() for item in raw_tags if str(item).strip()])
+                )
+            elif isinstance(raw_tags, str) and raw_tags.strip():
+                row.tags_text = "; ".join(
+                    _dedupe_strings([item.strip() for item in raw_tags.split(",") if item.strip()])
+                )
+
             rating_rel = self._rating_rel(row)
             self._write_text(
                 rating_rel,
@@ -1905,9 +2683,29 @@ class SourceDownloadOrchestrator:
             )
             row.rating_file = rating_rel.as_posix()
             row.rating_status = "generated"
+            self._complete_row_phase(
+                row,
+                PHASE_TAG,
+                status="completed",
+                content_digest=source_digest,
+                model=self.llm_backend.model,
+                profile_name=self.project_profile_name,
+                prompt_version=PROMPT_VERSION_RATING,
+            )
         except Exception as exc:
             notes.append(NOTE_RATING_GENERATION_FAILED)
             row.rating_status = "failed"
+            self._complete_row_phase(
+                row,
+                PHASE_TAG,
+                status="failed",
+                content_digest=source_digest,
+                error=f"rating_generation_failed: {type(exc).__name__}: {exc}",
+                error_code="rating_generation_failed",
+                model=self.llm_backend.model,
+                profile_name=self.project_profile_name,
+                prompt_version=PROMPT_VERSION_RATING,
+            )
             logger.warning("Rating generation failed for %s: %s", row.id, exc)
 
 
@@ -1921,6 +2719,12 @@ class SourceDownloadOrchestrator:
         dest = self.output_dir / rel_path
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(content, encoding="utf-8")
+
+    def _read_binary(self, rel_path: Path) -> bytes:
+        dest = self.output_dir / rel_path
+        if not dest.exists():
+            return b""
+        return dest.read_bytes()
 
     def _read_text(self, rel_path: Path) -> str:
         dest = self.output_dir / rel_path
@@ -2151,6 +2955,7 @@ def _derive_manifest_fields(
     row: SourceManifestRow,
     base_dir: Path | None = None,
 ) -> dict[str, dict[str, str | int | float | bool]]:
+    catalog_payload = _load_manifest_json(base_dir, row.catalog_file)
     summary_text = _load_manifest_text(base_dir, row.summary_file)
     rating_payload = _load_manifest_json(base_dir, row.rating_file)
 
@@ -2174,8 +2979,18 @@ def _derive_manifest_fields(
 
     rating_dimensions = _extract_rating_dimensions(rating_payload)
     flag_scores = _extract_flag_scores(rating_payload)
+    tags_text = row.tags_text or _format_tags_text(
+        rating_payload.get("tags") if isinstance(rating_payload, dict) else ""
+    )
 
     base: dict[str, str | int | float | bool] = {
+        "author_names": row.author_names or _stringify_manifest_value(catalog_payload.get("author_names")),
+        "publication_date": row.publication_date or _stringify_manifest_value(catalog_payload.get("publication_date")),
+        "publication_year": row.publication_year or _stringify_manifest_value(catalog_payload.get("publication_year")),
+        "document_type": row.document_type or _stringify_manifest_value(catalog_payload.get("document_type")),
+        "organization_name": row.organization_name or _stringify_manifest_value(catalog_payload.get("organization_name")),
+        "organization_type": row.organization_type or _stringify_manifest_value(catalog_payload.get("organization_type")),
+        "tags_text": tags_text,
         "summary_text": summary_text,
         "rating_overall": rating_overall,
         "rating_confidence": rating_confidence,
@@ -2342,16 +3157,19 @@ def _manifest_slug(value: str) -> str:
 def _count_fetch_outcomes(rows: list[SourceManifestRow]) -> dict[str, int]:
     counts = {"success": 0, "failed": 0, "partial": 0}
     for row in rows:
-        if row.fetch_status == "success":
+        outcome = _row_task_outcome(row)
+        if outcome == "success":
             counts["success"] += 1
-        elif row.fetch_status == "partial":
+        elif outcome == "partial":
             counts["partial"] += 1
-        else:
+        elif outcome == "failed":
             counts["failed"] += 1
     return counts
 
 
 def summarize_output_rows(rows: list[SourceManifestRow]) -> SourceOutputSummary:
+    catalog_missing = 0
+    catalog_failed = 0
     markdown_ready = 0
     summary_missing = 0
     summary_failed = 0
@@ -2362,12 +3180,18 @@ def summarize_output_rows(rows: list[SourceManifestRow]) -> SourceOutputSummary:
     for row in rows:
         if row.markdown_file or row.llm_cleanup_file:
             markdown_ready += 1
+        if (row.catalog_status or "").strip().lower() == "failed":
+            catalog_failed += 1
         if (row.summary_status or "").strip().lower() == "failed":
             summary_failed += 1
         if (row.rating_status or "").strip().lower() == "failed":
             rating_failed += 1
         if (row.llm_cleanup_status or "").strip().lower() == "failed":
             llm_cleanup_failed += 1
+
+        has_catalog = bool(row.catalog_file)
+        if (row.markdown_file or row.llm_cleanup_file) and not has_catalog:
+            catalog_missing += 1
 
         has_summary = bool(row.summary_file)
         if (row.markdown_file or row.llm_cleanup_file) and not has_summary:
@@ -2386,6 +3210,9 @@ def summarize_output_rows(rows: list[SourceManifestRow]) -> SourceOutputSummary:
         llm_cleanup_file_count=sum(1 for row in rows if row.llm_cleanup_file),
         llm_cleanup_needed_count=sum(1 for row in rows if row.llm_cleanup_needed),
         llm_cleanup_failed_count=llm_cleanup_failed,
+        catalog_file_count=sum(1 for row in rows if row.catalog_file),
+        catalog_missing_count=catalog_missing,
+        catalog_failed_count=catalog_failed,
         summary_file_count=sum(1 for row in rows if row.summary_file),
         summary_missing_count=summary_missing,
         summary_failed_count=summary_failed,
@@ -2399,6 +3226,397 @@ def parse_notes(value: str) -> list[str]:
     if not value:
         return []
     return [part.strip() for part in value.split(";") if part.strip()]
+
+
+def _phase_error_code(value: str) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return ""
+    code = normalized.split(":", 1)[0].strip().lower()
+    code = re.sub(r"[^a-z0-9_]+", "_", code)
+    return code.strip("_")
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        deduped.append(text)
+    return deduped
+
+
+def _phase_status_outcome(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"success", "generated", "existing", "completed", "extracted"}:
+        return "success"
+    if normalized in {"partial", "stale"}:
+        return "partial"
+    if normalized in {"not_applicable", "skipped", "not_requested"}:
+        return "skipped"
+    if normalized in {
+        "failed",
+        "missing_markdown",
+        "missing_project_profile",
+        "invalid_url",
+        "timeout",
+        "network_failure",
+        "unsupported_content",
+    }:
+        return "failed"
+    return "pending"
+
+
+def _row_task_outcome(
+    row: SourceManifestRow,
+    requested_phases: list[str] | None = None,
+) -> str:
+    phases = requested_phases or [PHASE_FETCH]
+    outcomes: list[str] = []
+    for phase in phases:
+        if phase == PHASE_FETCH:
+            outcomes.append(_phase_status_outcome(row.fetch_status))
+        elif phase == PHASE_CONVERT:
+            metadata = row.phase_metadata.get(PHASE_CONVERT)
+            if metadata is not None:
+                outcomes.append(_phase_status_outcome(metadata.status))
+            elif row.llm_cleanup_file or row.markdown_file:
+                outcomes.append("success")
+            else:
+                outcomes.append("pending")
+        elif phase == PHASE_CATALOG:
+            metadata = row.phase_metadata.get(PHASE_CATALOG)
+            if metadata is not None:
+                outcomes.append(_phase_status_outcome(metadata.status))
+            else:
+                outcomes.append(_phase_status_outcome(row.catalog_status))
+        elif phase == PHASE_SUMMARIZE:
+            metadata = row.phase_metadata.get(PHASE_SUMMARIZE)
+            if metadata is not None:
+                outcomes.append(_phase_status_outcome(metadata.status))
+            else:
+                outcomes.append(_phase_status_outcome(row.summary_status))
+        elif phase == PHASE_TAG:
+            metadata = row.phase_metadata.get(PHASE_TAG)
+            if metadata is not None:
+                outcomes.append(_phase_status_outcome(metadata.status))
+            else:
+                outcomes.append(_phase_status_outcome(row.rating_status))
+
+    if any(item == "failed" for item in outcomes):
+        return "failed"
+    if any(item == "partial" for item in outcomes) or any(
+        item == "pending" for item in outcomes
+    ):
+        return "partial"
+    if outcomes and all(item == "skipped" for item in outcomes):
+        return "skipped"
+    return "success"
+
+
+def _catalog_missing_core_fields(row: SourceManifestRow) -> bool:
+    return any(
+        not str(value or "").strip()
+        for value in (
+            row.title,
+            row.author_names,
+            row.document_type,
+            row.organization_name,
+            row.organization_type,
+        )
+    )
+
+
+def _merge_catalog_payload_into_row(
+    row: SourceManifestRow,
+    payload: dict[str, Any],
+    *,
+    overwrite_existing: bool = False,
+) -> None:
+    def should_set(current: str) -> bool:
+        return overwrite_existing or not str(current or "").strip()
+
+    title = normalize_generated_title(_stringify_manifest_value(payload.get("title")))
+    title_basis = str(payload.get("title_basis") or payload.get("basis") or "").strip().lower()
+    if title and should_set(row.title):
+        row.title = limit_title_words(title, 10) if title_basis == "generated" else title
+        row.title_status = "generated" if title_basis == "generated" else "extracted"
+
+    author_names = payload.get("author_names")
+    normalized_authors = ""
+    if isinstance(author_names, list):
+        normalized_authors = "; ".join(
+            _dedupe_strings([str(item).strip() for item in author_names if str(item).strip()])
+        )
+    elif isinstance(author_names, str):
+        normalized_authors = "; ".join(
+            _dedupe_strings([item.strip() for item in re.split(r"[;|,]", author_names) if item.strip()])
+        )
+    if normalized_authors and should_set(row.author_names):
+        row.author_names = normalized_authors
+
+    publication_date = _stringify_manifest_value(payload.get("publication_date"))
+    if publication_date and should_set(row.publication_date):
+        row.publication_date = publication_date
+
+    publication_year = _stringify_manifest_value(payload.get("publication_year"))
+    if not publication_year and publication_date:
+        match = re.search(r"\b(19|20)\d{2}\b", publication_date)
+        if match:
+            publication_year = match.group(0)
+    if publication_year and should_set(row.publication_year):
+        row.publication_year = publication_year
+
+    document_type = _stringify_manifest_value(payload.get("document_type"))
+    if document_type and should_set(row.document_type):
+        row.document_type = document_type
+
+    organization_name = _stringify_manifest_value(payload.get("organization_name"))
+    if organization_name and should_set(row.organization_name):
+        row.organization_name = organization_name
+
+    organization_type = _stringify_manifest_value(payload.get("organization_type"))
+    if organization_type and should_set(row.organization_type):
+        row.organization_type = organization_type
+
+
+def _build_deterministic_catalog_metadata(
+    *,
+    row: SourceManifestRow,
+    markdown_text: str,
+) -> dict[str, Any]:
+    front_matter = _parse_markdown_front_matter(markdown_text)
+    lines = [line.strip() for line in markdown_text.splitlines() if line.strip()]
+    author_names = _front_matter_list(front_matter, ("authors", "author", "byline"))
+    if not author_names:
+        author_names = _extract_byline_authors(lines[:10])
+
+    publication_date = _front_matter_scalar(
+        front_matter,
+        ("date", "published", "publication_date", "updated"),
+    )
+    if not publication_date:
+        publication_date = _extract_publication_date(lines[:30])
+
+    publication_year = ""
+    if publication_date:
+        match = re.search(r"\b(19|20)\d{2}\b", publication_date)
+        if match:
+            publication_year = match.group(0)
+    if not publication_year:
+        publication_year = _extract_publication_year(markdown_text)
+
+    organization_name = _front_matter_scalar(
+        front_matter,
+        ("organization", "publisher", "site_name", "institution", "company"),
+    )
+    if not organization_name:
+        organization_name = _organization_name_from_url(row.original_url or row.final_url)
+
+    document_type = _infer_document_type(row=row, markdown_text=markdown_text)
+    organization_type = _infer_organization_type(
+        organization_name=organization_name,
+        url=row.original_url or row.final_url,
+        source_kind=row.source_kind,
+    )
+
+    evidence_snippets = _dedupe_strings(
+        [
+            _stringify_manifest_value(front_matter.get("title")),
+            _stringify_manifest_value(front_matter.get("authors")),
+            _stringify_manifest_value(front_matter.get("date")),
+            *(lines[:3]),
+        ]
+    )[:5]
+
+    return {
+        "author_names": author_names,
+        "publication_date": publication_date,
+        "publication_year": publication_year,
+        "document_type": document_type,
+        "organization_name": organization_name,
+        "organization_type": organization_type,
+        "evidence_snippets": evidence_snippets,
+    }
+
+
+def _parse_markdown_front_matter(markdown_text: str) -> dict[str, Any]:
+    lines = markdown_text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}
+    payload: dict[str, Any] = {}
+    current_key = ""
+    for line in lines[1:]:
+        stripped = line.strip()
+        if stripped == "---":
+            break
+        match = re.match(r"^([A-Za-z0-9_-]+)\s*:\s*(.*)$", line)
+        if match:
+            current_key = match.group(1).strip().lower()
+            raw_value = match.group(2).strip()
+            if not raw_value:
+                payload[current_key] = []
+            elif raw_value.startswith("[") and raw_value.endswith("]"):
+                payload[current_key] = [
+                    item.strip().strip("'\"")
+                    for item in raw_value[1:-1].split(",")
+                    if item.strip()
+                ]
+            else:
+                payload[current_key] = raw_value.strip("'\"")
+            continue
+        if current_key and re.match(r"^\s*-\s+.+$", line):
+            payload.setdefault(current_key, [])
+            if isinstance(payload[current_key], list):
+                payload[current_key].append(line.split("-", 1)[1].strip().strip("'\""))
+    return payload
+
+
+def _front_matter_scalar(payload: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _front_matter_list(payload: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, list):
+            return "; ".join(
+                _dedupe_strings([str(item).strip() for item in value if str(item).strip()])
+            )
+        if isinstance(value, str) and value.strip():
+            return "; ".join(
+                _dedupe_strings([item.strip() for item in re.split(r"[;|,]", value) if item.strip()])
+            )
+    return ""
+
+
+def _extract_byline_authors(lines: list[str]) -> str:
+    for line in lines:
+        if not line.lower().startswith("by "):
+            continue
+        raw = line[3:].strip()
+        return "; ".join(
+            _dedupe_strings([item.strip() for item in re.split(r"\band\b|[;,|]", raw) if item.strip()])
+        )
+    return ""
+
+
+def _extract_publication_date(lines: list[str]) -> str:
+    patterns = [
+        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},\s+(19|20)\d{2}\b",
+        r"\b(19|20)\d{2}-\d{2}-\d{2}\b",
+        r"\b(19|20)\d{2}/\d{2}/\d{2}\b",
+    ]
+    for line in lines:
+        for pattern in patterns:
+            match = re.search(pattern, line, flags=re.IGNORECASE)
+            if match:
+                return match.group(0)
+    return ""
+
+
+def _extract_publication_year(markdown_text: str) -> str:
+    match = re.search(r"\b(19|20)\d{2}\b", markdown_text[:4000])
+    return match.group(0) if match else ""
+
+
+def _organization_name_from_url(url: str) -> str:
+    normalized = str(url or "").strip()
+    if not normalized:
+        return ""
+    try:
+        parsed = urlsplit(normalized if "://" in normalized else f"https://{normalized}")
+    except Exception:
+        return ""
+    host = parsed.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if not host:
+        return ""
+    label = host.split(":")[0].split(".")[0].replace("-", " ").replace("_", " ").strip()
+    return label.title()
+
+
+def _infer_document_type(*, row: SourceManifestRow, markdown_text: str) -> str:
+    normalized_text = markdown_text[:1600].lower()
+    normalized_title = str(row.title or "").strip().lower()
+    if row.source_kind == "uploaded_document":
+        suffix = Path(row.raw_file or row.source_document_name or "").suffix.lower()
+        if suffix == ".pdf":
+            return "report"
+        if suffix in {".html", ".htm"}:
+            return "web page"
+        if suffix in {".doc", ".docx", ".rtf", ".txt"}:
+            return "document"
+        if suffix == ".md":
+            return "markdown document"
+    url = (row.original_url or row.final_url or "").lower()
+    if "journal article" in normalized_title or "journal article" in normalized_text:
+        return "journal article"
+    if "working paper" in normalized_title or "working paper" in normalized_text:
+        return "working paper"
+    if "report" in normalized_title or re.search(r"\breport\b", normalized_text):
+        return "report"
+    if ".gov" in url and ("report" in normalized_text or row.detected_type == "pdf"):
+        return "report"
+    if row.detected_type == "html":
+        return "web page"
+    if row.detected_type == "pdf":
+        return "report"
+    if row.detected_type == "document":
+        return "document"
+    return "document"
+
+
+def _infer_organization_type(
+    *,
+    organization_name: str,
+    url: str,
+    source_kind: str,
+) -> str:
+    normalized_url = str(url or "").lower()
+    normalized_name = str(organization_name or "").lower()
+    if ".edu" in normalized_url or "university" in normalized_name or "college" in normalized_name:
+        return "university"
+    if ".gov" in normalized_url:
+        if ".state." in normalized_url or ".ca.gov" in normalized_url:
+            return "state agency"
+        return "federal agency"
+    if any(token in normalized_name for token in ("ministry", "department", "agency")):
+        return "government agency"
+    if any(token in normalized_name for token in ("policy", "council", "commission", "board")):
+        return "policy body"
+    if source_kind == "uploaded_document" and not normalized_url:
+        return "uploaded document"
+    if ".org" in normalized_url:
+        return "organization"
+    if any(token in normalized_name for token in ("blog", "substack")):
+        return "blog"
+    if normalized_url:
+        return "company"
+    return ""
+
+
+def _format_tags_text(value: Any) -> str:
+    if isinstance(value, list):
+        return "; ".join(
+            _dedupe_strings([str(item).strip() for item in value if str(item).strip()])
+        )
+    if isinstance(value, str):
+        return "; ".join(
+            _dedupe_strings([item.strip() for item in re.split(r"[;,|]", value) if item.strip()])
+        )
+    return ""
 
 
 def _has_output_file(output_dir: Path, rel_path: str) -> bool:

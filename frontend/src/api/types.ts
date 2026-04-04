@@ -47,6 +47,9 @@ export interface SourceOutputSummary {
   llm_cleanup_file_count: number;
   llm_cleanup_needed_count: number;
   llm_cleanup_failed_count: number;
+  catalog_file_count: number;
+  catalog_missing_count: number;
+  catalog_failed_count: number;
   summary_file_count: number;
   summary_missing_count: number;
   summary_failed_count: number;
@@ -338,8 +341,10 @@ export interface SourceItemStatus {
   id: string;
   original_url: string;
   citation_number: string;
+  source_kind: string;
   status: "pending" | "running" | "completed" | "failed" | "skipped" | "cancelled";
   fetch_status: string;
+  catalog_status: string;
   title_status: string;
   llm_cleanup_status: string;
   summary_status: string;
@@ -371,11 +376,15 @@ export interface SourceDownloadStatus {
   runtime_notes: string[];
   runtime_guidance: RuntimeGuidance[];
   run_download: boolean;
+  run_convert?: boolean;
+  run_catalog: boolean;
   run_llm_cleanup: boolean;
   run_llm_title: boolean;
   run_llm_summary: boolean;
   run_llm_rating: boolean;
   force_redownload?: boolean;
+  force_convert?: boolean;
+  force_catalog?: boolean;
   force_llm_cleanup?: boolean;
   force_title?: boolean;
   force_summary?: boolean;
@@ -391,11 +400,15 @@ export interface SourceDownloadStatus {
 export interface SourceDownloadRequest {
   rerun_failed_only: boolean;
   run_download: boolean;
+  run_convert?: boolean;
+  run_catalog: boolean;
   run_llm_cleanup: boolean;
   run_llm_title: boolean;
   run_llm_summary: boolean;
   run_llm_rating: boolean;
   force_redownload: boolean;
+  force_convert?: boolean;
+  force_catalog: boolean;
   force_llm_cleanup: boolean;
   force_title: boolean;
   force_summary: boolean;
@@ -410,6 +423,8 @@ export interface SourceDownloadRequest {
 export interface RepositorySourceTaskRequest extends SourceDownloadRequest {
   scope: "all" | "queued" | "import" | "latest_import";
   import_id: string;
+  source_ids?: string[];
+  selected_phases?: string[];
 }
 
 export interface ProjectProfile {
@@ -451,6 +466,7 @@ export interface RepositoryDashboardResponse {
     rendered_html: number;
     rendered_pdf: number;
     markdown: number;
+    catalogs: number;
     summaries: number;
     ratings: number;
   };
@@ -458,6 +474,7 @@ export interface RepositoryDashboardResponse {
     missing_files: number;
     orphaned_citation_rows: number;
     incomplete_summaries: number;
+    failed_catalogs: number;
     failed_ratings: number;
     failed_fetches: number;
   };
@@ -473,6 +490,7 @@ export interface RepositoryCitationDataResponse {
 export interface RepositoryManifestRow {
   id: string;
   repository_source_id: string;
+  source_kind: string;
   import_type: string;
   imported_at: string;
   provenance_ref: string;
@@ -487,6 +505,12 @@ export interface RepositoryManifestRow {
   fetch_method: string;
   title: string;
   title_status: string;
+  author_names: string;
+  publication_date: string;
+  publication_year: string;
+  document_type: string;
+  organization_name: string;
+  organization_type: string;
   raw_file: string;
   rendered_file: string;
   rendered_pdf_file: string;
@@ -494,11 +518,14 @@ export interface RepositoryManifestRow {
   llm_cleanup_needed: boolean;
   llm_cleanup_file: string;
   llm_cleanup_status: string;
+  catalog_file: string;
+  catalog_status: string;
   summary_file: string;
   summary_status: string;
   rating_file: string;
   rating_status: string;
   metadata_file: string;
+  tags_text: string;
   notes: string;
   error_message: string;
   fetched_at: string;
@@ -539,6 +566,13 @@ export interface RepositoryManifestResponse {
     q: string;
     fetch_status: string;
     detected_type: string;
+    source_kind: string;
+    document_type: string;
+    organization_type: string;
+    organization_name: string;
+    author_names: string;
+    publication_date: string;
+    tags_text: string;
     has_summary: boolean | null;
     has_rating: boolean | null;
     rating_overall_min: number | null;

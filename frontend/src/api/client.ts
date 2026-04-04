@@ -87,6 +87,16 @@ async function apiPostFile<T>(path: string, file: File): Promise<T> {
   return parseApiResponse<T>(resp);
 }
 
+async function apiPostFiles<T>(path: string, files: File[], fieldName = "files"): Promise<T> {
+  const formData = new FormData();
+  files.forEach((file) => formData.append(fieldName, file));
+  const resp = await fetch(`/api/${path}`, {
+    method: "POST",
+    body: formData,
+  });
+  return parseApiResponse<T>(resp);
+}
+
 export const api = {
   getAppSettings: () => apiGet<AppSettings>("settings"),
   getRepoStatus: () => apiGet<RepositoryStatusResponse>("repository/status"),
@@ -98,6 +108,10 @@ export const api = {
   saveRepoSettings: (settings: RepoSettings) =>
     apiPut<RepoSettings>("repository/settings", settings),
   getModels: (query: URLSearchParams) => apiGet<ModelsResponse>(`models?${query.toString()}`),
+  ingestRepositorySeedFiles: (files: File[]) =>
+    apiPostFiles<RepositoryImportResponse>("repository/ingest/seed-files", files),
+  ingestRepositoryDocuments: (files: File[]) =>
+    apiPostFiles<RepositoryImportResponse>("repository/ingest/documents", files),
   importSourceList: (file: File) =>
     apiPostFile<RepositoryImportResponse>("repository/import/source-list", file),
   getIngestionProfiles: () =>

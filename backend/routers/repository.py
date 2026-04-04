@@ -339,6 +339,13 @@ async def get_repository_manifest(
     q: str = "",
     fetch_status: str = "",
     detected_type: str = "",
+    source_kind: str = "",
+    document_type: str = "",
+    organization_type: str = "",
+    organization_name: str = "",
+    author_names: str = "",
+    publication_date: str = "",
+    tags_text: str = "",
     has_summary: bool | None = Query(default=None),
     has_rating: bool | None = Query(default=None),
     rating_overall_min: float | None = Query(default=None),
@@ -362,6 +369,13 @@ async def get_repository_manifest(
             q=q,
             fetch_status=fetch_status,
             detected_type=detected_type,
+            source_kind=source_kind,
+            document_type=document_type,
+            organization_type=organization_type,
+            organization_name=organization_name,
+            author_names=author_names,
+            publication_date=publication_date,
+            tags_text=tags_text,
             has_summary=has_summary,
             has_rating=has_rating,
             rating_overall_min=rating_overall_min,
@@ -393,6 +407,38 @@ async def get_repository_citation_data(request: Request) -> dict:
 
 
 # ---- Import ----
+
+@router.post("/repository/ingest/seed-files", response_model=RepositoryImportResponse)
+async def ingest_repository_seed_files(
+    request: Request,
+    files: list[UploadFile] = File(...),
+) -> RepositoryImportResponse:
+    service = request.app.state.repository_service
+    prepared_files = [
+        (upload.filename or "seed_upload", await upload.read())
+        for upload in files
+    ]
+    try:
+        return service.import_seed_files(prepared_files)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/repository/ingest/documents", response_model=RepositoryImportResponse)
+async def ingest_repository_documents(
+    request: Request,
+    files: list[UploadFile] = File(...),
+) -> RepositoryImportResponse:
+    service = request.app.state.repository_service
+    prepared_files = [
+        (upload.filename or "document", await upload.read())
+        for upload in files
+    ]
+    try:
+        return service.import_manual_documents(prepared_files)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
 
 @router.post("/repository/import/source-list", response_model=RepositoryImportResponse)
 async def import_repository_source_list(

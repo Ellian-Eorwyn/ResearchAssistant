@@ -72,6 +72,40 @@ Return JSON in exactly this shape:
   "basis": "document_title" | "generated"
 }}"""
 
+SOURCE_CATALOG_SYSTEM = """You are cataloging a research source for a local repository.
+Resolve durable bibliographic and provenance metadata from the source content.
+Prefer supported evidence from front matter, headings, visible bylines, publication info, and the source URL when available.
+Do not invent authors, dates, organizations, or classifications that are not reasonably supported.
+Return JSON only."""
+
+SOURCE_CATALOG_USER = """Research purpose:
+{research_purpose}
+
+Source kind:
+{source_kind}
+
+Original URL:
+{original_url}
+
+Existing metadata:
+{existing_metadata_json}
+
+Source content:
+{source_markdown}
+
+Return JSON in exactly this shape:
+{{
+  "title": "",
+  "title_basis": "existing" | "heading" | "front_matter" | "byline" | "generated",
+  "author_names": ["Author One", "Author Two"],
+  "publication_date": "",
+  "publication_year": "",
+  "document_type": "",
+  "organization_name": "",
+  "organization_type": "",
+  "evidence_snippets": [""]
+}}"""
+
 SOURCE_RATING_SYSTEM = """You are evaluating a source using an imported project profile.
 Use the project profile as the governing rubric for:
 - what counts as relevant
@@ -92,6 +126,7 @@ Important rules:
 - Do not confuse source length with relevance
 - Separate depth from relevant detail
 - Lower confidence when evidence is incomplete or ambiguous
+- Include a concise `tags` array with topic or source-characterization labels that help humans browse the repository
 - If the profile defines a flags section, include float scores (0.0-1.0, 0.05 increments) for each flag
 
 --- PROJECT PROFILE ---

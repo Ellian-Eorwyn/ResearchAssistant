@@ -214,6 +214,66 @@ class RepositoryServiceTests(unittest.TestCase):
         titles = [row.get("title") for row in state.get("sources", [])]
         self.assertEqual(titles, ["Alpha Source", "Beta Source"])
 
+    def test_import_seed_files_from_markdown_harvests_links_without_citations(self):
+        repo_dir = self.tmp_path / "repo_seed_markdown"
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        self.service.attach(str(repo_dir))
+
+        result = self.service.import_seed_files(
+            [
+                (
+                    "report.md",
+                    (
+                        "# Deep Research Report\n\n"
+                        "- [Alpha Study](https://example.com/a)\n"
+                        "- Beta source https://example.com/b\n"
+                    ).encode("utf-8"),
+                )
+            ]
+        )
+
+        self.assertEqual(result.import_type, "source_seed")
+        self.assertEqual(result.accepted_new, 2)
+        state = json.loads(
+            (repo_dir / ".ra_repo" / "repository_state.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(len(state["sources"]), 2)
+        self.assertEqual(state["citations"], [])
+        self.assertEqual(state["sources"][0]["source_kind"], "url")
+        self.assertEqual(state["sources"][0]["title"], "Alpha Study")
+        self.assertEqual(state["sources"][1]["title"], "Beta source")
+
+    def test_import_manual_documents_creates_uploaded_document_rows_and_dedupes_by_sha(self):
+        repo_dir = self.tmp_path / "repo_manual_documents"
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        self.service.attach(str(repo_dir))
+
+        content = b"# Local Memo\n\nDocument body text.\n"
+        result = self.service.import_manual_documents(
+            [
+                ("memo.md", content),
+                ("duplicate.md", content),
+            ]
+        )
+
+        self.assertEqual(result.import_type, "document_source")
+        self.assertEqual(result.accepted_new, 1)
+        self.assertEqual(result.duplicates_skipped, 1)
+        state = json.loads(
+            (repo_dir / ".ra_repo" / "repository_state.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(len(state["sources"]), 1)
+        self.assertEqual(state["citations"], [])
+        row = state["sources"][0]
+        self.assertEqual(row["source_kind"], "uploaded_document")
+        self.assertEqual(row["import_type"], "document_source")
+        self.assertEqual(row["fetch_status"], "not_applicable")
+        self.assertEqual(row["detected_type"], "document")
+        self.assertEqual(row["title"], "Local Memo")
+        self.assertTrue(row["raw_file"].startswith("sources/000001/"))
+        self.assertTrue(row["sha256"])
+        self.assertTrue((repo_dir / row["raw_file"]).is_file())
+
     def test_create_export_job_scope_import_selects_only_that_import(self):
         repo_dir = self.tmp_path / "repo_import"
         repo_dir.mkdir(parents=True, exist_ok=True)

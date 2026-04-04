@@ -21,7 +21,6 @@ import {
   ResearchPurposePage,
   SentencesPage,
   SourceCapturePage,
-  SourceListsPage,
 } from "./pages/pages";
 import { useAppState } from "./state/AppState";
 
@@ -38,8 +37,9 @@ export default function App() {
         <Route element={<Navigate replace to="/project/overview" />} index />
 
         <Route element={<OverviewPage />} path="project/overview" />
-        <Route element={<DocumentsPage />} path="project/documents" />
-        <Route element={<SourceListsPage />} path="project/source-lists" />
+        <Route element={<DocumentsPage />} path="project/ingest" />
+        <Route element={<Navigate replace to="/project/ingest" />} path="project/documents" />
+        <Route element={<Navigate replace to="/project/ingest" />} path="project/source-lists" />
         <Route element={<MergeRepositoriesPage />} path="project/merge" />
 
         <Route element={<CitationExtractionPage />} path="processing/citation-extraction" />

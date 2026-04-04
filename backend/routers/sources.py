@@ -37,6 +37,28 @@ def _job_store(request: Request, job_id: str):
     return request.app.state.file_store
 
 
+def _selected_phase_names(
+    *,
+    run_download: bool,
+    run_convert: bool,
+    run_catalog: bool,
+    run_llm_rating: bool,
+    run_llm_summary: bool,
+) -> list[str]:
+    phases: list[str] = []
+    if run_download:
+        phases.append("fetch")
+    if run_convert:
+        phases.append("convert")
+    if run_catalog:
+        phases.append("catalog")
+    if run_llm_rating:
+        phases.append("tag")
+    if run_llm_summary:
+        phases.append("summarize")
+    return phases
+
+
 @router.post("/sources/upload-list", response_model=SourceListUploadResponse)
 async def upload_source_list(
     request: Request,
@@ -149,6 +171,8 @@ async def start_source_download(
     repo_service = request.app.state.repository_service
 
     run_download = bool(payload.run_download or payload.force_redownload)
+    run_convert = bool(payload.run_convert or payload.force_convert or (run_download and payload.include_markdown))
+    run_catalog = bool(payload.run_catalog or payload.force_catalog or payload.run_llm_title or payload.force_title)
     run_llm_cleanup = bool(payload.run_llm_cleanup or payload.force_llm_cleanup)
     run_llm_title = bool(payload.run_llm_title or payload.force_title)
     run_llm_summary = bool(payload.run_llm_summary or payload.force_summary)
@@ -156,6 +180,8 @@ async def start_source_download(
 
     if not (
         run_download
+        or run_convert
+        or run_catalog
         or run_llm_cleanup
         or run_llm_title
         or run_llm_summary
@@ -243,11 +269,15 @@ async def start_source_download(
         research_purpose=settings.research_purpose,
         fetch_delay=settings.fetch_delay,
         run_download=run_download,
+        run_convert=run_convert,
+        run_catalog=run_catalog,
         run_llm_cleanup=run_llm_cleanup,
         run_llm_title=run_llm_title,
         run_llm_summary=run_llm_summary,
         run_llm_rating=run_llm_rating,
         force_redownload=payload.force_redownload,
+        force_convert=payload.force_convert,
+        force_catalog=payload.force_catalog or payload.force_title,
         force_llm_cleanup=payload.force_llm_cleanup,
         force_title=payload.force_title,
         force_summary=payload.force_summary,
@@ -259,6 +289,13 @@ async def start_source_download(
             include_rendered_html=payload.include_rendered_html,
             include_rendered_pdf=payload.include_rendered_pdf,
             include_markdown=payload.include_markdown,
+        ),
+        selected_phases=_selected_phase_names(
+            run_download=run_download,
+            run_convert=run_convert,
+            run_catalog=run_catalog,
+            run_llm_rating=run_llm_rating,
+            run_llm_summary=run_llm_summary,
         ),
     )
 
@@ -300,11 +337,13 @@ async def start_source_download(
         "job_id": job_id,
         "status": "started",
         "rerun_failed_only": payload.rerun_failed_only,
-        "run_download": payload.run_download,
-        "run_llm_cleanup": payload.run_llm_cleanup,
-        "run_llm_title": payload.run_llm_title,
-        "run_llm_summary": payload.run_llm_summary,
-        "run_llm_rating": payload.run_llm_rating,
+        "run_download": run_download,
+        "run_convert": run_convert,
+        "run_catalog": run_catalog,
+        "run_llm_cleanup": run_llm_cleanup,
+        "run_llm_title": run_llm_title,
+        "run_llm_summary": run_llm_summary,
+        "run_llm_rating": run_llm_rating,
     }
 
 
@@ -383,11 +422,15 @@ async def get_source_download_status(job_id: str, request: Request) -> dict:
                     else "Preparing source task run..."
                 ),
                 run_download=orchestrator.run_download,
+                run_convert=bool(getattr(orchestrator, "run_convert", False)),
+                run_catalog=bool(getattr(orchestrator, "run_catalog", False)),
                 run_llm_cleanup=orchestrator.run_llm_cleanup,
                 run_llm_title=bool(getattr(orchestrator, "run_llm_title", False)),
                 run_llm_summary=orchestrator.run_llm_summary,
                 run_llm_rating=orchestrator.run_llm_rating,
                 force_redownload=orchestrator.force_redownload,
+                force_convert=bool(getattr(orchestrator, "force_convert", False)),
+                force_catalog=bool(getattr(orchestrator, "force_catalog", False)),
                 force_llm_cleanup=orchestrator.force_llm_cleanup,
                 force_title=bool(getattr(orchestrator, "force_title", False)),
                 force_summary=orchestrator.force_summary,
@@ -400,6 +443,16 @@ async def get_source_download_status(job_id: str, request: Request) -> dict:
                 repository_path=str(getattr(orchestrator, "repository_path", "")),
                 selected_scope=str(getattr(orchestrator, "selected_scope", "")),
                 selected_import_id=str(getattr(orchestrator, "selected_import_id", "")),
+                selected_phases=list(
+                    getattr(orchestrator, "selected_phases", [])
+                    or _selected_phase_names(
+                        run_download=bool(getattr(orchestrator, "run_download", False)),
+                        run_convert=bool(getattr(orchestrator, "run_convert", False)),
+                        run_catalog=bool(getattr(orchestrator, "run_catalog", False)),
+                        run_llm_rating=bool(getattr(orchestrator, "run_llm_rating", False)),
+                        run_llm_summary=bool(getattr(orchestrator, "run_llm_summary", False)),
+                    )
+                ),
                 items=[],
             )
             return pending.model_dump(mode="json")
@@ -430,8 +483,10 @@ async def get_source_download_status(job_id: str, request: Request) -> dict:
                 id=row.id,
                 original_url=row.original_url,
                 citation_number=row.citation_number,
+                source_kind=row.source_kind,
                 status="completed" if row.fetch_status != "failed" else "failed",
                 fetch_status=row.fetch_status,
+                catalog_status=row.catalog_status,
                 title_status=row.title_status,
                 llm_cleanup_status=row.llm_cleanup_status,
                 summary_status=row.summary_status,

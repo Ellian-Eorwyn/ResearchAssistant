@@ -25,6 +25,18 @@ function formatTimestamp(value: string): string {
   return parsed.toLocaleString();
 }
 
+function mergeQueuedFiles(existing: File[], incoming: FileList | File[]): File[] {
+  const seen = new Set(existing.map((file) => `${file.name}::${file.size}::${file.lastModified}`));
+  const next = [...existing];
+  Array.from(incoming || []).forEach((file) => {
+    const signature = `${file.name}::${file.size}::${file.lastModified}`;
+    if (seen.has(signature)) return;
+    seen.add(signature);
+    next.push(file);
+  });
+  return next;
+}
+
 function confidenceBadge(value: number) {
   const pct = Math.max(0, Math.min(100, Math.round((value || 0) * 100)));
   if (pct >= 80) {
@@ -220,7 +232,7 @@ export function LandingPage() {
     }
     const created = await createRepository(selectedPath);
     if (created) {
-      navigate("/project/documents");
+      navigate("/project/ingest");
     }
   };
 
@@ -381,7 +393,7 @@ export function OverviewPage() {
             {(dashboard?.recent_jobs || []).slice(0, 6).map((job) => (
               <div key={`${job.kind}-${job.job_id}-${job.updated_at}`} className="flex items-center justify-between rounded-md bg-surface-container-low px-3 py-2">
                 <div>
-                  <div className="text-body-md font-semibold">{job.kind === "citation_extraction" ? "Citation Extraction" : "Source Capture"}</div>
+                  <div className="text-body-md font-semibold">{job.kind === "citation_extraction" ? "Citation Extraction (Legacy)" : "Repository Processing"}</div>
                   <div className="text-label-sm font-mono text-on-surface-variant">{job.job_id}</div>
                 </div>
                 <StatusBadge text={job.state} tone={job.state === "failed" ? "error" : job.state === "running" ? "active" : "neutral"} />
@@ -426,11 +438,11 @@ export function OverviewPage() {
       <SurfaceCard className="mt-4">
         <div className="mb-2 text-label-sm uppercase tracking-[0.1em] text-on-surface-variant">Command Center</div>
         <div className="grid gap-2 md:grid-cols-3 lg:grid-cols-6">
-          <Button onClick={() => navigate("/project/documents")}>Add Documents</Button>
-          <Button onClick={() => navigate("/project/source-lists")}>Import Source List</Button>
-          <Button onClick={() => navigate("/processing/citation-extraction")}>Extract Citations</Button>
+          <Button onClick={() => navigate("/project/ingest")}>Ingest Sources</Button>
+          <Button onClick={() => navigate("/data/repository-browser")}>Open Repository Browser</Button>
+          <Button onClick={() => navigate("/processing/citation-extraction")}>Citation Extraction (Legacy)</Button>
           <Button onClick={() => navigate("/data/manifest")}>Open Manifest</Button>
-          <Button onClick={() => navigate("/processing/source-capture")}>Run Source Capture</Button>
+          <Button onClick={() => navigate("/processing/source-capture")}>Run Repository Processing</Button>
           <Button onClick={() => navigate("/data/citations")}>Open Citations</Button>
         </div>
       </SurfaceCard>
@@ -439,128 +451,179 @@ export function OverviewPage() {
 }
 
 export function DocumentsPage() {
+  const navigate = useNavigate();
   const {
-    files,
-    addFiles,
-    removeFileAtIndex,
-    clearFiles,
-    startProcessing,
-    processingRunning,
-    processingError,
-    processingStatus,
-    ingestionProfiles,
-    defaultIngestionProfileId,
-    selectedIngestionProfileId,
-    setSelectedIngestionProfileId,
+    ingestSeedFiles,
+    ingestRepositoryDocuments,
+    repoMessage,
+    repoError,
+    repositoryStatus,
+    sourceTaskDraft,
   } = useAppState();
+  const [seedFiles, setSeedFiles] = useState<File[]>([]);
+  const [documentFiles, setDocumentFiles] = useState<File[]>([]);
+  const [seedSubmitting, setSeedSubmitting] = useState(false);
+  const [documentSubmitting, setDocumentSubmitting] = useState(false);
+
+  const addSeedFiles = (incoming: FileList | File[]) =>
+    setSeedFiles((prev) => mergeQueuedFiles(prev, incoming));
+  const addDocumentFiles = (incoming: FileList | File[]) =>
+    setDocumentFiles((prev) => mergeQueuedFiles(prev, incoming));
+
+  const removeSeedFile = (index: number) =>
+    setSeedFiles((prev) => prev.filter((_, currentIndex) => currentIndex !== index));
+  const removeDocumentFile = (index: number) =>
+    setDocumentFiles((prev) => prev.filter((_, currentIndex) => currentIndex !== index));
+
+  const submitSeedFiles = async () => {
+    if (seedFiles.length === 0 || seedSubmitting) return;
+    setSeedSubmitting(true);
+    try {
+      await ingestSeedFiles(seedFiles);
+      setSeedFiles([]);
+    } finally {
+      setSeedSubmitting(false);
+    }
+  };
+
+  const submitDocumentFiles = async () => {
+    if (documentFiles.length === 0 || documentSubmitting) return;
+    setDocumentSubmitting(true);
+    try {
+      await ingestRepositoryDocuments(documentFiles);
+      setDocumentFiles([]);
+    } finally {
+      setDocumentSubmitting(false);
+    }
+  };
 
   return (
     <div>
-      <SectionHeader title="Documents" description="Upload research documents and write extraction results directly into the repository." />
+      <SectionHeader
+        title="Ingest"
+        description="Bring seed links or primary documents into the repository. Uploaded files become repository sources; citation extraction now lives under Advanced/Legacy."
+      />
 
-      <SurfaceCard>
-        <div className="text-title-sm font-semibold">Extraction Upload Queue</div>
-        <div
-          className="mt-3 rounded-lg border border-dashed border-outline-variant bg-surface-container-low p-6 text-center"
-          onDrop={(event) => {
-            event.preventDefault();
-            addFiles(event.dataTransfer.files);
-          }}
-          onDragOver={(event) => event.preventDefault()}
-        >
-          <div className="text-body-md">Drag and drop PDF/DOCX/MD files here</div>
-          <label className="mt-3 inline-flex cursor-pointer items-center rounded-md bg-surface-variant px-3 py-2 text-body-md">
-            Select Files
-            <input
-              className="hidden"
-              multiple
-              accept=".pdf,.docx,.md"
-              type="file"
-              onChange={(event) => addFiles(event.target.files || [])}
-            />
-          </label>
-        </div>
-
-        {files.length > 0 ? (
-          <div className="mt-4 space-y-2">
-            {files.map((file, index) => (
-              <div key={`${file.name}-${file.lastModified}`} className="flex items-center justify-between rounded-md bg-surface-container-low px-3 py-2">
-                <div>
-                  <div className="text-body-md font-medium">{file.name}</div>
-                  <div className="text-label-sm text-on-surface-variant">{formatBytes(file.size)}</div>
-                </div>
-                <Button variant="danger" onClick={() => removeFileAtIndex(index)}>Remove</Button>
-              </div>
-            ))}
+      <div className="grid gap-4 xl:grid-cols-2">
+        <SurfaceCard>
+          <div className="text-title-sm font-semibold">Seed Links / Reports</div>
+          <div className="mt-2 text-body-md text-on-surface-variant">
+            Accepts deep research reports and link lists. The ingest step only harvests links and nearby titles, assigns stable source IDs, and queues the repository for later processing.
           </div>
-        ) : (
-          <div className="mt-4 text-body-md text-on-surface-variant">No extraction files selected.</div>
-        )}
-
-        <div className="mt-4 flex flex-wrap gap-2">
-          <Button variant="primary" disabled={files.length === 0 || processingRunning} onClick={() => startProcessing()}>
-            {processingRunning ? "Processing..." : "Extract Citations"}
-          </Button>
-          <Button onClick={clearFiles}>Clear Queue</Button>
-        </div>
-
-        <div className="mt-4 grid gap-3 lg:grid-cols-[minmax(0,1fr)_220px]">
-          <SelectField
-            label="Normalization Profile"
-            value={selectedIngestionProfileId}
-            onChange={(event) => setSelectedIngestionProfileId(event.target.value)}
+          <div
+            className="mt-4 rounded-lg border border-dashed border-outline-variant bg-surface-container-low p-6 text-center"
+            onDrop={(event) => {
+              event.preventDefault();
+              addSeedFiles(event.dataTransfer.files);
+            }}
+            onDragOver={(event) => event.preventDefault()}
           >
-            <option value="">
-              Auto-detect{defaultIngestionProfileId ? ` (${defaultIngestionProfileId})` : ""}
-            </option>
-            {ingestionProfiles.map((profile) => (
-              <option key={profile.profile_id} value={profile.profile_id}>
-                {profile.label}
-                {profile.built_in ? " [Built-in]" : ""}
-              </option>
-            ))}
-          </SelectField>
-          <div className="rounded-md bg-surface-container-low px-3 py-3 text-body-md text-on-surface-variant">
-            Use a profile override only for known document families. Auto-detect remains the default path.
+            <div className="text-body-md">Drop CSV, XLSX, MD, PDF, or DOCX files here</div>
+            <label className="mt-3 inline-flex cursor-pointer items-center rounded-md bg-surface-variant px-3 py-2 text-body-md">
+              Select Seed Files
+              <input
+                className="hidden"
+                multiple
+                accept=".csv,.xlsx,.md,.pdf,.docx"
+                type="file"
+                onChange={(event) => addSeedFiles(event.target.files || [])}
+              />
+            </label>
           </div>
-        </div>
-
-        {processingError && <div className="mt-3 rounded-md bg-error/10 px-3 py-2 text-body-md text-error">{processingError}</div>}
-        {processingStatus && (
-          <div className="mt-3 space-y-1 text-body-md text-on-surface-variant">
-            <div>
-              Current stage: <span className="font-mono">{processingStatus.current_stage}</span> ({Math.round(processingStatus.progress_pct || 0)}%) | profile{" "}
-              <span className="font-mono">{processingStatus.selected_profile_id || selectedIngestionProfileId || "auto_detect"}</span>
+          {seedFiles.length > 0 ? (
+            <div className="mt-4 space-y-2">
+              {seedFiles.map((file, index) => (
+                <div key={`${file.name}-${file.lastModified}`} className="flex items-center justify-between rounded-md bg-surface-container-low px-3 py-2">
+                  <div>
+                    <div className="text-body-md font-medium">{file.name}</div>
+                    <div className="text-label-sm text-on-surface-variant">{formatBytes(file.size)}</div>
+                  </div>
+                  <Button variant="danger" onClick={() => removeSeedFile(index)}>Remove</Button>
+                </div>
+              ))}
             </div>
-            {processingStatus.repository_preprocess_state &&
-              processingStatus.repository_preprocess_state !== "completed" &&
-              processingStatus.repository_preprocess_state !== "skipped" && (
-                <div>
-                  Repository preprocess:{" "}
-                  <span className="font-mono">{processingStatus.repository_preprocess_state}</span>
-                  {processingStatus.repository_preprocess_message
-                    ? ` | ${processingStatus.repository_preprocess_message}`
-                    : ""}
-                </div>
-              )}
-            {processingStatus.repository_finalize_state &&
-              processingStatus.repository_finalize_state !== "completed" &&
-              processingStatus.repository_finalize_state !== "skipped" && (
-                <div>
-                  Repository finalize:{" "}
-                  <span className="font-mono">{processingStatus.repository_finalize_state}</span>
-                  {processingStatus.repository_finalize_message
-                    ? ` | ${processingStatus.repository_finalize_message}`
-                    : ""}
-                </div>
-              )}
+          ) : (
+            <div className="mt-4 text-body-md text-on-surface-variant">No seed files selected.</div>
+          )}
+          <div className="mt-4 flex flex-wrap gap-2">
+            <Button variant="primary" disabled={seedFiles.length === 0 || seedSubmitting} onClick={() => void submitSeedFiles()}>
+              {seedSubmitting ? "Importing..." : "Import Seed Sources"}
+            </Button>
+            <Button onClick={() => setSeedFiles([])}>Clear Queue</Button>
           </div>
-        )}
+        </SurfaceCard>
+
+        <SurfaceCard>
+          <div className="text-title-sm font-semibold">Add Documents To Repository</div>
+          <div className="mt-2 text-body-md text-on-surface-variant">
+            Upload PDFs, docs, markdown, or HTML directly into the repository. These become first-class local sources and can be processed in bulk through convert, catalog, summary, and tagging phases.
+          </div>
+          <div
+            className="mt-4 rounded-lg border border-dashed border-outline-variant bg-surface-container-low p-6 text-center"
+            onDrop={(event) => {
+              event.preventDefault();
+              addDocumentFiles(event.dataTransfer.files);
+            }}
+            onDragOver={(event) => event.preventDefault()}
+          >
+            <div className="text-body-md">Drop PDF, DOC, DOCX, HTML, MD, RTF, or TXT files here</div>
+            <label className="mt-3 inline-flex cursor-pointer items-center rounded-md bg-surface-variant px-3 py-2 text-body-md">
+              Select Repository Documents
+              <input
+                className="hidden"
+                multiple
+                accept=".pdf,.doc,.docx,.html,.htm,.md,.rtf,.txt"
+                type="file"
+                onChange={(event) => addDocumentFiles(event.target.files || [])}
+              />
+            </label>
+          </div>
+          {documentFiles.length > 0 ? (
+            <div className="mt-4 space-y-2">
+              {documentFiles.map((file, index) => (
+                <div key={`${file.name}-${file.lastModified}`} className="flex items-center justify-between rounded-md bg-surface-container-low px-3 py-2">
+                  <div>
+                    <div className="text-body-md font-medium">{file.name}</div>
+                    <div className="text-label-sm text-on-surface-variant">{formatBytes(file.size)}</div>
+                  </div>
+                  <Button variant="danger" onClick={() => removeDocumentFile(index)}>Remove</Button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="mt-4 text-body-md text-on-surface-variant">No repository documents selected.</div>
+          )}
+          <div className="mt-4 flex flex-wrap gap-2">
+            <Button variant="primary" disabled={documentFiles.length === 0 || documentSubmitting} onClick={() => void submitDocumentFiles()}>
+              {documentSubmitting ? "Adding..." : "Add To Repository"}
+            </Button>
+            <Button onClick={() => setDocumentFiles([])}>Clear Queue</Button>
+          </div>
+        </SurfaceCard>
+      </div>
+
+      <SurfaceCard className="mt-4">
+        <div className="mb-2 text-label-sm uppercase tracking-[0.08em] text-on-surface-variant">Next Step</div>
+        <div className="text-body-md text-on-surface-variant">
+          After ingest, run repository processing to fetch URL sources, convert uploaded documents, catalog metadata, summarize against the research purpose, and apply relevance ratings and tags.
+        </div>
+        <div className="mt-3 grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto]">
+          <div className="rounded-md bg-surface-container-low px-3 py-3 text-body-md text-on-surface-variant">
+            Repository path: <span className="font-mono">{repositoryStatus?.path || "-"}</span>
+            <br />
+            Next processing scope: <span className="font-mono">{sourceTaskDraft.import_id || "latest repository state"}</span>
+          </div>
+          <Button className="lg:mt-4" variant="primary" onClick={() => navigate("/processing/source-capture")}>
+            Open Repository Processing
+          </Button>
+        </div>
       </SurfaceCard>
 
-      <div className="mt-4">
-        <NormalizationResultsPanel results={processingStatus?.document_normalization || []} />
-      </div>
+      {(repoError || repoMessage) && (
+        <div className={`mt-4 rounded-md px-3 py-2 text-body-md ${repoError ? "bg-error/10 text-error" : "bg-surface-container text-on-surface"}`}>
+          {repoError || repoMessage}
+        </div>
+      )}
     </div>
   );
 }
@@ -651,6 +714,9 @@ export function MergeRepositoriesPage() {
 export function CitationExtractionPage() {
   const {
     files,
+    addFiles,
+    removeFileAtIndex,
+    clearFiles,
     documentImports,
     startProcessing,
     reprocessStoredDocuments,
@@ -680,8 +746,8 @@ export function CitationExtractionPage() {
   return (
     <div>
       <SectionHeader
-        title="Citation Extraction"
-        description="Process repository documents and merge extracted citation data directly into repository files."
+        title="Citation Extraction (Legacy)"
+        description="Run the legacy citation-centric document pipeline. Repository-first ingest and source processing now live under Project > Ingest and Processing > Repository Processing."
         right={
           <StatusBadge
             text={processingRunning ? "Engine Running" : "Engine Ready"}
@@ -694,17 +760,45 @@ export function CitationExtractionPage() {
         <div className="space-y-4">
           <SurfaceCard>
             <div className="mb-2 text-label-sm uppercase tracking-[0.08em] text-on-surface-variant">Documents to run</div>
-            <div className="space-y-2">
+            <div
+              className="rounded-lg border border-dashed border-outline-variant bg-surface-container-low p-4 text-center"
+              onDrop={(event) => {
+                event.preventDefault();
+                addFiles(event.dataTransfer.files);
+              }}
+              onDragOver={(event) => event.preventDefault()}
+            >
+              <div className="text-body-md">Drop PDF, DOCX, or MD files here for the legacy citation pipeline</div>
+              <label className="mt-3 inline-flex cursor-pointer items-center rounded-md bg-surface-variant px-3 py-2 text-body-md">
+                Select Legacy Files
+                <input
+                  className="hidden"
+                  multiple
+                  accept=".pdf,.docx,.md"
+                  type="file"
+                  onChange={(event) => addFiles(event.target.files || [])}
+                />
+              </label>
+            </div>
+            <div className="mt-3 space-y-2">
               {files.length === 0 ? (
-                <div className="text-body-md text-on-surface-variant">No staged documents. Add files in Project › Documents.</div>
+                <div className="text-body-md text-on-surface-variant">No staged legacy documents yet.</div>
               ) : (
-                files.map((file) => (
+                files.map((file, index) => (
                   <div key={`${file.name}-${file.lastModified}`} className="rounded-md bg-surface-container-low px-3 py-2">
-                    <div className="text-body-md font-medium">{file.name}</div>
-                    <div className="text-label-sm text-on-surface-variant">{formatBytes(file.size)}</div>
+                    <div className="flex items-center justify-between gap-2">
+                      <div>
+                        <div className="text-body-md font-medium">{file.name}</div>
+                        <div className="text-label-sm text-on-surface-variant">{formatBytes(file.size)}</div>
+                      </div>
+                      <Button variant="danger" onClick={() => removeFileAtIndex(index)}>Remove</Button>
+                    </div>
                   </div>
                 ))
               )}
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <Button onClick={clearFiles}>Clear Staged Files</Button>
             </div>
           </SurfaceCard>
 
@@ -964,7 +1058,7 @@ export function SourceCapturePage() {
 
   return (
     <div>
-      <SectionHeader title="Source Capture" description="Run download, cleanup, summary, and rating phases directly against repository rows." />
+      <SectionHeader title="Repository Processing" description="Run fetch, convert, catalog, summary, and tagging phases directly against repository rows." />
 
       <div className="grid gap-4 xl:grid-cols-[420px_1fr]">
         <div className="space-y-4">
@@ -997,6 +1091,9 @@ export function SourceCapturePage() {
             )}
             <div className="mt-3 text-body-md text-on-surface-variant">
               Repository path: <span className="font-mono">{repositoryStatus?.path || "-"}</span>
+            </div>
+            <div className="mt-2 text-body-md text-on-surface-variant">
+              Uploaded repository documents automatically skip fetch and continue into later phases.
             </div>
           </SurfaceCard>
 
@@ -1058,7 +1155,7 @@ export function SourceCapturePage() {
           </SurfaceCard>
 
           <SurfaceCard>
-            <div className="mb-2 text-label-sm uppercase tracking-[0.08em] text-on-surface-variant">Local LLM-Based</div>
+            <div className="mb-2 text-label-sm uppercase tracking-[0.08em] text-on-surface-variant">AI Enrichment</div>
             <label className="mb-2 flex items-center gap-2 text-body-md">
               <input
                 checked={sourceTaskDraft.run_llm_cleanup}
@@ -1071,13 +1168,13 @@ export function SourceCapturePage() {
             </label>
             <label className="mb-2 flex items-center gap-2 text-body-md">
               <input
-                checked={sourceTaskDraft.run_llm_title}
+                checked={sourceTaskDraft.run_catalog}
                 type="checkbox"
                 onChange={(event) =>
-                  setSourceTaskDraft((prev) => ({ ...prev, run_llm_title: event.target.checked }))
+                  setSourceTaskDraft((prev) => ({ ...prev, run_catalog: event.target.checked }))
                 }
               />
-              Resolve titles from front matter or content
+              Catalog metadata: title, authors, date, document type, organization
             </label>
             <label className="mb-2 flex items-center gap-2 text-body-md">
               <input
@@ -1101,7 +1198,7 @@ export function SourceCapturePage() {
             </label>
             {([
               ["force_llm_cleanup", "Re-run cleanup even if cleanup file exists"],
-              ["force_title", "Re-run title resolution"],
+              ["force_catalog", "Re-run catalog metadata extraction"],
               ["force_summary", "Re-run summaries"],
               ["force_rating", "Force re-rate"],
             ] as const).map(([key, label]) => (
@@ -1116,8 +1213,8 @@ export function SourceCapturePage() {
                       ...(key === "force_llm_cleanup" && event.target.checked
                         ? { run_llm_cleanup: true }
                         : {}),
-                      ...(key === "force_title" && event.target.checked
-                        ? { run_llm_title: true }
+                      ...(key === "force_catalog" && event.target.checked
+                        ? { run_catalog: true }
                         : {}),
                       ...(key === "force_summary" && event.target.checked
                         ? { run_llm_summary: true }
@@ -1249,12 +1346,14 @@ export function SourceCapturePage() {
                           tone={item.status === "failed" ? "error" : item.status === "running" ? "active" : "neutral"}
                         />
                       </div>
-                      <div className="mt-1 text-body-md break-all">{item.original_url}</div>
-                      <div className="mt-1 text-label-sm text-on-surface-variant">
-                        title: {item.title_status || "-"} | cleanup: {item.llm_cleanup_status || "-"} | summary: {item.summary_status || "-"} | rating: {item.rating_status || "-"}
+                      <div className="mt-1 text-body-md break-all">
+                        {item.original_url || (item.source_kind === "uploaded_document" ? "[uploaded document]" : "-")}
                       </div>
-                    </div>
-                  ))}
+                      <div className="mt-1 text-label-sm text-on-surface-variant">
+                kind: {item.source_kind || "url"} | catalog: {item.catalog_status || "-"} | cleanup: {item.llm_cleanup_status || "-"} | summary: {item.summary_status || "-"} | rating: {item.rating_status || "-"}
+              </div>
+            </div>
+          ))}
                 </div>
               )}
             </div>

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import base64
 import hashlib
 import io
 import json
@@ -20,6 +21,19 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from backend.models.bibliography import BibliographyArtifact, BibliographyEntry, ReferencesSection
+from backend.models.agent import (
+    AgentResourceContent,
+    AgentResourceRecord,
+    AgentRunCounts,
+    AgentRunCurrentItem,
+    AgentRunRecord,
+    AgentRunSnapshot,
+    AgentSourceContentChunk,
+    AgentSourceArtifactUris,
+    AgentSourceFreshness,
+    AgentSourceProvenance,
+    AgentSourceRecord,
+)
 from backend.models.export import ExportArtifact, ExportRow
 from backend.models.common import ProcessingConfig
 from backend.models.ingestion import IngestedDocument
@@ -54,6 +68,8 @@ from backend.models.settings import RepoSettings
 from backend.models.sources import (
     SOURCE_MANIFEST_COLUMNS,
     SourceDownloadRequest,
+    SourceDownloadStatus,
+    SourcePhaseMetadata,
     SourceManifestArtifact,
     SourceManifestRow,
     SourceOutputOptions,
@@ -96,7 +112,7 @@ except Exception:  # pragma: no cover - Windows fallback
     fcntl = None
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 INTERNAL_DIR_NAME = ".ra_repo"
 META_FILE_NAME = "repository.json"
 STATE_FILE_NAME = "repository_state.json"
@@ -107,6 +123,10 @@ INGESTION_PROFILE_SUGGESTIONS_FILE_NAME = "ingestion_profile_suggestions.json"
 BUNDLED_INGESTION_PROFILES_FILE_NAME = "bundled_ingestion_profiles.json"
 PROJECT_PROFILES_DIR_NAME = "project_profiles"
 REPO_JOBS_DIR_NAME = "jobs"
+AGENT_RESOURCES_FILE_NAME = "agent_resources.json"
+AGENT_TOKENS_FILE_NAME = "agent_tokens.json"
+AGENT_IDEMPOTENCY_FILE_NAME = "agent_idempotency.json"
+AGENT_AUDIT_FILE_NAME = "agent_audit.jsonl"
 DOCUMENTS_DIR_NAME = "documents"
 SOURCES_DIR_NAME = "sources"
 MANIFEST_CSV_NAME = "manifest.csv"
@@ -121,6 +141,7 @@ JOB_SEED_FILE_FIELDS = [
     "rendered_pdf_file",
     "markdown_file",
     "llm_cleanup_file",
+    "catalog_file",
     "summary_file",
     "rating_file",
     "metadata_file",
@@ -135,12 +156,24 @@ FILE_FIELDS = [
     "rendered_pdf_file",
     "markdown_file",
     "llm_cleanup_file",
+    "catalog_file",
     "summary_file",
     "rating_file",
     "metadata_file",
 ]
 
 SUPPORTED_DOCUMENT_IMPORT_EXTENSIONS = {".pdf", ".docx", ".md"}
+SUPPORTED_SEED_IMPORT_EXTENSIONS = {".csv", ".xlsx", ".pdf", ".docx", ".md"}
+SUPPORTED_MANUAL_SOURCE_EXTENSIONS = {
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".html",
+    ".htm",
+    ".md",
+    ".rtf",
+    ".txt",
+}
 
 
 @dataclass
@@ -730,6 +763,7 @@ class AttachedRepositoryService:
             "rendered_html": sum(1 for row in rows if (row.rendered_file or "").strip()),
             "rendered_pdf": sum(1 for row in rows if (row.rendered_pdf_file or "").strip()),
             "markdown": sum(1 for row in rows if (row.markdown_file or "").strip()),
+            "catalogs": sum(1 for row in rows if (row.catalog_file or "").strip()),
             "summaries": sum(1 for row in rows if (row.summary_file or "").strip()),
             "ratings": sum(1 for row in rows if (row.rating_file or "").strip()),
         }
@@ -744,6 +778,9 @@ class AttachedRepositoryService:
             ),
             "failed_ratings": sum(
                 1 for row in rows if (row.rating_status or "").strip().lower() == "failed"
+            ),
+            "failed_catalogs": sum(
+                1 for row in rows if (row.catalog_status or "").strip().lower() == "failed"
             ),
             "failed_fetches": sum(
                 1 for row in rows if (row.fetch_status or "").strip().lower() == "failed"
@@ -776,6 +813,13 @@ class AttachedRepositoryService:
         q: str = "",
         fetch_status: str = "",
         detected_type: str = "",
+        source_kind: str = "",
+        document_type: str = "",
+        organization_type: str = "",
+        organization_name: str = "",
+        author_names: str = "",
+        publication_date: str = "",
+        tags_text: str = "",
         has_summary: bool | None = None,
         has_rating: bool | None = None,
         rating_overall_min: float | None = None,
@@ -806,6 +850,13 @@ class AttachedRepositoryService:
         q_norm = (q or "").strip().lower()
         fetch_status_norm = (fetch_status or "").strip().lower()
         detected_type_norm = (detected_type or "").strip().lower()
+        source_kind_norm = (source_kind or "").strip().lower()
+        document_type_norm = (document_type or "").strip().lower()
+        organization_type_norm = (organization_type or "").strip().lower()
+        organization_name_norm = (organization_name or "").strip().lower()
+        author_names_norm = (author_names or "").strip().lower()
+        publication_date_norm = (publication_date or "").strip().lower()
+        tags_text_norm = (tags_text or "").strip().lower()
         rating_filters = {
             "rating_overall": (rating_overall_min, rating_overall_max),
             "rating_overall_relevance": (
@@ -835,6 +886,20 @@ class AttachedRepositoryService:
                 continue
             if detected_type_norm and str(record.get("detected_type") or "").strip().lower() != detected_type_norm:
                 continue
+            if source_kind_norm and str(record.get("source_kind") or "").strip().lower() != source_kind_norm:
+                continue
+            if document_type_norm and document_type_norm not in str(record.get("document_type") or "").strip().lower():
+                continue
+            if organization_type_norm and organization_type_norm not in str(record.get("organization_type") or "").strip().lower():
+                continue
+            if organization_name_norm and organization_name_norm not in str(record.get("organization_name") or "").strip().lower():
+                continue
+            if author_names_norm and author_names_norm not in str(record.get("author_names") or "").strip().lower():
+                continue
+            if publication_date_norm and publication_date_norm not in str(record.get("publication_date") or "").strip().lower():
+                continue
+            if tags_text_norm and tags_text_norm not in str(record.get("tags_text") or "").strip().lower():
+                continue
 
             summary_present = bool(str(record.get("summary_file") or "").strip()) or (
                 str(record.get("summary_status") or "").strip().lower()
@@ -861,7 +926,14 @@ class AttachedRepositoryService:
                 haystack = " ".join(
                     [
                         str(record.get("id") or ""),
+                        str(record.get("source_kind") or ""),
                         str(record.get("title") or ""),
+                        str(record.get("author_names") or ""),
+                        str(record.get("publication_date") or ""),
+                        str(record.get("document_type") or ""),
+                        str(record.get("organization_name") or ""),
+                        str(record.get("organization_type") or ""),
+                        str(record.get("tags_text") or ""),
                         str(record.get("original_url") or ""),
                         str(record.get("final_url") or ""),
                         str(record.get("source_document_name") or ""),
@@ -898,6 +970,13 @@ class AttachedRepositoryService:
                 "q": q,
                 "fetch_status": fetch_status,
                 "detected_type": detected_type,
+                "source_kind": source_kind,
+                "document_type": document_type,
+                "organization_type": organization_type,
+                "organization_name": organization_name,
+                "author_names": author_names,
+                "publication_date": publication_date,
+                "tags_text": tags_text,
                 "has_summary": has_summary,
                 "has_rating": has_rating,
                 "rating_overall_min": rating_overall_min,
@@ -910,6 +989,500 @@ class AttachedRepositoryService:
                 "rating_relevant_detail_score_max": rating_relevant_detail_score_max,
             },
         }
+
+    def list_agent_sources(
+        self,
+        *,
+        q: str = "",
+        status: str = "",
+        fetch_status: str = "",
+        convert_status: str = "",
+        tag_status: str = "",
+        summarize_status: str = "",
+        import_id: str = "",
+        has_summary: bool | None = None,
+        has_rating: bool | None = None,
+        min_relevance: float | None = None,
+        sort_by: str = "rating_overall",
+        sort_dir: str = "desc",
+        limit: int = 50,
+        cursor: str = "",
+    ) -> dict[str, Any]:
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+
+        normalized_sort_by = (sort_by or "rating_overall").strip().lower() or "rating_overall"
+        normalized_sort_dir = (sort_dir or "desc").strip().lower()
+        if normalized_sort_dir not in {"asc", "desc"}:
+            raise ValueError("Invalid sort_dir. Use `asc` or `desc`.")
+        allowed_sort_fields = {"rating_overall", "updated_at", "source_id", "title"}
+        if normalized_sort_by not in allowed_sort_fields:
+            raise ValueError(
+                f"Invalid sort_by. Allowed: {sorted(allowed_sort_fields)}"
+            )
+
+        safe_limit = max(1, min(int(limit), 500))
+        offset = _decode_agent_offset_cursor(cursor)
+        q_norm = (q or "").strip().lower()
+        status_norm = (status or "").strip().lower()
+        fetch_status_norm = (fetch_status or "").strip().lower()
+        convert_status_norm = (convert_status or "").strip().lower()
+        tag_status_norm = (tag_status or "").strip().lower()
+        summarize_status_norm = (summarize_status or "").strip().lower()
+        import_id_norm = (import_id or "").strip()
+
+        with self._writer_lock():
+            state = self._load_state_locked()
+            rows = self._sort_rows(_load_source_rows(state.get("sources", [])))
+            imports = list(state.get("imports", []))
+
+        paired_records: list[tuple[AgentSourceRecord, dict[str, Any]]] = []
+        for row in rows:
+            manifest_record = build_manifest_record(row, base_dir=self.path)
+            source_record = self._build_agent_source_record(
+                row=row,
+                imports=imports,
+                manifest_record=manifest_record,
+            )
+            paired_records.append((source_record, manifest_record))
+
+        filtered: list[tuple[AgentSourceRecord, dict[str, Any]]] = []
+        for source_record, manifest_record in paired_records:
+            if status_norm and source_record.fetch_status.lower() != status_norm:
+                continue
+            if fetch_status_norm and source_record.fetch_status.lower() != fetch_status_norm:
+                continue
+            if convert_status_norm and source_record.convert_status.lower() != convert_status_norm:
+                continue
+            if tag_status_norm and source_record.tag_status.lower() != tag_status_norm:
+                continue
+            if summarize_status_norm and source_record.summarize_status.lower() != summarize_status_norm:
+                continue
+            if import_id_norm and source_record.provenance.import_id != import_id_norm:
+                continue
+            if has_summary is True and not source_record.summary_present:
+                continue
+            if has_summary is False and source_record.summary_present:
+                continue
+            if has_rating is True and not source_record.rating_present:
+                continue
+            if has_rating is False and source_record.rating_present:
+                continue
+
+            relevance_value = _coerce_optional_float(
+                manifest_record.get("rating_overall_relevance")
+            )
+            if relevance_value is None:
+                relevance_value = source_record.rating_overall
+            if min_relevance is not None and (
+                relevance_value is None or relevance_value < float(min_relevance)
+            ):
+                continue
+
+            if q_norm:
+                haystack = " ".join(
+                    [
+                        source_record.source_id,
+                        source_record.title,
+                        source_record.original_url,
+                        source_record.final_url,
+                        source_record.provenance.source_document_name,
+                        source_record.provenance.provenance_ref,
+                        str(manifest_record.get("summary_text") or ""),
+                        str(manifest_record.get("rating_rationale") or ""),
+                        str(manifest_record.get("relevant_sections") or ""),
+                    ]
+                ).lower()
+                if q_norm not in haystack:
+                    continue
+
+            filtered.append((source_record, manifest_record))
+
+        sorted_records = _sort_agent_source_records(
+            filtered,
+            sort_by=normalized_sort_by,
+            sort_dir=normalized_sort_dir,
+        )
+        page = sorted_records[offset : offset + safe_limit]
+        next_offset = offset + safe_limit
+        next_cursor = (
+            _encode_agent_offset_cursor(next_offset) if next_offset < len(sorted_records) else ""
+        )
+        return {
+            "items": [record.model_dump(mode="json") for record, _ in page],
+            "total": len(sorted_records),
+            "limit": safe_limit,
+            "cursor": cursor,
+            "next_cursor": next_cursor,
+            "sort_by": normalized_sort_by,
+            "sort_dir": normalized_sort_dir,
+        }
+
+    def get_agent_source(self, source_id: str) -> AgentSourceRecord:
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+        normalized_id = str(source_id or "").strip()
+        if not normalized_id:
+            raise ValueError("source_id is required")
+
+        with self._writer_lock():
+            state = self._load_state_locked()
+            rows = _load_source_rows(state.get("sources", []))
+            imports = list(state.get("imports", []))
+
+        row = next((item for item in rows if item.id == normalized_id), None)
+        if row is None:
+            raise ValueError(f"Unknown source_id: {normalized_id}")
+        manifest_record = build_manifest_record(row, base_dir=self.path)
+        return self._build_agent_source_record(
+            row=row,
+            imports=imports,
+            manifest_record=manifest_record,
+        )
+
+    def get_agent_source_content(
+        self,
+        source_id: str,
+        *,
+        kind: str,
+        cursor: str = "",
+        chunk_size: int = 8000,
+    ) -> AgentSourceContentChunk:
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+        normalized_id = str(source_id or "").strip()
+        if not normalized_id:
+            raise ValueError("source_id is required")
+        normalized_kind = str(kind or "").strip().lower()
+        if normalized_kind not in {"markdown", "clean_markdown", "summary", "rating", "metadata"}:
+            raise ValueError(
+                "Invalid content kind. Use `markdown`, `clean_markdown`, `summary`, `rating`, or `metadata`."
+            )
+
+        with self._writer_lock():
+            state = self._load_state_locked()
+            rows = _load_source_rows(state.get("sources", []))
+
+        row = next((item for item in rows if item.id == normalized_id), None)
+        if row is None:
+            raise ValueError(f"Unknown source_id: {normalized_id}")
+
+        artifact_uri = _agent_source_artifact_uri(normalized_id, normalized_kind)
+        content = ""
+        mime_type = "text/plain"
+        if normalized_kind == "markdown":
+            content = self._load_source_text_artifact(row, "markdown_file")
+            mime_type = "text/markdown"
+        elif normalized_kind == "clean_markdown":
+            content = self._load_source_text_artifact(
+                row,
+                "llm_cleanup_file",
+                fallback_field="markdown_file",
+            )
+            mime_type = "text/markdown"
+        elif normalized_kind == "summary":
+            content = self._load_source_text_artifact(row, "summary_file")
+            mime_type = "text/markdown"
+        elif normalized_kind == "rating":
+            content = self._load_source_text_artifact(row, "rating_file")
+            mime_type = "application/json"
+        else:
+            metadata_path = self._resolve_repository_artifact_path(
+                row,
+                "metadata_file",
+                row.metadata_file,
+            )
+            if metadata_path is not None and metadata_path.is_file():
+                content = metadata_path.read_text(encoding="utf-8", errors="replace")
+            else:
+                content = json.dumps(row.model_dump(mode="json"), ensure_ascii=False, indent=2)
+            mime_type = "application/json"
+
+        if not content.strip():
+            raise ValueError(
+                f"No `{normalized_kind}` content available for source `{normalized_id}`"
+            )
+
+        safe_chunk_size = max(1, min(int(chunk_size), 50000))
+        offset = _decode_agent_offset_cursor(cursor)
+        if offset > len(content):
+            raise ValueError("Cursor is out of range for the requested content.")
+        end = min(len(content), offset + safe_chunk_size)
+        next_cursor = _encode_agent_offset_cursor(end) if end < len(content) else ""
+        return AgentSourceContentChunk(
+            source_id=normalized_id,
+            kind=normalized_kind,
+            mime_type=mime_type,
+            artifact_uri=artifact_uri,
+            cursor=cursor,
+            next_cursor=next_cursor,
+            total_length=len(content),
+            offset_start=offset,
+            offset_end=end,
+            content=content[offset:end],
+        )
+
+    def get_agent_run(
+        self,
+        run_id: str,
+        *,
+        live_jobs: dict[str, SourceDownloadOrchestrator] | None = None,
+        live_jobs_lock: threading.Lock | None = None,
+    ) -> AgentRunRecord:
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_run_id:
+            raise ValueError("run_id is required")
+
+        store = self.job_store_for(normalized_run_id)
+        if not store.job_exists(normalized_run_id):
+            raise ValueError(f"Unknown run_id: {normalized_run_id}")
+
+        raw_status = store.get_source_status(normalized_run_id)
+        if raw_status is None and live_jobs is not None and live_jobs_lock is not None:
+            with live_jobs_lock:
+                orchestrator = live_jobs.get(normalized_run_id)
+            if orchestrator is not None:
+                pending = _build_pending_source_status(
+                    job_id=normalized_run_id,
+                    store=store,
+                    orchestrator=orchestrator,
+                )
+                raw_status = pending.model_dump(mode="json")
+
+        status = (
+            SourceDownloadStatus.model_validate(raw_status)
+            if isinstance(raw_status, dict)
+            else None
+        )
+        context = store.load_artifact(normalized_run_id, "repo_source_task_context") or {}
+        artifact = store.load_artifact(normalized_run_id, "06_sources_manifest") or {}
+        rows = _load_source_rows(artifact.get("rows", []))
+        selected_phases = _normalize_agent_phase_names(
+            context.get("selected_phases", []),
+            run_download=bool(getattr(status, "run_download", False)),
+            run_convert=bool(getattr(status, "run_convert", False)),
+            run_catalog=bool(getattr(status, "run_catalog", False)),
+            run_tag=bool(getattr(status, "run_llm_rating", False)),
+            run_summarize=bool(getattr(status, "run_llm_summary", False)),
+        )
+        counts = _build_agent_run_counts(
+            rows=rows,
+            selected_phases=selected_phases,
+            fallback_status=status,
+        )
+
+        manifest_csv_path = store.get_sources_manifest_csv_path(normalized_run_id)
+        manifest_xlsx_path = store.get_sources_manifest_xlsx_path(normalized_run_id)
+        bundle_path = store.get_sources_bundle_path(normalized_run_id)
+        output_summary = {}
+        if status is not None:
+            output_summary = status.output_summary.model_dump(mode="json")
+        elif rows:
+            output_summary = summarize_output_rows(rows).model_dump(mode="json")
+
+        phase_states: dict[str, SourcePhaseMetadata] = {}
+        if status is not None:
+            phase_states = {
+                key: value.model_copy(deep=True)
+                for key, value in status.phase_states.items()
+            }
+        elif selected_phases:
+            phase_states = {
+                phase: SourcePhaseMetadata(phase=phase, status="pending")
+                for phase in selected_phases
+            }
+
+        selected_source_ids = [
+            str(item).strip()
+            for item in context.get("selected_ids", [])
+            if str(item).strip()
+        ]
+        snapshot = AgentRunSnapshot(
+            manifest_csv=str(manifest_csv_path) if manifest_csv_path.exists() else "",
+            manifest_xlsx=str(manifest_xlsx_path) if manifest_xlsx_path.exists() else "",
+            bundle_file=str(bundle_path) if bundle_path.exists() else "",
+            repository_path=str(context.get("repository_path") or self.path),
+            output_summary=output_summary,
+        )
+        current_item = AgentRunCurrentItem(
+            source_id=str(getattr(status, "current_item_id", "") or ""),
+            url=str(getattr(status, "current_url", "") or ""),
+        )
+        return AgentRunRecord(
+            run_id=normalized_run_id,
+            scope=str(context.get("scope") or getattr(status, "selected_scope", "") or ""),
+            import_id=str(
+                context.get("import_id") or getattr(status, "selected_import_id", "") or ""
+            ),
+            phase_states=phase_states,
+            counts=counts,
+            current_item=current_item,
+            selected_source_ids=selected_source_ids,
+            started_at=str(getattr(status, "started_at", "") or ""),
+            completed_at=str(getattr(status, "completed_at", "") or ""),
+            cancel_requested=bool(getattr(status, "cancel_requested", False)),
+            result_snapshot=snapshot,
+        )
+
+    def cancel_agent_run(
+        self,
+        run_id: str,
+        *,
+        live_jobs: dict[str, SourceDownloadOrchestrator] | None = None,
+        live_jobs_lock: threading.Lock | None = None,
+    ) -> AgentRunRecord:
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_run_id:
+            raise ValueError("run_id is required")
+
+        store = self.job_store_for(normalized_run_id)
+        if not store.job_exists(normalized_run_id):
+            raise ValueError(f"Unknown run_id: {normalized_run_id}")
+
+        orchestrator: SourceDownloadOrchestrator | None = None
+        if live_jobs is not None and live_jobs_lock is not None:
+            with live_jobs_lock:
+                orchestrator = live_jobs.get(normalized_run_id)
+        if orchestrator is not None:
+            orchestrator.request_cancel()
+            message = (
+                getattr(getattr(orchestrator, "status", None), "message", "")
+                or "Stop requested. Finishing the current item before stopping."
+            )
+            if getattr(orchestrator, "writes_to_repository", False):
+                self.mark_source_tasks_cancelling(message)
+        else:
+            status = store.get_source_status(normalized_run_id) or {}
+            state = str(status.get("state") or "").strip().lower()
+            if state not in {"cancelled", "completed", "failed", "cancelling"}:
+                raise RuntimeError(
+                    "Run is not currently cancellable because no live worker handle is available."
+                )
+
+        return self.get_agent_run(
+            normalized_run_id,
+            live_jobs=live_jobs,
+            live_jobs_lock=live_jobs_lock,
+        )
+
+    def _load_source_text_artifact(
+        self,
+        row: SourceManifestRow,
+        field_name: str,
+        *,
+        fallback_field: str = "",
+    ) -> str:
+        rel_value = str(getattr(row, field_name) or "").strip()
+        source_path = self._resolve_repository_artifact_path(row, field_name, rel_value)
+        if source_path is None and fallback_field:
+            fallback_value = str(getattr(row, fallback_field) or "").strip()
+            source_path = self._resolve_repository_artifact_path(
+                row,
+                fallback_field,
+                fallback_value,
+            )
+        if source_path is None or not source_path.is_file():
+            return ""
+        return source_path.read_text(encoding="utf-8", errors="replace")
+
+    def _build_agent_source_record(
+        self,
+        *,
+        row: SourceManifestRow,
+        imports: list[dict[str, Any]],
+        manifest_record: dict[str, Any] | None = None,
+    ) -> AgentSourceRecord:
+        derived = manifest_record or build_manifest_record(row, base_dir=self.path)
+        import_id = _row_import_id(row)
+        rating_overall = _coerce_optional_float(derived.get("rating_overall"))
+        rating_confidence = _coerce_optional_float(derived.get("rating_confidence"))
+        markdown_digest = _file_sha256(
+            self._resolve_repository_artifact_path(row, "markdown_file", row.markdown_file)
+        )
+        clean_markdown_path = self._resolve_repository_artifact_path(
+            row,
+            "llm_cleanup_file",
+            row.llm_cleanup_file,
+        )
+        if clean_markdown_path is None:
+            clean_markdown_path = self._resolve_repository_artifact_path(
+                row,
+                "markdown_file",
+                row.markdown_file,
+            )
+        clean_markdown_digest = _file_sha256(clean_markdown_path)
+        summary_digest = _file_sha256(
+            self._resolve_repository_artifact_path(row, "summary_file", row.summary_file)
+        )
+        rating_digest = _file_sha256(
+            self._resolve_repository_artifact_path(row, "rating_file", row.rating_file)
+        )
+        summary_metadata = row.phase_metadata.get("summarize")
+        tag_metadata = row.phase_metadata.get("tag")
+        summary_stale = _phase_is_stale(summary_metadata, clean_markdown_digest)
+        rating_stale = _phase_is_stale(tag_metadata, clean_markdown_digest)
+
+        return AgentSourceRecord(
+            source_id=row.id,
+            original_url=row.original_url,
+            final_url=row.final_url or row.original_url,
+            title=row.title,
+            detected_type=row.detected_type,
+            fetch_status=_agent_fetch_status(row),
+            convert_status=_agent_phase_status(row, "convert"),
+            tag_status=_agent_phase_status(row, "tag"),
+            summarize_status=_agent_phase_status(row, "summarize"),
+            rating_overall=rating_overall,
+            rating_confidence=rating_confidence,
+            summary_present=bool(summary_digest),
+            rating_present=bool(rating_digest),
+            content_digests={
+                "fetch": row.sha256,
+                "markdown": markdown_digest,
+                "clean_markdown": clean_markdown_digest,
+                "summary": summary_digest,
+                "summary_source": str(getattr(summary_metadata, "content_digest", "") or ""),
+                "rating": rating_digest,
+                "rating_source": str(getattr(tag_metadata, "content_digest", "") or ""),
+            },
+            artifact_uris=AgentSourceArtifactUris(
+                markdown=(
+                    _agent_source_artifact_uri(row.id, "markdown") if markdown_digest else ""
+                ),
+                clean_markdown=(
+                    _agent_source_artifact_uri(row.id, "clean_markdown")
+                    if clean_markdown_digest
+                    else ""
+                ),
+                summary=(
+                    _agent_source_artifact_uri(row.id, "summary") if summary_digest else ""
+                ),
+                rating=(
+                    _agent_source_artifact_uri(row.id, "rating") if rating_digest else ""
+                ),
+                metadata=_agent_source_artifact_uri(row.id, "metadata"),
+            ),
+            provenance=AgentSourceProvenance(
+                import_id=import_id,
+                import_type=row.import_type,
+                imported_at=row.imported_at,
+                provenance_ref=row.provenance_ref,
+                repository_path=str(self.path),
+                repository_source_id=row.repository_source_id or row.id,
+                source_document_name=row.source_document_name,
+                citation_number=row.citation_number,
+            ),
+            freshness=AgentSourceFreshness(
+                summary_stale=summary_stale,
+                rating_stale=rating_stale,
+            ),
+            phase_metadata={
+                key: value.model_copy(deep=True) for key, value in row.phase_metadata.items()
+            },
+            updated_at=_row_updated_at(row, self.path, imports=imports),
+        )
 
     def resolve_source_file(
         self,
@@ -1306,12 +1879,187 @@ class AttachedRepositoryService:
     def import_source_list(self, filename: str, content: bytes) -> RepositoryImportResponse:
         if not self.is_attached:
             raise ValueError("Attach a repository before importing")
-        parsed = parse_source_list_upload(filename=filename, content=content)
+        return self.import_seed_files([(filename, content)])
+
+    def import_seed_files(
+        self,
+        files: list[tuple[str, bytes]],
+    ) -> RepositoryImportResponse:
+        if not self.is_attached:
+            raise ValueError("Attach a repository before importing")
+
+        all_entries: list[BibliographyEntry] = []
+        provenance_parts: list[str] = []
+        for filename, content in files:
+            entries = self._extract_seed_entries_from_file(filename=filename, content=content)
+            if entries:
+                all_entries.extend(entries)
+                provenance_parts.append(Path(filename or "seed").name)
+
+        if not all_entries:
+            raise ValueError(
+                "No usable links were found. Seed uploads support .csv, .xlsx, .pdf, .docx, and .md."
+            )
+
         return self._import_entries(
-            entries=parsed.entries,
-            import_type="spreadsheet",
-            provenance_label=filename,
-            default_source_document=filename,
+            entries=all_entries,
+            import_type="source_seed",
+            provenance_label=", ".join(provenance_parts) or "seed_upload",
+            default_source_document="seed_upload",
+            write_placeholder_citations=False,
+            source_kind="url",
+        )
+
+    def import_manual_documents(
+        self,
+        files: list[tuple[str, bytes]],
+    ) -> RepositoryImportResponse:
+        if not self.is_attached:
+            raise ValueError("Attach a repository before importing")
+
+        import_id = uuid.uuid4().hex[:12]
+        imported_at = _utc_now_iso()
+        provenance_parts: list[str] = []
+
+        with self._writer_lock():
+            state = self._load_state_locked()
+            rows = _load_source_rows(state.get("sources", []))
+            citations = _load_citation_rows(state.get("citations", []))
+            imports = list(state.get("imports", []))
+            meta = self._load_meta_locked()
+            next_source_id = int(meta.get("next_source_id") or _next_source_id_from_rows(rows))
+
+            existing_by_sha = {
+                str(row.sha256 or "").strip(): row
+                for row in rows
+                if row.source_kind == "uploaded_document" and str(row.sha256 or "").strip()
+            }
+
+            accepted_new = 0
+            duplicates = 0
+            total_candidates = 0
+            document_records: list[dict[str, str]] = []
+
+            for original_filename, content in files:
+                ext = Path(original_filename or "").suffix.lower()
+                if ext not in SUPPORTED_MANUAL_SOURCE_EXTENSIONS:
+                    continue
+
+                total_candidates += 1
+                provenance_parts.append(Path(original_filename or "document").name)
+                sha256 = hashlib.sha256(content).hexdigest()
+                existing = existing_by_sha.get(sha256)
+                if existing is not None:
+                    duplicates += 1
+                    document_records.append(
+                        {
+                            "filename": Path(original_filename or "document").name,
+                            "repository_path": existing.raw_file,
+                            "sha256": sha256,
+                            "source_id": existing.id,
+                        }
+                    )
+                    continue
+
+                source_id = f"{next_source_id:06d}"
+                next_source_id += 1
+                source_name = Path(original_filename or f"{source_id}{ext}").name
+                raw_rel = _repository_source_file_path(
+                    source_id=source_id,
+                    field="raw_file",
+                    source_name=source_name,
+                )
+                raw_abs = self.path / raw_rel
+                raw_abs.parent.mkdir(parents=True, exist_ok=True)
+                raw_abs.write_bytes(content)
+
+                detected_type = _local_document_detected_type(ext)
+                title = ""
+                if ext == ".md":
+                    title = _extract_markdown_seed_title(content.decode("utf-8", errors="replace"))
+
+                row = SourceManifestRow(
+                    id=source_id,
+                    repository_source_id=source_id,
+                    source_kind="uploaded_document",
+                    import_type="document_source",
+                    imported_at=imported_at,
+                    provenance_ref=f"{import_id}:{source_name}",
+                    source_document_name=source_name,
+                    original_url="",
+                    final_url="",
+                    fetch_status="not_applicable",
+                    content_type=mimetypes.guess_type(source_name)[0] or "",
+                    detected_type=detected_type,
+                    fetch_method="local_upload",
+                    title=title,
+                    title_status="extracted" if title else "not_requested",
+                    raw_file=raw_rel.as_posix(),
+                    notes="local_document",
+                    fetched_at=imported_at,
+                    sha256=sha256,
+                )
+                self._write_repository_source_metadata(row)
+                rows.append(row)
+                existing_by_sha[sha256] = row
+                accepted_new += 1
+                document_records.append(
+                    {
+                        "filename": source_name,
+                        "repository_path": raw_rel.as_posix(),
+                        "sha256": sha256,
+                        "source_id": source_id,
+                    }
+                )
+
+            if total_candidates == 0:
+                raise ValueError(
+                    "No supported documents were provided. Use .pdf, .doc, .docx, .html, .md, .rtf, or .txt."
+                )
+
+            sorted_rows = self._sort_rows(rows)
+            self._save_state_locked(
+                sources=sorted_rows,
+                citations=citations,
+                imports=[
+                    *imports,
+                    {
+                        "import_id": import_id,
+                        "import_type": "document_source",
+                        "provenance": ", ".join(provenance_parts),
+                        "imported_at": imported_at,
+                        "total_candidates": total_candidates,
+                        "accepted_new": accepted_new,
+                        "duplicates_skipped": duplicates,
+                        "documents": document_records,
+                    },
+                ],
+            )
+            self._save_meta_locked(
+                {
+                    **meta,
+                    "schema_version": SCHEMA_VERSION,
+                    "next_source_id": next_source_id,
+                    "updated_at": _utc_now_iso(),
+                }
+            )
+            self._rebuild_outputs_locked(sorted_rows, citations)
+
+        queued_count = sum(
+            1 for row in sorted_rows if (row.fetch_status or "") in {"", "queued"}
+        )
+        return RepositoryImportResponse(
+            import_id=import_id,
+            import_type="document_source",
+            total_candidates=total_candidates,
+            accepted_new=accepted_new,
+            duplicates_skipped=duplicates,
+            total_sources=len(sorted_rows),
+            queued_count=queued_count,
+            message=(
+                f"Added {accepted_new} new repository document(s)"
+                + (f" ({duplicates} duplicate documents skipped)" if duplicates else "")
+            ),
         )
 
     def import_document(self, filename: str, content: bytes) -> RepositoryImportResponse:
@@ -1366,6 +2114,39 @@ class AttachedRepositoryService:
                 provenance_label=filename,
                 default_source_document=doc.filename,
             )
+
+    def _extract_seed_entries_from_file(
+        self,
+        *,
+        filename: str,
+        content: bytes,
+    ) -> list[BibliographyEntry]:
+        ext = Path(filename or "").suffix.lower()
+        if ext in {".csv", ".xlsx"}:
+            parsed = parse_source_list_upload(filename=filename, content=content)
+            for entry in parsed.entries:
+                if not entry.source_document_name:
+                    entry.source_document_name = Path(filename).name
+            return parsed.entries
+        if ext not in SUPPORTED_SEED_IMPORT_EXTENSIONS:
+            return []
+        if ext == ".md":
+            return _extract_seed_entries_from_markdown(
+                filename=filename,
+                text=content.decode("utf-8", errors="replace"),
+            )
+
+        with tempfile.TemporaryDirectory(prefix="repo-seed-import-") as tmp:
+            tmp_path = Path(tmp)
+            file_path = tmp_path / (Path(filename).name or f"document{ext}")
+            file_path.write_bytes(content)
+            ingestion = run_ingestion(tmp_path)
+        if not ingestion.documents:
+            return []
+        return _extract_seed_entries_from_document(
+            filename=filename,
+            document=ingestion.documents[0],
+        )
 
     def process_documents(
         self,
@@ -2933,12 +3714,16 @@ class AttachedRepositoryService:
         if not self.is_attached:
             raise ValueError("Attach a repository before running source tasks")
         run_download = bool(payload.run_download or payload.force_redownload)
+        run_convert = bool(payload.run_convert or payload.force_convert or (run_download and payload.include_markdown))
+        run_catalog = bool(payload.run_catalog or payload.force_catalog or payload.run_llm_title or payload.force_title)
         run_llm_cleanup = bool(payload.run_llm_cleanup or payload.force_llm_cleanup)
         run_llm_title = bool(payload.run_llm_title or payload.force_title)
         run_llm_summary = bool(payload.run_llm_summary or payload.force_summary)
         run_llm_rating = bool(payload.run_llm_rating or payload.force_rating)
         if not (
             run_download
+            or run_convert
+            or run_catalog
             or run_llm_cleanup
             or run_llm_title
             or run_llm_summary
@@ -2957,6 +3742,16 @@ class AttachedRepositoryService:
 
         repo_settings = settings or self.load_repo_settings()
         normalized_scope = str(payload.scope or "queued").strip().lower()
+        normalized_source_ids = _normalize_source_ids(payload.source_ids)
+        requested_limit = payload.limit
+        selected_phases = _normalize_agent_phase_names(
+            payload.selected_phases,
+            run_download=run_download,
+            run_convert=run_convert,
+            run_catalog=run_catalog,
+            run_tag=run_llm_rating,
+            run_summarize=run_llm_summary,
+        )
 
         with self._writer_lock():
             if self._download_thread and self._download_thread.is_alive():
@@ -2965,14 +3760,16 @@ class AttachedRepositoryService:
             state = self._load_state_locked()
             rows = _load_source_rows(state.get("sources", []))
             imports = list(state.get("imports", []))
-            selected_rows, selected_import_id = self._select_rows_for_scope(
+            selected_rows, selected_import_id, effective_scope = self._select_rows_for_task_request(
                 rows=rows,
                 imports=imports,
                 scope=normalized_scope,
                 import_id=payload.import_id,
+                source_ids=normalized_source_ids,
+                limit=requested_limit,
             )
             if not selected_rows:
-                raise ValueError(f"No repository rows available for scope `{normalized_scope}`.")
+                raise ValueError(f"No repository rows available for scope `{effective_scope}`.")
 
             project_profile_name, project_profile_yaml = self._load_project_profile_yaml(
                 payload.project_profile_name,
@@ -2985,9 +3782,10 @@ class AttachedRepositoryService:
                 job_id,
                 "repo_source_task_context",
                 {
-                    "scope": normalized_scope,
+                    "scope": effective_scope,
                     "import_id": selected_import_id,
                     "selected_ids": [row.id for row in selected_rows],
+                    "selected_phases": selected_phases,
                     "repository_path": str(self.path),
                 },
             )
@@ -3006,11 +3804,15 @@ class AttachedRepositoryService:
                 research_purpose=repo_settings.research_purpose,
                 fetch_delay=repo_settings.fetch_delay,
                 run_download=run_download,
+                run_convert=run_convert,
+                run_catalog=run_catalog,
                 run_llm_cleanup=run_llm_cleanup,
                 run_llm_title=run_llm_title,
                 run_llm_summary=run_llm_summary,
                 run_llm_rating=run_llm_rating,
                 force_redownload=payload.force_redownload,
+                force_convert=payload.force_convert,
+                force_catalog=payload.force_catalog or payload.force_title,
                 force_llm_cleanup=payload.force_llm_cleanup,
                 force_title=payload.force_title,
                 force_summary=payload.force_summary,
@@ -3027,8 +3829,9 @@ class AttachedRepositoryService:
                 output_dir=self.path,
                 writes_to_repository=True,
                 repository_path=str(self.path),
-                selected_scope=normalized_scope,
+                selected_scope=effective_scope,
                 selected_import_id=selected_import_id,
+                selected_phases=selected_phases,
                 row_persist_callback=self._persist_source_task_row,
             )
 
@@ -3048,7 +3851,7 @@ class AttachedRepositoryService:
             return RepositorySourceTaskResponse(
                 job_id=job_id,
                 status="started",
-                scope=normalized_scope,
+                scope=effective_scope,
                 import_id=selected_import_id,
                 total_urls=len(selected_rows),
                 message=self._download_message,
@@ -3572,6 +4375,39 @@ class AttachedRepositoryService:
         selected = [row for row in ordered_rows if (row.provenance_ref or "").startswith(prefix)]
         return selected, normalized_import_id
 
+    def _select_rows_for_task_request(
+        self,
+        *,
+        rows: list[SourceManifestRow],
+        imports: list[dict[str, Any]],
+        scope: str,
+        import_id: str,
+        source_ids: set[str] | None = None,
+        limit: int | None = None,
+    ) -> tuple[list[SourceManifestRow], str, str]:
+        normalized_source_ids = source_ids or set()
+        if normalized_source_ids:
+            ordered_rows = self._sort_rows(rows)
+            selected_rows = [row for row in ordered_rows if row.id in normalized_source_ids]
+            missing = sorted(normalized_source_ids.difference({row.id for row in selected_rows}))
+            if missing:
+                raise ValueError(f"Unknown source_ids: {', '.join(missing[:20])}")
+            effective_scope = "source_ids"
+            selected_import_id = ""
+        else:
+            selected_rows, selected_import_id = self._select_rows_for_scope(
+                rows=rows,
+                imports=imports,
+                scope=scope,
+                import_id=import_id,
+            )
+            effective_scope = scope
+
+        safe_limit = max(1, min(int(limit), 500)) if limit is not None else None
+        if safe_limit is not None:
+            selected_rows = selected_rows[:safe_limit]
+        return selected_rows, selected_import_id, effective_scope
+
     def _build_export_job_bibliography(
         self,
         rows: list[SourceManifestRow],
@@ -3928,6 +4764,7 @@ class AttachedRepositoryService:
         origin_root: Path,
     ) -> None:
         target.repository_source_id = target.id
+        target.source_kind = source_row.source_kind or target.source_kind or "url"
         target.source_document_name = source_row.source_document_name or target.source_document_name
         target.citation_number = source_row.citation_number or target.citation_number
         target.original_url = source_row.original_url or target.original_url
@@ -3939,6 +4776,12 @@ class AttachedRepositoryService:
         target.fetch_method = source_row.fetch_method
         target.title = source_row.title
         target.title_status = source_row.title_status
+        target.author_names = source_row.author_names
+        target.publication_date = source_row.publication_date
+        target.publication_year = source_row.publication_year
+        target.document_type = source_row.document_type
+        target.organization_name = source_row.organization_name
+        target.organization_type = source_row.organization_type
         target.notes = source_row.notes
         target.error_message = source_row.error_message
         target.fetched_at = source_row.fetched_at or _utc_now_iso()
@@ -3948,8 +4791,10 @@ class AttachedRepositoryService:
         target.markdown_char_count = source_row.markdown_char_count
         target.llm_cleanup_needed = source_row.llm_cleanup_needed
         target.llm_cleanup_status = source_row.llm_cleanup_status
+        target.catalog_status = source_row.catalog_status
         target.summary_status = source_row.summary_status
         target.rating_status = source_row.rating_status
+        target.tags_text = source_row.tags_text
         self._copy_repository_artifacts_from_origin(
             target_id=target.id,
             source_row=target,
@@ -4423,6 +5268,7 @@ class AttachedRepositoryService:
         output_dir: Path,
     ) -> None:
         target.repository_source_id = target.id
+        target.source_kind = downloaded.source_kind or target.source_kind or "url"
         target.final_url = downloaded.final_url
         target.fetch_status = downloaded.fetch_status
         target.http_status = downloaded.http_status
@@ -4431,6 +5277,12 @@ class AttachedRepositoryService:
         target.fetch_method = downloaded.fetch_method
         target.title = downloaded.title
         target.title_status = downloaded.title_status
+        target.author_names = downloaded.author_names
+        target.publication_date = downloaded.publication_date
+        target.publication_year = downloaded.publication_year
+        target.document_type = downloaded.document_type
+        target.organization_name = downloaded.organization_name
+        target.organization_type = downloaded.organization_type
         target.notes = downloaded.notes
         target.error_message = downloaded.error_message
         target.fetched_at = downloaded.fetched_at or _utc_now_iso()
@@ -4440,8 +5292,10 @@ class AttachedRepositoryService:
         target.markdown_char_count = downloaded.markdown_char_count
         target.llm_cleanup_needed = downloaded.llm_cleanup_needed
         target.llm_cleanup_status = downloaded.llm_cleanup_status
+        target.catalog_status = downloaded.catalog_status
         target.summary_status = downloaded.summary_status
         target.rating_status = downloaded.rating_status
+        target.tags_text = downloaded.tags_text
 
         for field in FILE_FIELDS:
             if field == "metadata_file":
@@ -4473,6 +5327,9 @@ class AttachedRepositoryService:
         import_type: str,
         provenance_label: str,
         default_source_document: str,
+        *,
+        write_placeholder_citations: bool = True,
+        source_kind: str = "url",
     ) -> RepositoryImportResponse:
         import_id = uuid.uuid4().hex[:12]
         imported_at = _utc_now_iso()
@@ -4510,16 +5367,17 @@ class AttachedRepositoryService:
                     duplicates += 1
                     if not existing.title and entry.title:
                         existing.title = entry.title
-                    citations.append(
-                        self._placeholder_citation_row(
-                            entry=entry,
-                            source_id=existing.id,
-                            import_type=import_type,
-                            imported_at=imported_at,
-                            provenance_ref=f"{import_id}:{provenance_label}",
-                            default_source_document=default_source_document,
+                    if write_placeholder_citations:
+                        citations.append(
+                            self._placeholder_citation_row(
+                                entry=entry,
+                                source_id=existing.id,
+                                import_type=import_type,
+                                imported_at=imported_at,
+                                provenance_ref=f"{import_id}:{provenance_label}",
+                                default_source_document=default_source_document,
+                            )
                         )
-                    )
                     continue
 
                 source_id = f"{next_source_id:06d}"
@@ -4528,6 +5386,7 @@ class AttachedRepositoryService:
                 row = SourceManifestRow(
                     id=source_id,
                     repository_source_id=source_id,
+                    source_kind=source_kind,
                     import_type=import_type,
                     imported_at=imported_at,
                     provenance_ref=f"{import_id}:{provenance_label}",
@@ -4542,16 +5401,17 @@ class AttachedRepositoryService:
                 by_key[dedupe_key] = row
                 accepted_new += 1
 
-                citations.append(
-                    self._placeholder_citation_row(
-                        entry=entry,
-                        source_id=source_id,
-                        import_type=import_type,
-                        imported_at=imported_at,
-                        provenance_ref=f"{import_id}:{provenance_label}",
-                        default_source_document=default_source_document,
+                if write_placeholder_citations:
+                    citations.append(
+                        self._placeholder_citation_row(
+                            entry=entry,
+                            source_id=source_id,
+                            import_type=import_type,
+                            imported_at=imported_at,
+                            provenance_ref=f"{import_id}:{provenance_label}",
+                            default_source_document=default_source_document,
+                        )
                     )
-                )
 
             deduped_citations = self._dedupe_citations(citations)
             sorted_rows = self._sort_rows(rows)
@@ -4718,11 +5578,10 @@ class AttachedRepositoryService:
                 row.imported_at = row.fetched_at or _utc_now_iso()
             if not row.provenance_ref:
                 row.provenance_ref = "legacy_scan"
+            if not row.source_kind:
+                row.source_kind = "url"
 
-            url = row.original_url or row.final_url
-            key = repository_dedupe_key(url)
-            if not key:
-                key = dedupe_url_key(url)
+            key = _source_row_identity_key(row)
             if not key:
                 continue
 
@@ -5034,6 +5893,11 @@ class AttachedRepositoryService:
         suggestions_path = self._internal_dir() / INGESTION_PROFILE_SUGGESTIONS_FILE_NAME
         if not suggestions_path.exists():
             suggestions_path.write_text("[]\n", encoding="utf-8")
+        if not self._agent_idempotency_path().exists():
+            self._agent_idempotency_path().write_text("{}\n", encoding="utf-8")
+        self._load_agent_tokens_locked()
+        if not self._agent_resources_path().exists():
+            self._agent_resources_path().write_text("[]\n", encoding="utf-8")
 
         if not self.manifest_csv_path().exists():
             self.manifest_csv_path().write_text(
@@ -5054,6 +5918,7 @@ class AttachedRepositoryService:
                 write_csv(empty_citations),
                 encoding="utf-8-sig",
             )
+        self._refresh_agent_resource_index_locked()
 
     def _default_meta(self) -> dict[str, Any]:
         now = _utc_now_iso()
@@ -5172,8 +6037,270 @@ class AttachedRepositoryService:
     def _backups_dir(self) -> Path:
         return self._internal_dir() / "backups"
 
+    def _agent_resources_path(self) -> Path:
+        return self._internal_dir() / AGENT_RESOURCES_FILE_NAME
+
+    def _agent_tokens_path(self) -> Path:
+        return self._internal_dir() / AGENT_TOKENS_FILE_NAME
+
+    def _agent_idempotency_path(self) -> Path:
+        return self._internal_dir() / AGENT_IDEMPOTENCY_FILE_NAME
+
+    def _agent_audit_path(self) -> Path:
+        return self._internal_dir() / AGENT_AUDIT_FILE_NAME
+
     def _repo_jobs_dir(self) -> Path:
         return self._internal_dir() / REPO_JOBS_DIR_NAME
+
+    def _load_agent_tokens_locked(self) -> dict[str, str]:
+        path = self._agent_tokens_path()
+        raw: dict[str, Any] = {}
+        if path.exists():
+            try:
+                parsed = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    raw = parsed
+            except Exception:
+                raw = {}
+
+        read_token = str(raw.get("read_token") or "").strip()
+        write_token = str(raw.get("write_token") or "").strip()
+        updated = False
+        if not read_token:
+            read_token = f"ra-read-{uuid.uuid4().hex}"
+            updated = True
+        if not write_token:
+            write_token = f"ra-write-{uuid.uuid4().hex}"
+            updated = True
+        if updated or not path.exists():
+            payload = {
+                "read_token": read_token,
+                "write_token": write_token,
+            }
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        return {"read_token": read_token, "write_token": write_token}
+
+    def load_agent_tokens(self) -> dict[str, str]:
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+        with self._writer_lock():
+            self._ensure_scaffold_locked()
+            return self._load_agent_tokens_locked()
+
+    def _load_agent_idempotency_locked(self) -> dict[str, dict[str, str]]:
+        path = self._agent_idempotency_path()
+        if not path.exists():
+            return {}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        data: dict[str, dict[str, str]] = {}
+        for key, value in raw.items():
+            if not isinstance(value, dict):
+                continue
+            data[str(key)] = {
+                "request_fingerprint": str(value.get("request_fingerprint") or "").strip(),
+                "run_id": str(value.get("run_id") or "").strip(),
+            }
+        return data
+
+    def _save_agent_idempotency_locked(self, payload: dict[str, dict[str, str]]) -> None:
+        self._agent_idempotency_path().write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def resolve_agent_idempotency(
+        self,
+        idempotency_key: str,
+        request_fingerprint: str,
+    ) -> str:
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+        normalized_key = str(idempotency_key or "").strip()
+        if not normalized_key:
+            return ""
+        with self._writer_lock():
+            self._ensure_scaffold_locked()
+            stored = self._load_agent_idempotency_locked()
+            entry = stored.get(normalized_key)
+            if not entry:
+                return ""
+            stored_fingerprint = str(entry.get("request_fingerprint") or "").strip()
+            if stored_fingerprint and stored_fingerprint != request_fingerprint:
+                raise ValueError(
+                    "Idempotency key already exists for a different request payload."
+                )
+            return str(entry.get("run_id") or "").strip()
+
+    def remember_agent_idempotency(
+        self,
+        idempotency_key: str,
+        request_fingerprint: str,
+        run_id: str,
+    ) -> None:
+        normalized_key = str(idempotency_key or "").strip()
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_key or not normalized_run_id:
+            return
+        with self._writer_lock():
+            self._ensure_scaffold_locked()
+            stored = self._load_agent_idempotency_locked()
+            stored[normalized_key] = {
+                "request_fingerprint": request_fingerprint,
+                "run_id": normalized_run_id,
+            }
+            self._save_agent_idempotency_locked(stored)
+
+    def append_agent_audit_record(self, payload: dict[str, Any]) -> None:
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+        with self._writer_lock():
+            self._ensure_scaffold_locked()
+            with self._agent_audit_path().open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    def _save_agent_resources_locked(self, resources: list[AgentResourceRecord]) -> None:
+        self._agent_resources_path().write_text(
+            json.dumps(
+                [resource.model_dump(mode="json") for resource in resources],
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    def _load_agent_resources_locked(self) -> list[AgentResourceRecord]:
+        path = self._agent_resources_path()
+        if not path.exists():
+            return []
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        if not isinstance(raw, list):
+            return []
+        resources: list[AgentResourceRecord] = []
+        for item in raw:
+            try:
+                resources.append(AgentResourceRecord.model_validate(item))
+            except Exception:
+                continue
+        return resources
+
+    def refresh_agent_resource_index(self) -> list[AgentResourceRecord]:
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+        with self._writer_lock():
+            self._ensure_scaffold_locked()
+            return self._refresh_agent_resource_index_locked()
+
+    def _refresh_agent_resource_index_locked(self) -> list[AgentResourceRecord]:
+        if not self.is_attached:
+            return []
+
+        candidates: list[tuple[str, Path]] = []
+        root_memory = self.path / "CLAUDE.md"
+        if root_memory.is_file():
+            candidates.append(("memory", root_memory))
+
+        candidates.extend(
+            ("skill", path)
+            for path in sorted((self.path / ".claude" / "agents").glob("*.md"))
+            if path.is_file()
+        )
+        candidates.extend(
+            ("memory", path)
+            for path in sorted((self.path / ".researchassistant" / "memory").glob("*.md"))
+            if path.is_file()
+        )
+        candidates.extend(
+            ("skill", path)
+            for path in sorted((self.path / ".researchassistant" / "skills").glob("*.md"))
+            if path.is_file()
+        )
+        candidates.extend(
+            ("rubric", path)
+            for path in sorted(self.project_profiles_dir.glob("*.y*ml"))
+            if path.is_file()
+        )
+
+        resources: list[AgentResourceRecord] = []
+        for kind, source_path in candidates:
+            try:
+                content = source_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            relative_path = source_path.relative_to(self.path).as_posix()
+            title, tags, description = _derive_agent_resource_metadata(
+                source_path=source_path,
+                content=content,
+                kind=kind,
+            )
+            content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            last_modified = _path_mtime_iso(source_path)
+            stable_key = f"{kind}:{relative_path}"
+            resource_id = hashlib.sha1(stable_key.encode("utf-8")).hexdigest()[:16]
+            resources.append(
+                AgentResourceRecord(
+                    resource_id=resource_id,
+                    kind=kind,
+                    path=relative_path,
+                    title=title,
+                    tags=tags,
+                    last_modified_at=last_modified,
+                    short_description=description,
+                    content_hash=content_hash,
+                    mime_type=(
+                        "application/yaml"
+                        if source_path.suffix.lower() in {".yaml", ".yml"}
+                        else "text/markdown"
+                    ),
+                )
+            )
+
+        resources = sorted(
+            resources,
+            key=lambda item: (item.kind, item.title.lower(), item.path.lower()),
+        )
+        self._save_agent_resources_locked(resources)
+        return resources
+
+    def list_agent_resources(self) -> list[AgentResourceRecord]:
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+        with self._writer_lock():
+            self._ensure_scaffold_locked()
+            return self._refresh_agent_resource_index_locked()
+
+    def get_agent_resource(self, resource_id: str) -> AgentResourceContent:
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+        normalized_id = str(resource_id or "").strip()
+        if not normalized_id:
+            raise ValueError("resource_id is required")
+
+        with self._writer_lock():
+            self._ensure_scaffold_locked()
+            resources = self._refresh_agent_resource_index_locked()
+            resource = next(
+                (item for item in resources if item.resource_id == normalized_id),
+                None,
+            )
+        if resource is None:
+            raise ValueError(f"Unknown resource_id: {normalized_id}")
+
+        abs_path = self.path / Path(resource.path)
+        if not abs_path.is_file():
+            raise ValueError(f"Resource file not found: {resource.path}")
+        content = abs_path.read_text(encoding="utf-8", errors="replace")
+        return AgentResourceContent(resource=resource, content=content)
 
     @contextmanager
     def _writer_lock(self):
@@ -5317,6 +6444,7 @@ def _repository_source_file_headers(path: Path) -> dict[str, str]:
 def _manifest_column_label(value: str) -> str:
     overrides = {
         "id": "ID",
+        "source_kind": "Source Kind",
         "original_url": "Original URL",
         "final_url": "Final URL",
         "canonical_url": "Canonical URL",
@@ -5325,6 +6453,15 @@ def _manifest_column_label(value: str) -> str:
         "llm_cleanup_needed": "LLM Cleanup Needed",
         "llm_cleanup_file": "LLM Cleanup File",
         "llm_cleanup_status": "LLM Cleanup Status",
+        "catalog_file": "Catalog File",
+        "catalog_status": "Catalog Status",
+        "author_names": "Authors",
+        "publication_date": "Publication Date",
+        "publication_year": "Publication Year",
+        "document_type": "Document Type",
+        "organization_name": "Organization",
+        "organization_type": "Organization Type",
+        "tags_text": "Tags",
         "sha256": "SHA256",
     }
     if value in overrides:
@@ -5583,6 +6720,215 @@ def _document_citation_provenance(
     )
 
 
+def _extract_seed_entries_from_markdown(
+    *,
+    filename: str,
+    text: str,
+) -> list[BibliographyEntry]:
+    source_name = Path(filename or "seed.md").name
+    front_matter = _parse_simple_front_matter(text)
+    default_title = str(front_matter.get("title") or "").strip()
+    entries: list[BibliographyEntry] = []
+    seen_keys: set[str] = set()
+    next_ref = 1
+    lines = text.splitlines()
+
+    markdown_link_pattern = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
+    bare_url_pattern = re.compile(r"(?P<url>https?://[^\s<>()]+|www\.[^\s<>()]+)")
+
+    for line in lines:
+        link_matches = list(markdown_link_pattern.finditer(line))
+        for match in link_matches:
+            raw_url = match.group(2)
+            clean_url = clean_url_candidate(raw_url)
+            if not clean_url:
+                continue
+            dedupe_key = repository_dedupe_key(clean_url) or dedupe_url_key(clean_url) or clean_url
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+            link_text = re.sub(r"\s+", " ", match.group(1)).strip()
+            title = link_text if link_text and link_text != clean_url else ""
+            entries.append(
+                BibliographyEntry(
+                    ref_number=next_ref,
+                    raw_text=line.strip() or clean_url,
+                    source_document_name=source_name,
+                    title=title or default_title,
+                    url=clean_url,
+                    parse_confidence=1.0,
+                    parse_warnings=[],
+                    repair_method="seed_markdown",
+                )
+            )
+            next_ref += 1
+
+        stripped_for_bare = markdown_link_pattern.sub(" ", line)
+        for match in bare_url_pattern.finditer(stripped_for_bare):
+            raw_url = match.group("url")
+            clean_url = clean_url_candidate(raw_url)
+            if not clean_url:
+                continue
+            dedupe_key = repository_dedupe_key(clean_url) or dedupe_url_key(clean_url) or clean_url
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+            title = _derive_seed_entry_title_from_line(line=line, url=clean_url)
+            entries.append(
+                BibliographyEntry(
+                    ref_number=next_ref,
+                    raw_text=line.strip() or clean_url,
+                    source_document_name=source_name,
+                    title=title or default_title,
+                    url=clean_url,
+                    parse_confidence=1.0,
+                    parse_warnings=[],
+                    repair_method="seed_markdown",
+                )
+            )
+            next_ref += 1
+
+    return entries
+
+
+def _extract_seed_entries_from_document(
+    *,
+    filename: str,
+    document: IngestedDocument,
+) -> list[BibliographyEntry]:
+    source_name = Path(filename or document.filename or "seed").name
+    lines = [block.text.strip() for block in document.blocks if str(block.text or "").strip()]
+    text = document.full_text or "\n".join(lines)
+    entries: list[BibliographyEntry] = []
+    seen_keys: set[str] = set()
+    next_ref = 1
+
+    for raw_url in document.inline_citation_urls.values():
+        clean_url = clean_url_candidate(raw_url)
+        if not clean_url:
+            continue
+        dedupe_key = repository_dedupe_key(clean_url) or dedupe_url_key(clean_url) or clean_url
+        if dedupe_key in seen_keys:
+            continue
+        seen_keys.add(dedupe_key)
+        title = _derive_seed_entry_title_from_context(lines=lines, url=clean_url)
+        entries.append(
+            BibliographyEntry(
+                ref_number=next_ref,
+                raw_text=clean_url,
+                source_document_name=source_name,
+                title=title,
+                url=clean_url,
+                parse_confidence=1.0,
+                parse_warnings=[],
+                repair_method="seed_document",
+            )
+        )
+        next_ref += 1
+
+    bare_url_pattern = re.compile(r"(?P<url>https?://[^\s<>()]+|www\.[^\s<>()]+)")
+    for line in text.splitlines():
+        for match in bare_url_pattern.finditer(line):
+            raw_url = match.group("url")
+            clean_url = clean_url_candidate(raw_url)
+            if not clean_url:
+                continue
+            dedupe_key = repository_dedupe_key(clean_url) or dedupe_url_key(clean_url) or clean_url
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+            entries.append(
+                BibliographyEntry(
+                    ref_number=next_ref,
+                    raw_text=line.strip() or clean_url,
+                    source_document_name=source_name,
+                    title=_derive_seed_entry_title_from_line(line=line, url=clean_url),
+                    url=clean_url,
+                    parse_confidence=1.0,
+                    parse_warnings=[],
+                    repair_method="seed_document",
+                )
+            )
+            next_ref += 1
+
+    return entries
+
+
+def _derive_seed_entry_title_from_context(
+    *,
+    lines: list[str],
+    url: str,
+) -> str:
+    for line in lines:
+        if url not in line:
+            continue
+        title = _derive_seed_entry_title_from_line(line=line, url=url)
+        if title:
+            return title
+    return ""
+
+
+def _derive_seed_entry_title_from_line(*, line: str, url: str) -> str:
+    stripped = str(line or "").strip()
+    if not stripped:
+        return ""
+    candidate = stripped.replace(url, " ")
+    candidate = re.sub(r"\[[^\]]+\]\((?:https?://[^)\s]+)\)", " ", candidate)
+    candidate = re.sub(r"\s+", " ", candidate)
+    candidate = candidate.strip(" -:|,.;[]()")
+    if not candidate:
+        return ""
+    if len(candidate) > 240:
+        candidate = candidate[:240].rstrip(" ,.;:-")
+    if re.fullmatch(r"https?://.+", candidate):
+        return ""
+    return candidate
+
+
+def _local_document_detected_type(ext: str) -> str:
+    normalized = str(ext or "").strip().lower()
+    if normalized == ".pdf":
+        return "pdf"
+    if normalized in {".html", ".htm"}:
+        return "html"
+    if normalized in {".doc", ".docx", ".md", ".rtf", ".txt"}:
+        return "document"
+    return "unsupported"
+
+
+def _extract_markdown_seed_title(text: str) -> str:
+    front_matter = _parse_simple_front_matter(text)
+    title = str(front_matter.get("title") or "").strip()
+    if title:
+        return title
+    return _extract_markdown_title(text)
+
+
+def _source_row_identity_key(row: SourceManifestRow) -> str:
+    source_kind = str(row.source_kind or "").strip().lower() or "url"
+    if source_kind == "uploaded_document":
+        sha256 = str(row.sha256 or "").strip().lower()
+        if sha256:
+            return f"uploaded_document:sha256:{sha256}"
+        source_id = str(row.repository_source_id or row.id or "").strip()
+        if source_id:
+            return f"uploaded_document:id:{source_id}"
+        raw_file = str(row.raw_file or "").strip().lower()
+        if raw_file:
+            return f"uploaded_document:file:{raw_file}"
+        return ""
+
+    candidate_url = row.original_url or row.final_url
+    dedupe_key = repository_dedupe_key(candidate_url)
+    if dedupe_key:
+        return f"url:{dedupe_key}"
+    fallback = dedupe_url_key(candidate_url)
+    if fallback:
+        return f"url:{fallback}"
+    source_id = str(row.repository_source_id or row.id or "").strip()
+    return f"url:id:{source_id}" if source_id else ""
+
+
 def _repository_source_file_path(
     source_id: str,
     field: str,
@@ -5627,6 +6973,8 @@ def _load_citation_rows(payload: list[Any]) -> list[ExportRow]:
 
 def _safe_manifest_row(payload: dict[str, Any]) -> SourceManifestRow | None:
     try:
+        if not str(payload.get("source_kind") or "").strip():
+            payload["source_kind"] = "url"
         if payload.get("http_status") in {"", None}:
             payload["http_status"] = None
         else:
@@ -5740,3 +7088,531 @@ def _relative_or_absolute(root: Path, path: Path) -> str:
         return str(path.resolve().relative_to(root.resolve()))
     except Exception:
         return str(path)
+
+
+def _normalize_agent_phase_names(
+    values: list[str] | tuple[str, ...] | set[str] | Any,
+    *,
+    run_download: bool = False,
+    run_convert: bool = False,
+    run_catalog: bool = False,
+    run_tag: bool = False,
+    run_summarize: bool = False,
+) -> list[str]:
+    allowed = {"fetch", "convert", "catalog", "tag", "summarize"}
+    normalized: list[str] = []
+    seen: set[str] = set()
+    if isinstance(values, (list, tuple, set)):
+        for item in values:
+            phase = str(item or "").strip().lower()
+            if phase not in allowed or phase in seen:
+                continue
+            seen.add(phase)
+            normalized.append(phase)
+    if normalized:
+        return normalized
+
+    defaults: list[str] = []
+    if run_download:
+        defaults.append("fetch")
+    if run_convert:
+        defaults.append("convert")
+    if run_catalog:
+        defaults.append("catalog")
+    if run_tag:
+        defaults.append("tag")
+    if run_summarize:
+        defaults.append("summarize")
+    return defaults
+
+
+def _encode_agent_offset_cursor(offset: int) -> str:
+    payload = json.dumps({"offset": max(0, int(offset))}, separators=(",", ":"))
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
+
+
+def _decode_agent_offset_cursor(cursor: str) -> int:
+    normalized = str(cursor or "").strip()
+    if not normalized:
+        return 0
+    try:
+        padding = "=" * (-len(normalized) % 4)
+        raw = base64.urlsafe_b64decode((normalized + padding).encode("ascii")).decode(
+            "utf-8"
+        )
+        parsed = json.loads(raw)
+    except Exception as exc:
+        raise ValueError("Invalid cursor.") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("Invalid cursor.")
+    offset = parsed.get("offset")
+    if not isinstance(offset, int) or offset < 0:
+        raise ValueError("Invalid cursor.")
+    return offset
+
+
+def _coerce_optional_float(value: Any) -> float | None:
+    if value in {"", None}:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _file_sha256(path: Path | None) -> str:
+    if path is None or not path.is_file():
+        return ""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _phase_is_stale(metadata: SourcePhaseMetadata | None, current_digest: str) -> bool:
+    if metadata is None:
+        return False
+    if metadata.stale:
+        return True
+    reference_digest = str(metadata.content_digest or "").strip()
+    return bool(reference_digest and current_digest and reference_digest != current_digest)
+
+
+def _agent_source_artifact_uri(source_id: str, kind: str) -> str:
+    return f"repo://sources/{source_id}/{kind}"
+
+
+def _row_import_id(row: SourceManifestRow) -> str:
+    prefix = str(row.provenance_ref or "").split(":", 1)[0].strip()
+    if not prefix:
+        return ""
+    if prefix.lower() in {"merge", "document", "repository", "scan", "manual"}:
+        return ""
+    if "/" in prefix or prefix.startswith("http"):
+        return ""
+    return prefix
+
+
+def _row_updated_at(
+    row: SourceManifestRow,
+    base_dir: Path,
+    *,
+    imports: list[dict[str, Any]] | None = None,
+) -> str:
+    candidates: list[str] = [str(row.fetched_at or "").strip(), str(row.imported_at or "").strip()]
+    for field_name in (
+        "metadata_file",
+        "rating_file",
+        "summary_file",
+        "llm_cleanup_file",
+        "markdown_file",
+        "rendered_file",
+        "rendered_pdf_file",
+        "raw_file",
+    ):
+        rel_value = str(getattr(row, field_name) or "").strip()
+        if not rel_value:
+            continue
+        path = Path(rel_value)
+        full_path = path if path.is_absolute() else base_dir / path
+        if full_path.is_file():
+            candidates.append(_path_mtime_iso(full_path))
+
+    normalized_candidates = [item for item in candidates if item]
+    if imports:
+        import_id = _row_import_id(row)
+        if import_id:
+            matching = next(
+                (
+                    item
+                    for item in imports
+                    if str(item.get("import_id") or "").strip() == import_id
+                ),
+                None,
+            )
+            if matching is not None:
+                imported_at = str(matching.get("imported_at") or "").strip()
+                if imported_at:
+                    normalized_candidates.append(imported_at)
+    return max(normalized_candidates) if normalized_candidates else ""
+
+
+def _agent_fetch_status(row: SourceManifestRow) -> str:
+    metadata = row.phase_metadata.get("fetch")
+    if metadata is not None and metadata.status:
+        return metadata.status
+    status = str(row.fetch_status or "").strip().lower()
+    if status in {"success", "completed"}:
+        return "completed"
+    if status in {"partial", "failed", "queued"}:
+        return status
+    return "pending"
+
+
+def _agent_phase_status(row: SourceManifestRow, phase: str) -> str:
+    metadata = row.phase_metadata.get(phase)
+    if metadata is not None and metadata.status:
+        return metadata.status
+
+    if phase == "convert":
+        cleanup_status = str(row.llm_cleanup_status or "").strip().lower()
+        if cleanup_status == "failed":
+            return "failed"
+        if row.llm_cleanup_file or row.markdown_file:
+            return "completed"
+        return "pending"
+
+    if phase == "catalog":
+        status = str(row.catalog_status or "").strip().lower()
+        if status in {"generated", "existing", "completed"}:
+            return "completed"
+        if status in {"failed", "missing_markdown"}:
+            return "failed"
+        if status == "stale":
+            return "stale"
+        if status in {"skipped", "not_applicable"}:
+            return "skipped"
+        return "pending"
+
+    if phase == "summarize":
+        status = str(row.summary_status or "").strip().lower()
+        if status in {"generated", "existing", "completed"}:
+            return "completed"
+        if status in {"failed", "missing_markdown"}:
+            return "failed"
+        if status == "stale":
+            return "stale"
+        if status == "skipped":
+            return "skipped"
+        return "pending"
+
+    if phase == "tag":
+        status = str(row.rating_status or "").strip().lower()
+        if status in {"generated", "existing", "completed"}:
+            return "completed"
+        if status in {"failed", "missing_markdown"}:
+            return "failed"
+        if status == "stale":
+            return "stale"
+        if status == "skipped":
+            return "skipped"
+        return "pending"
+
+    return _agent_fetch_status(row)
+
+
+def _sort_agent_source_records(
+    records: list[tuple[AgentSourceRecord, dict[str, Any]]],
+    *,
+    sort_by: str,
+    sort_dir: str,
+) -> list[tuple[AgentSourceRecord, dict[str, Any]]]:
+    def sort_value(item: tuple[AgentSourceRecord, dict[str, Any]]) -> Any:
+        record = item[0]
+        if sort_by == "rating_overall":
+            return record.rating_overall
+        if sort_by == "updated_at":
+            return record.updated_at
+        if sort_by == "title":
+            return record.title.lower()
+        return record.source_id.lower()
+
+    present: list[tuple[AgentSourceRecord, dict[str, Any]]] = []
+    missing: list[tuple[AgentSourceRecord, dict[str, Any]]] = []
+    for item in records:
+        value = sort_value(item)
+        if value in {"", None}:
+            missing.append(item)
+        else:
+            present.append(item)
+
+    present = sorted(present, key=lambda item: item[0].source_id.lower())
+    missing = sorted(missing, key=lambda item: item[0].source_id.lower())
+    present = sorted(
+        present,
+        key=sort_value,
+        reverse=(sort_dir == "desc"),
+    )
+    return present + missing
+
+
+def _normalize_phase_outcome(status: str) -> str:
+    normalized = str(status or "").strip().lower()
+    if normalized in {"completed", "success", "generated", "existing"}:
+        return "success"
+    if normalized in {"failed", "missing_markdown"}:
+        return "failed"
+    if normalized in {"partial", "stale"}:
+        return "partial"
+    if normalized in {"skipped", "not_requested"}:
+        return "skipped"
+    return "pending"
+
+
+def _build_agent_run_counts(
+    *,
+    rows: list[SourceManifestRow],
+    selected_phases: list[str],
+    fallback_status: SourceDownloadStatus | None,
+) -> AgentRunCounts:
+    total = len(rows) if rows else int(getattr(fallback_status, "total_urls", 0) or 0)
+    if not rows:
+        return AgentRunCounts(
+            total=total,
+            processed=int(getattr(fallback_status, "processed_urls", 0) or 0),
+            success=int(getattr(fallback_status, "success_count", 0) or 0),
+            failed=int(getattr(fallback_status, "failed_count", 0) or 0),
+            partial=int(getattr(fallback_status, "partial_count", 0) or 0),
+            skipped=int(getattr(fallback_status, "skipped_count", 0) or 0),
+        )
+
+    success = 0
+    failed = 0
+    partial = 0
+    skipped = 0
+    processed = 0
+    phases = selected_phases or ["fetch"]
+
+    for row in rows:
+        outcomes = [
+            _normalize_phase_outcome(
+                _agent_fetch_status(row) if phase == "fetch" else _agent_phase_status(row, phase)
+            )
+            for phase in phases
+        ]
+        if any(item == "failed" for item in outcomes):
+            failed += 1
+            processed += 1
+            continue
+        if any(item == "partial" for item in outcomes):
+            partial += 1
+            processed += 1
+            continue
+        if all(item == "skipped" for item in outcomes):
+            skipped += 1
+            processed += 1
+            continue
+        if all(item == "success" for item in outcomes):
+            success += 1
+            processed += 1
+            continue
+
+    if fallback_status is not None:
+        processed = max(processed, int(fallback_status.processed_urls or 0))
+        total = max(total, int(fallback_status.total_urls or 0))
+        skipped = max(skipped, int(fallback_status.skipped_count or 0))
+    return AgentRunCounts(
+        total=total,
+        processed=processed,
+        success=success,
+        failed=failed,
+        partial=partial,
+        skipped=skipped,
+    )
+
+
+def _build_pending_source_status(
+    *,
+    job_id: str,
+    store: FileStore,
+    orchestrator: SourceDownloadOrchestrator,
+) -> SourceDownloadStatus:
+    bibliography = store.load_artifact(job_id, "03_bibliography") or {}
+    if getattr(orchestrator, "target_rows", None):
+        pending_total = len(getattr(orchestrator, "target_rows", []))
+    else:
+        pending_total = len(
+            [entry for entry in bibliography.get("entries", []) if isinstance(entry, dict)]
+        )
+    phase_states = {
+        key: value.model_copy(deep=True)
+        for key, value in getattr(orchestrator, "_phase_states", {}).items()
+    }
+    return SourceDownloadStatus(
+        job_id=job_id,
+        state="cancelling" if getattr(orchestrator, "cancel_requested", False) else "running",
+        total_urls=pending_total,
+        processed_urls=0,
+        cancel_requested=bool(getattr(orchestrator, "cancel_requested", False)),
+        cancel_requested_at=None,
+        stop_after_current_item=False,
+        message=(
+            "Stop requested | stopping before the next item"
+            if getattr(orchestrator, "cancel_requested", False)
+            else "Preparing source task run..."
+        ),
+        run_download=bool(getattr(orchestrator, "run_download", False)),
+        run_convert=bool(getattr(orchestrator, "run_convert", False)),
+        run_catalog=bool(getattr(orchestrator, "run_catalog", False)),
+        run_llm_cleanup=bool(getattr(orchestrator, "run_llm_cleanup", False)),
+        run_llm_title=bool(getattr(orchestrator, "run_llm_title", False)),
+        run_llm_summary=bool(getattr(orchestrator, "run_llm_summary", False)),
+        run_llm_rating=bool(getattr(orchestrator, "run_llm_rating", False)),
+        force_redownload=bool(getattr(orchestrator, "force_redownload", False)),
+        force_convert=bool(getattr(orchestrator, "force_convert", False)),
+        force_catalog=bool(getattr(orchestrator, "force_catalog", False)),
+        force_llm_cleanup=bool(getattr(orchestrator, "force_llm_cleanup", False)),
+        force_title=bool(getattr(orchestrator, "force_title", False)),
+        force_summary=bool(getattr(orchestrator, "force_summary", False)),
+        force_rating=bool(getattr(orchestrator, "force_rating", False)),
+        output_dir=str(getattr(orchestrator, "status_output_dir", "output_run")),
+        manifest_csv=str(getattr(orchestrator, "status_manifest_csv", "output_run/manifest.csv")),
+        manifest_xlsx=str(
+            getattr(orchestrator, "status_manifest_xlsx", "output_run/manifest.xlsx")
+        ),
+        bundle_file=str(getattr(orchestrator, "status_bundle_file", "output_run.zip")),
+        writes_to_repository=bool(getattr(orchestrator, "writes_to_repository", False)),
+        repository_path=str(getattr(orchestrator, "repository_path", "")),
+        selected_scope=str(getattr(orchestrator, "selected_scope", "")),
+        selected_import_id=str(getattr(orchestrator, "selected_import_id", "")),
+        selected_phases=list(getattr(orchestrator, "selected_phases", [])),
+        phase_states=phase_states,
+        items=[],
+    )
+
+
+def _parse_simple_front_matter(content: str) -> dict[str, Any]:
+    lines = content.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}
+
+    data: dict[str, Any] = {}
+    current_key = ""
+    for line in lines[1:]:
+        stripped = line.strip()
+        if stripped == "---":
+            break
+        match = re.match(r"^([A-Za-z0-9_-]+)\s*:\s*(.*)$", line)
+        if match:
+            current_key = match.group(1).strip().lower()
+            raw_value = match.group(2).strip()
+            if not raw_value:
+                data[current_key] = []
+                continue
+            if raw_value.startswith("[") and raw_value.endswith("]"):
+                pieces = [
+                    item.strip().strip("'\"")
+                    for item in raw_value[1:-1].split(",")
+                    if item.strip()
+                ]
+                data[current_key] = pieces
+            else:
+                data[current_key] = raw_value.strip("'\"")
+            continue
+        if current_key and re.match(r"^\s*-\s+.+$", line):
+            data.setdefault(current_key, [])
+            if isinstance(data[current_key], list):
+                data[current_key].append(line.split("-", 1)[1].strip().strip("'\""))
+    return data
+
+
+def _extract_markdown_title(content: str) -> str:
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            return stripped.lstrip("#").strip()
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped[:200]
+    return ""
+
+
+def _extract_markdown_tags(content: str) -> list[str]:
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped.lower().startswith("tags:"):
+            continue
+        _, raw_tags = stripped.split(":", 1)
+        return [
+            item.strip().strip("'\"")
+            for item in raw_tags.split(",")
+            if item.strip()
+        ]
+    return []
+
+
+def _extract_markdown_description(content: str) -> str:
+    paragraph: list[str] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if paragraph:
+                break
+            continue
+        if stripped.startswith("#") or stripped.lower().startswith("tags:"):
+            continue
+        paragraph.append(stripped)
+        if len(" ".join(paragraph)) >= 220:
+            break
+    return " ".join(paragraph)[:240].strip()
+
+
+def _extract_simple_yaml_value(content: str, key: str) -> str:
+    pattern = rf"(?m)^{re.escape(key)}\s*:\s*(.+?)\s*$"
+    match = re.search(pattern, content)
+    if not match:
+        return ""
+    return match.group(1).strip().strip("'\"")
+
+
+def _derive_agent_resource_metadata(
+    *,
+    source_path: Path,
+    content: str,
+    kind: str,
+) -> tuple[str, list[str], str]:
+    front_matter = _parse_simple_front_matter(content)
+    title = ""
+    tags: list[str] = []
+    description = ""
+
+    if kind == "rubric":
+        title = (
+            str(front_matter.get("title") or "").strip()
+            or _extract_simple_yaml_value(content, "name")
+            or _extract_simple_yaml_value(content, "title")
+            or source_path.stem
+        )
+        raw_tags = front_matter.get("tags") or []
+        if isinstance(raw_tags, list):
+            tags = [str(item).strip() for item in raw_tags if str(item).strip()]
+        description = (
+            str(front_matter.get("description") or "").strip()
+            or _extract_simple_yaml_value(content, "description")
+            or _extract_simple_yaml_value(content, "summary")
+        )
+    else:
+        title = (
+            str(front_matter.get("title") or "").strip()
+            or _extract_markdown_title(content)
+            or source_path.stem
+        )
+        raw_tags = front_matter.get("tags") or _extract_markdown_tags(content)
+        if isinstance(raw_tags, list):
+            tags = [str(item).strip() for item in raw_tags if str(item).strip()]
+        elif isinstance(raw_tags, str) and raw_tags.strip():
+            tags = [
+                item.strip()
+                for item in raw_tags.split(",")
+                if item.strip()
+            ]
+        description = (
+            str(front_matter.get("description") or "").strip()
+            or str(front_matter.get("summary") or "").strip()
+            or _extract_markdown_description(content)
+        )
+
+    deduped_tags: list[str] = []
+    seen: set[str] = set()
+    for item in tags:
+        normalized = item.lower()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped_tags.append(item)
+    return title[:200].strip(), deduped_tags, description[:280].strip()
+
+
+def _path_mtime_iso(path: Path) -> str:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
+    except Exception:
+        return ""

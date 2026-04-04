@@ -39,24 +39,51 @@ class RepositoryDashboardManifestApiTests(unittest.TestCase):
         self.assertGreaterEqual(len(rows), 3)
 
         rows[0]["title"] = "Alpha Source"
+        rows[0]["source_kind"] = "url"
         rows[0]["fetch_status"] = "success"
         rows[0]["detected_type"] = "pdf"
+        rows[0]["author_names"] = "Jane Doe; John Roe"
+        rows[0]["publication_date"] = "2024-03-15"
+        rows[0]["publication_year"] = "2024"
+        rows[0]["document_type"] = "report"
+        rows[0]["organization_name"] = "Alpha Agency"
+        rows[0]["organization_type"] = "state agency"
+        rows[0]["catalog_status"] = "generated"
+        rows[0]["tags_text"] = "housing; retrofit"
         rows[0]["summary_file"] = "summaries/000001_summary.md"
         rows[0]["summary_status"] = "generated"
         rows[0]["rating_file"] = "ratings/000001_rating.json"
         rows[0]["rating_status"] = "generated"
 
         rows[1]["title"] = "Beta Source"
+        rows[1]["source_kind"] = "url"
         rows[1]["fetch_status"] = "failed"
         rows[1]["detected_type"] = "html"
+        rows[1]["author_names"] = "Beta Team"
+        rows[1]["publication_date"] = "2023"
+        rows[1]["publication_year"] = "2023"
+        rows[1]["document_type"] = "web page"
+        rows[1]["organization_name"] = "Beta Blog"
+        rows[1]["organization_type"] = "blog"
+        rows[1]["catalog_status"] = "generated"
+        rows[1]["tags_text"] = "blog; commentary"
         rows[1]["summary_file"] = ""
         rows[1]["summary_status"] = "failed"
         rows[1]["rating_file"] = ""
         rows[1]["rating_status"] = ""
 
         rows[2]["title"] = "Gamma Source"
+        rows[2]["source_kind"] = "uploaded_document"
         rows[2]["fetch_status"] = "queued"
         rows[2]["detected_type"] = "document"
+        rows[2]["author_names"] = "Gamma Lab"
+        rows[2]["publication_date"] = "2025-01-07"
+        rows[2]["publication_year"] = "2025"
+        rows[2]["document_type"] = "journal article"
+        rows[2]["organization_name"] = "Gamma University"
+        rows[2]["organization_type"] = "university"
+        rows[2]["catalog_status"] = "generated"
+        rows[2]["tags_text"] = "heat pump; workforce"
         rows[2]["summary_file"] = ""
         rows[2]["summary_status"] = ""
         rows[2]["rating_file"] = "ratings/000003_rating.json"
@@ -180,6 +207,14 @@ class RepositoryDashboardManifestApiTests(unittest.TestCase):
         self.assertGreaterEqual(len(payload["rows"]), 1)
         self.assertTrue(any((row.get("title") or "").lower() == "alpha source" for row in payload["rows"]))
 
+    def test_repository_manifest_q_filter_matches_catalog_fields(self):
+        resp = self.client.get("/api/repository/manifest?q=jane%20doe")
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.json()
+
+        self.assertEqual(len(payload["rows"]), 1)
+        self.assertEqual(payload["rows"][0]["id"], "000001")
+
     def test_repository_manifest_filters_by_rating_thresholds(self):
         resp = self.client.get(
             "/api/repository/manifest?rating_overall_relevance_min=0.9&rating_depth_score_min=0.9"
@@ -208,8 +243,26 @@ class RepositoryDashboardManifestApiTests(unittest.TestCase):
 
         keys = {item["key"] for item in payload["columns"]}
         self.assertIn("id", keys)
+        self.assertIn("source_kind", keys)
+        self.assertIn("author_names", keys)
+        self.assertIn("document_type", keys)
+        self.assertIn("organization_type", keys)
+        self.assertIn("tags_text", keys)
         self.assertIn("rating_depth_score", keys)
         self.assertIn("rating_overall_relevance", keys)
+
+    def test_repository_manifest_filters_by_catalog_fields(self):
+        resp = self.client.get(
+            "/api/repository/manifest?source_kind=uploaded_document&organization_type=university&document_type=journal"
+        )
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.json()
+
+        self.assertEqual(len(payload["rows"]), 1)
+        row = payload["rows"][0]
+        self.assertEqual(row["id"], "000003")
+        self.assertEqual(row["source_kind"], "uploaded_document")
+        self.assertEqual(row["organization_type"], "university")
 
     def test_repository_manifest_returns_enriched_summary_and_rating_fields(self):
         resp = self.client.get("/api/repository/manifest?q=alpha")

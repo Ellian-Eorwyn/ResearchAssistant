@@ -35,7 +35,7 @@ class RepositoryHealth(BaseModel):
 class RepositoryStatusResponse(BaseModel):
     attached: bool = False
     path: str = ""
-    schema_version: int = 2
+    schema_version: int = 3
     next_source_id: int = 1
     total_sources: int = 0
     total_citations: int = 0
@@ -147,6 +147,9 @@ class RepositoryReprocessDocumentsResponse(BaseModel):
 class RepositorySourceTaskRequest(SourceDownloadRequest):
     scope: str = "queued"
     import_id: str = ""
+    source_ids: list[str] = Field(default_factory=list)
+    limit: int | None = Field(default=None, ge=1, le=500)
+    selected_phases: list[str] = Field(default_factory=list)
 
 
 class RepositorySourceTaskResponse(BaseModel):

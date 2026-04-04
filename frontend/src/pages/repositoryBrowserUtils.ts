@@ -4,6 +4,13 @@ export interface RepositoryBrowserFilters {
   q: string;
   fetchStatus: string;
   detectedType: string;
+  sourceKind: string;
+  documentType: string;
+  organizationType: string;
+  organizationName: string;
+  authorNames: string;
+  publicationDate: string;
+  tagsText: string;
   hasSummary: string;
   hasRating: string;
   ratingOverallRelevanceMin: string;
@@ -45,8 +52,15 @@ export const REPOSITORY_BROWSER_FILE_COLUMNS: Array<{
 
 export const REPOSITORY_BROWSER_DEFAULT_VISIBLE_COLUMNS = [
   "id",
+  "source_kind",
   "source_document_name",
   "title",
+  "author_names",
+  "publication_date",
+  "document_type",
+  "organization_name",
+  "organization_type",
+  "tags_text",
   "markdown_char_count",
   "summary_text",
   "rating_overall_relevance",
@@ -57,7 +71,7 @@ export const REPOSITORY_BROWSER_DEFAULT_VISIBLE_COLUMNS = [
 ];
 
 export function buildRepositoryBrowserStorageKey(): string {
-  return "repository-browser:v3";
+  return "repository-browser:v4";
 }
 
 export function buildRepositoryBrowserQuery(filters: RepositoryBrowserFilters): URLSearchParams {
@@ -65,6 +79,13 @@ export function buildRepositoryBrowserQuery(filters: RepositoryBrowserFilters): 
     q: filters.q,
     fetch_status: filters.fetchStatus,
     detected_type: filters.detectedType,
+    source_kind: filters.sourceKind,
+    document_type: filters.documentType,
+    organization_type: filters.organizationType,
+    organization_name: filters.organizationName,
+    author_names: filters.authorNames,
+    publication_date: filters.publicationDate,
+    tags_text: filters.tagsText,
     sort_by: filters.sortBy,
     sort_dir: filters.sortDir,
     limit: String(filters.limit),
@@ -171,7 +192,14 @@ export function mergeRepositoryBrowserColumns(
 export function labelRepositoryBrowserColumn(columnKey: string, fallbackLabel?: string): string {
   const overrides: Record<string, string> = {
     id: "Source ID",
+    source_kind: "Source Kind",
     source_document_name: "Source Document",
+    author_names: "Authors",
+    publication_date: "Publication Date",
+    document_type: "Document Type",
+    organization_name: "Organization",
+    organization_type: "Organization Type",
+    tags_text: "Tags",
     rating_relevant_detail_score: "Detail Score",
   };
   return overrides[columnKey] || fallbackLabel || columnKey;

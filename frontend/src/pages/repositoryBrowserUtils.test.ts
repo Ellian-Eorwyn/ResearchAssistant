@@ -11,8 +11,15 @@ describe("repositoryBrowserUtils", () => {
   it("exposes stable default visible columns", () => {
     expect(REPOSITORY_BROWSER_DEFAULT_VISIBLE_COLUMNS).toEqual([
       "id",
+      "source_kind",
       "source_document_name",
       "title",
+      "author_names",
+      "publication_date",
+      "document_type",
+      "organization_name",
+      "organization_type",
+      "tags_text",
       "markdown_char_count",
       "summary_text",
       "rating_overall_relevance",
@@ -31,6 +38,13 @@ describe("repositoryBrowserUtils", () => {
       q: "alpha",
       fetchStatus: "success",
       detectedType: "pdf",
+      sourceKind: "url",
+      documentType: "report",
+      organizationType: "agency",
+      organizationName: "Alpha Agency",
+      authorNames: "Jane Doe",
+      publicationDate: "2024",
+      tagsText: "housing",
       hasSummary: "true",
       hasRating: "false",
       ratingOverallRelevanceMin: "0.6",
@@ -48,6 +62,13 @@ describe("repositoryBrowserUtils", () => {
     expect(params.get("q")).toBe("alpha");
     expect(params.get("fetch_status")).toBe("success");
     expect(params.get("detected_type")).toBe("pdf");
+    expect(params.get("source_kind")).toBe("url");
+    expect(params.get("document_type")).toBe("report");
+    expect(params.get("organization_type")).toBe("agency");
+    expect(params.get("organization_name")).toBe("Alpha Agency");
+    expect(params.get("author_names")).toBe("Jane Doe");
+    expect(params.get("publication_date")).toBe("2024");
+    expect(params.get("tags_text")).toBe("housing");
     expect(params.get("has_summary")).toBe("true");
     expect(params.get("has_rating")).toBe("false");
     expect(params.get("rating_overall_min")).toBeNull();
