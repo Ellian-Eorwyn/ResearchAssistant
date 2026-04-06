@@ -60,6 +60,70 @@ class SourcesRepositorySeedApiTests(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
+    def _update_source_row(self, **fields):
+        state_path = self.repo_dir / ".ra_repo" / "repository_state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["sources"][0].update(fields)
+        state_path.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _start_empty_only_job(self, **payload):
+        started = threading.Event()
+        release = threading.Event()
+
+        def fake_run(self: SourceDownloadOrchestrator):
+            started.set()
+            release.wait(timeout=2)
+
+        with patch(
+            "backend.storage.attached_repository.SourceDownloadOrchestrator.run",
+            new=fake_run,
+        ):
+            response = self.client.post(
+                "/api/repository/source-tasks",
+                json={
+                    "scope": "empty_only",
+                    "import_id": "",
+                    "rerun_failed_only": False,
+                    "run_download": False,
+                    "run_convert": False,
+                    "run_catalog": False,
+                    "run_llm_cleanup": False,
+                    "run_llm_title": False,
+                    "run_llm_summary": False,
+                    "run_llm_rating": False,
+                    "force_redownload": False,
+                    "force_convert": False,
+                    "force_catalog": False,
+                    "force_llm_cleanup": False,
+                    "force_title": False,
+                    "force_summary": False,
+                    "force_rating": False,
+                    "project_profile_name": "",
+                    "include_raw_file": False,
+                    "include_rendered_html": False,
+                    "include_rendered_pdf": False,
+                    "include_markdown": False,
+                    **payload,
+                },
+            )
+
+            if response.status_code != 200:
+                return response, None
+
+            job_id = response.json()["job_id"]
+            self.assertTrue(started.wait(timeout=1))
+            with self.app.state.source_download_lock:
+                orchestrator = self.app.state.source_download_jobs.get(job_id)
+            self.assertIsNotNone(orchestrator)
+
+            release.set()
+            if self.service._download_thread is not None:
+                self.service._download_thread.join(timeout=1)
+            return response, orchestrator
+
     def test_summary_cleanup_only_run_bootstraps_existing_repository_output(self):
         export_job = self.service.create_export_job(scope="all")
         job_store = self.service.job_store_for(export_job.job_id)
@@ -342,6 +406,63 @@ class SourcesRepositorySeedApiTests(unittest.TestCase):
             release.set()
             if self.service._download_thread is not None:
                 self.service._download_thread.join(timeout=1)
+
+    def test_empty_only_scope_selects_rows_missing_markdown_outputs(self):
+        self._update_source_row(markdown_file="")
+
+        response, orchestrator = self._start_empty_only_job(
+            run_download=True,
+            run_convert=True,
+            include_markdown=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["scope"], "empty_only")
+        self.assertEqual([row.id for row in orchestrator.target_rows], ["000001"])
+
+    def test_empty_only_scope_selects_rows_missing_catalog_artifacts(self):
+        self._update_source_row(catalog_file="", catalog_status="")
+
+        response, orchestrator = self._start_empty_only_job(
+            run_catalog=True,
+            include_markdown=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([row.id for row in orchestrator.target_rows], ["000001"])
+
+    def test_empty_only_scope_selects_rows_missing_cleanup_artifacts(self):
+        self._update_source_row(llm_cleanup_file="", llm_cleanup_status="")
+
+        response, orchestrator = self._start_empty_only_job(
+            run_llm_cleanup=True,
+            include_markdown=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([row.id for row in orchestrator.target_rows], ["000001"])
+
+    def test_empty_only_scope_selects_rows_missing_summary_artifacts(self):
+        self._update_source_row(summary_file="", summary_status="")
+
+        response, orchestrator = self._start_empty_only_job(
+            run_llm_summary=True,
+            include_markdown=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([row.id for row in orchestrator.target_rows], ["000001"])
+
+    def test_empty_only_scope_selects_rows_missing_rating_artifacts(self):
+        self._update_source_row(rating_file="", rating_status="")
+
+        response, orchestrator = self._start_empty_only_job(
+            run_llm_rating=True,
+            include_markdown=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([row.id for row in orchestrator.target_rows], ["000001"])
 
 
 if __name__ == "__main__":

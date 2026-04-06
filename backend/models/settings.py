@@ -25,6 +25,7 @@ class RepoSettings(BaseModel):
     llm_backend: LLMBackendConfig = Field(default_factory=LLMBackendConfig)
     use_llm: bool = False
     research_purpose: str = ""
+    default_project_profile_name: str = ""
     fetch_delay: float = Field(default=2.0, ge=1.0, le=10.0)
 
 

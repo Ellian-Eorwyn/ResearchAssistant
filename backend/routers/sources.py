@@ -172,7 +172,14 @@ async def start_source_download(
 
     run_download = bool(payload.run_download or payload.force_redownload)
     run_convert = bool(payload.run_convert or payload.force_convert or (run_download and payload.include_markdown))
-    run_catalog = bool(payload.run_catalog or payload.force_catalog or payload.run_llm_title or payload.force_title)
+    run_citation_verify = bool(payload.run_citation_verify or payload.force_citation_verify)
+    run_catalog = bool(
+        payload.run_catalog
+        or payload.force_catalog
+        or payload.run_llm_title
+        or payload.force_title
+        or run_citation_verify
+    )
     run_llm_cleanup = bool(payload.run_llm_cleanup or payload.force_llm_cleanup)
     run_llm_title = bool(payload.run_llm_title or payload.force_title)
     run_llm_summary = bool(payload.run_llm_summary or payload.force_summary)
@@ -182,6 +189,7 @@ async def start_source_download(
         run_download
         or run_convert
         or run_catalog
+        or run_citation_verify
         or run_llm_cleanup
         or run_llm_title
         or run_llm_summary
@@ -271,6 +279,7 @@ async def start_source_download(
         run_download=run_download,
         run_convert=run_convert,
         run_catalog=run_catalog,
+        run_citation_verify=run_citation_verify,
         run_llm_cleanup=run_llm_cleanup,
         run_llm_title=run_llm_title,
         run_llm_summary=run_llm_summary,
@@ -278,6 +287,7 @@ async def start_source_download(
         force_redownload=payload.force_redownload,
         force_convert=payload.force_convert,
         force_catalog=payload.force_catalog or payload.force_title,
+        force_citation_verify=payload.force_citation_verify,
         force_llm_cleanup=payload.force_llm_cleanup,
         force_title=payload.force_title,
         force_summary=payload.force_summary,
@@ -340,6 +350,7 @@ async def start_source_download(
         "run_download": run_download,
         "run_convert": run_convert,
         "run_catalog": run_catalog,
+        "run_citation_verify": run_citation_verify,
         "run_llm_cleanup": run_llm_cleanup,
         "run_llm_title": run_llm_title,
         "run_llm_summary": run_llm_summary,

@@ -66,9 +66,11 @@ body {
 }
 
 .data-table {
-  width: 100%;
+  min-width: 100%;
+  width: max-content;
   border-collapse: separate;
   border-spacing: 0 1px;
+  table-layout: fixed;
 }
 
 .data-table thead th {
@@ -83,6 +85,8 @@ body {
 .data-table td {
   @apply px-3 py-2 text-body-md;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .data-table td.data-cell-wrap,
@@ -94,11 +98,62 @@ body {
 }
 
 .repository-browser-long-cell {
-  min-width: 22rem;
-  max-width: 32rem;
   line-height: 1.6;
   padding-top: 0.875rem;
   padding-bottom: 0.875rem;
+}
+
+.repository-browser-action-row {
+  display: flex;
+  align-items: stretch;
+  background: rgba(17, 27, 49, 0.96);
+  border-bottom: 2px solid rgba(166, 200, 255, 0.75);
+  backdrop-filter: blur(18px);
+}
+
+.repository-browser-action-cell,
+.repository-browser-action-rail {
+  padding: 0.45rem 0.6rem;
+  min-height: 76px;
+}
+
+.repository-browser-action-cell {
+  border-right: 1px solid rgba(166, 200, 255, 0.12);
+}
+
+.repository-browser-action-rail {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-left: 1px solid rgba(166, 200, 255, 0.16);
+  background: rgba(11, 18, 34, 0.92);
+}
+
+.repository-browser-add-column-button {
+  width: 2.25rem;
+  height: 2.25rem;
+  border: 1px solid rgba(166, 200, 255, 0.24);
+  border-radius: 999px;
+  background: rgba(166, 200, 255, 0.08);
+  color: rgb(230 237 255);
+  font-size: 1.35rem;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    transform 120ms ease,
+    background 120ms ease,
+    border-color 120ms ease;
+}
+
+.repository-browser-add-column-button:hover:not(:disabled) {
+  transform: translateY(-1px);
+  background: rgba(166, 200, 255, 0.16);
+  border-color: rgba(166, 200, 255, 0.42);
+}
+
+.repository-browser-add-column-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
 }
 
 .data-table tbody tr:nth-child(odd) {

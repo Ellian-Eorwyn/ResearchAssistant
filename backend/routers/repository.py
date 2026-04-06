@@ -7,7 +7,7 @@ import platform
 import subprocess
 
 from fastapi import APIRouter, Body, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 from backend.models.ingestion_profiles import (
     IngestionProfile,
@@ -19,12 +19,22 @@ from backend.models.ingestion_profiles import (
 from backend.models.repository import (
     AttachRepositoryRequest,
     CreateRepositoryRequest,
+    RepositoryCitationRisExportRequest,
     RepositoryActionResponse,
+    RepositoryColumnConfig,
+    RepositoryColumnCreateRequest,
+    RepositoryColumnPromptFixRequest,
+    RepositoryColumnPromptFixResponse,
+    RepositoryColumnRunRequest,
+    RepositoryColumnRunStartResponse,
+    RepositoryColumnRunStatus,
+    RepositoryColumnUpdateRequest,
     RepositoryDocumentImportListResponse,
     RepositorySourceDeleteRequest,
     RepositorySourceDeleteResponse,
     RepositorySourceExportRequest,
     RepositorySourceExportResponse,
+    RepositorySourcePatchRequest,
     RepositoryExportJobRequest,
     RepositoryExportJobResponse,
     RepositoryImportResponse,
@@ -356,8 +366,16 @@ async def get_repository_manifest(
     rating_depth_score_max: float | None = Query(default=None),
     rating_relevant_detail_score_min: float | None = Query(default=None),
     rating_relevant_detail_score_max: float | None = Query(default=None),
-    sort_by: str = "id",
-    sort_dir: str = "asc",
+    citation_type: str = "",
+    citation_doi: str = "",
+    citation_report_number: str = "",
+    citation_standard_number: str = "",
+    citation_missing_fields: str = "",
+    citation_ready: bool | None = Query(default=None),
+    citation_confidence_min: float | None = Query(default=None),
+    citation_confidence_max: float | None = Query(default=None),
+    sort_by: str = "",
+    sort_dir: str = "",
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> dict:
@@ -386,6 +404,14 @@ async def get_repository_manifest(
             rating_depth_score_max=rating_depth_score_max,
             rating_relevant_detail_score_min=rating_relevant_detail_score_min,
             rating_relevant_detail_score_max=rating_relevant_detail_score_max,
+            citation_type=citation_type,
+            citation_doi=citation_doi,
+            citation_report_number=citation_report_number,
+            citation_standard_number=citation_standard_number,
+            citation_missing_fields=citation_missing_fields,
+            citation_ready=citation_ready,
+            citation_confidence_min=citation_confidence_min,
+            citation_confidence_max=citation_confidence_max,
             sort_by=sort_by,
             sort_dir=sort_dir,
             limit=limit,
@@ -592,6 +618,106 @@ async def open_repository_source_file(
     )
 
 
+@router.patch("/repository/sources/{source_id}")
+async def patch_repository_source(
+    source_id: str,
+    request: Request,
+    payload: RepositorySourcePatchRequest,
+) -> dict:
+    service = request.app.state.repository_service
+    try:
+        return service.update_source(
+            source_id,
+            patch=payload.model_dump(exclude_unset=True),
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 404 if "unknown source_id" in detail.lower() else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+
+
+@router.post("/repository/columns", response_model=RepositoryColumnConfig)
+async def create_repository_column(
+    request: Request,
+    payload: RepositoryColumnCreateRequest,
+) -> RepositoryColumnConfig:
+    service = request.app.state.repository_service
+    try:
+        return service.create_column(payload.label)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.patch("/repository/columns/{column_id}", response_model=RepositoryColumnConfig)
+async def update_repository_column(
+    column_id: str,
+    request: Request,
+    payload: RepositoryColumnUpdateRequest,
+) -> RepositoryColumnConfig:
+    service = request.app.state.repository_service
+    try:
+        return service.update_column(
+            column_id,
+            patch=payload.model_dump(exclude_unset=True),
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 404 if "unknown" in detail.lower() else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+
+
+@router.post(
+    "/repository/columns/{column_id}/fix-prompt",
+    response_model=RepositoryColumnPromptFixResponse,
+)
+async def fix_repository_column_prompt(
+    column_id: str,
+    request: Request,
+    payload: RepositoryColumnPromptFixRequest,
+) -> RepositoryColumnPromptFixResponse:
+    service = request.app.state.repository_service
+    try:
+        return service.fix_column_prompt(column_id, draft_prompt=payload.draft_prompt)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/repository/columns/{column_id}/run",
+    response_model=RepositoryColumnRunStartResponse,
+)
+async def start_repository_column_run(
+    column_id: str,
+    request: Request,
+    payload: RepositoryColumnRunRequest,
+) -> RepositoryColumnRunStartResponse:
+    service = request.app.state.repository_service
+    try:
+        return service.start_column_run(column_id, payload=payload)
+    except ValueError as exc:
+        detail = str(exc)
+        if "already running" in detail.lower():
+            raise HTTPException(status_code=409, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
+
+
+@router.get(
+    "/repository/column-runs/{job_id}",
+    response_model=RepositoryColumnRunStatus,
+)
+async def get_repository_column_run_status(
+    job_id: str,
+    request: Request,
+) -> RepositoryColumnRunStatus:
+    service = request.app.state.repository_service
+    try:
+        return service.get_column_run_status(job_id)
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 404 if "not found" in detail.lower() else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+
+
 @router.post(
     "/repository/sources/bulk-delete",
     response_model=RepositorySourceDeleteResponse,
@@ -624,6 +750,23 @@ async def export_repository_source_files(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/repository/citations/export-ris")
+async def export_repository_citations_ris(
+    request: Request,
+    payload: RepositoryCitationRisExportRequest,
+) -> Response:
+    service = request.app.state.repository_service
+    try:
+        content, headers = service.export_citations_ris(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return Response(
+        content=content,
+        media_type="application/x-research-info-systems; charset=utf-8",
+        headers=headers,
+    )
 
 
 @router.post("/repository/export-job", response_model=RepositoryExportJobResponse)

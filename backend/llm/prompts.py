@@ -103,7 +103,95 @@ Return JSON in exactly this shape:
   "document_type": "",
   "organization_name": "",
   "organization_type": "",
-  "evidence_snippets": [""]
+  "evidence_snippets": [""],
+  "citation": {{
+    "item_type": "",
+    "title": "",
+    "authors": [
+      {{"family": "", "given": "", "literal": ""}}
+    ],
+    "issued": "",
+    "publisher": "",
+    "container_title": "",
+    "volume": "",
+    "issue": "",
+    "pages": "",
+    "doi": "",
+    "url": "",
+    "report_number": "",
+    "standard_number": "",
+    "language": "",
+    "accessed": "",
+    "evidence": [""],
+    "confidence": 0.0,
+    "missing_fields": [""],
+    "ready_for_ris": false
+  }}
+}}"""
+
+SOURCE_CITATION_VERIFY_SYSTEM = """You verify citation metadata for a research source so it can be safely exported to RIS.
+Use only the provided candidates, evidence, and source content.
+Choose the most strongly supported citation value for each field.
+If a field is not clearly supported, leave it blank.
+Do not synthesize fallback citation titles or dates.
+If no individual authors are supported but the source is clearly authored by an organization, you may use that organization as a single literal corporate author.
+Prefer explicit citation metadata, DOI registry metadata, front matter, headings, bylines, and publication info over weaker heuristics.
+Return JSON only."""
+
+SOURCE_CITATION_VERIFY_USER = """Research purpose:
+{research_purpose}
+
+Source kind:
+{source_kind}
+
+Original URL:
+{original_url}
+
+Candidate metadata and evidence:
+{candidate_metadata_json}
+
+Source content:
+{source_markdown}
+
+Return JSON in exactly this shape:
+{{
+  "citation": {{
+    "item_type": "",
+    "title": "",
+    "authors": [
+      {{"family": "", "given": "", "literal": ""}}
+    ],
+    "issued": "",
+    "publisher": "",
+    "container_title": "",
+    "volume": "",
+    "issue": "",
+    "pages": "",
+    "doi": "",
+    "url": "",
+    "report_number": "",
+    "standard_number": "",
+    "language": "",
+    "accessed": ""
+  }},
+  "field_evidence": {{
+    "item_type": {{"source_type": "", "source_label": "", "evidence": "", "confidence": 0.0}},
+    "title": {{"source_type": "", "source_label": "", "evidence": "", "confidence": 0.0}},
+    "authors": {{"source_type": "", "source_label": "", "evidence": "", "confidence": 0.0}},
+    "issued": {{"source_type": "", "source_label": "", "evidence": "", "confidence": 0.0}},
+    "publisher": {{"source_type": "", "source_label": "", "evidence": "", "confidence": 0.0}},
+    "container_title": {{"source_type": "", "source_label": "", "evidence": "", "confidence": 0.0}},
+    "volume": {{"source_type": "", "source_label": "", "evidence": "", "confidence": 0.0}},
+    "issue": {{"source_type": "", "source_label": "", "evidence": "", "confidence": 0.0}},
+    "pages": {{"source_type": "", "source_label": "", "evidence": "", "confidence": 0.0}},
+    "doi": {{"source_type": "", "source_label": "", "evidence": "", "confidence": 0.0}},
+    "url": {{"source_type": "", "source_label": "", "evidence": "", "confidence": 0.0}},
+    "report_number": {{"source_type": "", "source_label": "", "evidence": "", "confidence": 0.0}},
+    "standard_number": {{"source_type": "", "source_label": "", "evidence": "", "confidence": 0.0}}
+  }},
+  "blocked_reasons": [""],
+  "notes": [""],
+  "verification_confidence": 0.0
 }}"""
 
 SOURCE_RATING_SYSTEM = """You are evaluating a source using an imported project profile.
@@ -216,3 +304,117 @@ Return JSON with exactly these top-level keys:
     "llm_guidance": ""
   }}
 }}"""
+
+COLUMN_PROMPT_FIX_SYSTEM = """You improve user-authored spreadsheet column prompts for row-wise research extraction and normalization.
+Preserve the user's intent while making the instructions clearer, more constrained, and safer for single-cell output.
+
+Hard rules:
+- Do not change the task the user asked for.
+- Prefer deterministic output constraints when the task implies them.
+- Bias toward concise single-cell-safe output.
+- No markdown in the final cell value unless explicitly requested.
+- Use blank output when evidence is insufficient unless the task clearly implies another fallback.
+
+Return JSON only in exactly this shape:
+{
+  "prompt": "",
+  "output_constraint": {
+    "kind": "text" | "yes_no" | "integer" | "number" | "date",
+    "allowed_values": [""],
+    "max_words": 8,
+    "fallback_value": "",
+    "format_hint": ""
+  },
+  "notes": [""]
+}"""
+
+COLUMN_PROMPT_FIX_USER = """Column label:
+{column_label}
+
+Current saved prompt:
+{current_prompt}
+
+Current output constraint:
+{current_constraint_json}
+
+User draft prompt:
+{draft_prompt}
+
+Rewrite the draft prompt so it is better suited for row-wise extraction or transformation in a spreadsheet column.
+Return JSON only."""
+
+COLUMN_RUN_SYSTEM = """You generate exactly one spreadsheet cell value for a repository browser column.
+
+Hard rules:
+- Return JSON only.
+- Output only the value for the target cell, never an explanation.
+- No markdown.
+- Keep the value single-cell-safe.
+- Follow the requested output constraint exactly.
+- If evidence is insufficient, return status `insufficient_evidence` and the fallback cell value.
+
+Return JSON only in exactly this shape:
+{
+  "value": "",
+  "status": "ok" | "insufficient_evidence"
+}"""
+
+COLUMN_RUN_USER = """Research purpose:
+{research_purpose}
+
+Column label:
+{column_label}
+
+Column instructions:
+{column_prompt}
+
+Output constraint:
+{output_constraint_json}
+
+Application hard rules:
+{hard_rules}
+
+Current cell value:
+{current_value}
+
+Row metadata:
+{row_metadata_json}
+
+Document text:
+{document_text}
+
+Return JSON only."""
+
+PROJECT_PROFILE_GENERATION_SYSTEM = """You generate repository project-profile YAML files for source rating.
+Preserve compatibility with the existing rating pipeline.
+
+Hard requirements:
+- Keep the YAML valid.
+- Keep the output contract compatible with the current repository schema.
+- Preserve these scoring dimension ids exactly:
+  - overall_relevance
+  - depth_score
+  - relevant_detail_score
+- Preserve rationale, relevant sections, tags, and flags support.
+- Allow {{research_purpose}} placeholders in the generated YAML when useful.
+- Do not invent extra required fields that would break the existing rating parser.
+- Prefer adapting the provided template instead of inventing a brand-new schema.
+
+Return JSON only in exactly this shape:
+{
+  "profile_name": "",
+  "filename_stem": "",
+  "yaml": ""
+}"""
+
+PROJECT_PROFILE_GENERATION_USER = """Research purpose:
+{research_purpose}
+
+Requested profile name:
+{profile_name}
+
+Current compatible template YAML:
+{template_yaml}
+
+Generate a project-specific profile draft that remains compatible with the template's output schema.
+Return JSON only."""

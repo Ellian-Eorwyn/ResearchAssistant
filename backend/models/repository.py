@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from backend.models.ingestion_profiles import DocumentNormalizationResult
@@ -35,7 +37,7 @@ class RepositoryHealth(BaseModel):
 class RepositoryStatusResponse(BaseModel):
     attached: bool = False
     path: str = ""
-    schema_version: int = 3
+    schema_version: int = 4
     next_source_id: int = 1
     total_sources: int = 0
     total_citations: int = 0
@@ -188,3 +190,156 @@ class RepositorySourceExportResponse(BaseModel):
     missing_files: int = 0
     destination_path: str = ""
     message: str = ""
+
+
+class RepositorySourcePatchRequest(BaseModel):
+    title: str | None = None
+    author_names: str | None = None
+    publication_date: str | None = None
+    document_type: str | None = None
+    organization_name: str | None = None
+    organization_type: str | None = None
+    tags_text: str | None = None
+    notes: str | None = None
+    summary_text: str | None = None
+    overall_relevance: float | None = Field(default=None, ge=0.0, le=1.0)
+    depth_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    relevant_detail_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    rating_rationale: str | None = None
+    relevant_sections: str | None = None
+    citation_title: str | None = None
+    citation_authors: str | None = None
+    citation_issued: str | None = None
+    citation_type: str | None = None
+    citation_url: str | None = None
+    citation_publisher: str | None = None
+    citation_container_title: str | None = None
+    citation_volume: str | None = None
+    citation_issue: str | None = None
+    citation_pages: str | None = None
+    citation_doi: str | None = None
+    citation_report_number: str | None = None
+    citation_standard_number: str | None = None
+    citation_language: str | None = None
+    citation_accessed: str | None = None
+    citation_override_fields: list[str] = Field(default_factory=list)
+    custom_fields: dict[str, str | None] = Field(default_factory=dict)
+
+
+class RepositoryColumnOutputConstraint(BaseModel):
+    kind: Literal["text", "yes_no", "integer", "number", "date"] = "text"
+    allowed_values: list[str] = Field(default_factory=list)
+    max_words: int | None = Field(default=None, ge=1, le=100)
+    fallback_value: str = ""
+    format_hint: str = ""
+
+
+class RepositoryColumnConfig(BaseModel):
+    id: str
+    label: str
+    kind: Literal["builtin", "custom"] = "builtin"
+    builtin_key: str = ""
+    instruction_prompt: str = ""
+    output_constraint: RepositoryColumnOutputConstraint | None = None
+    last_run_at: str = ""
+    last_run_status: str = ""
+
+
+class RepositoryColumnCreateRequest(BaseModel):
+    label: str = ""
+
+
+class RepositoryColumnUpdateRequest(BaseModel):
+    label: str | None = None
+    instruction_prompt: str | None = None
+    output_constraint: RepositoryColumnOutputConstraint | None = None
+
+
+class RepositoryColumnPromptFixRequest(BaseModel):
+    draft_prompt: str = ""
+
+
+class RepositoryColumnPromptFixResponse(BaseModel):
+    status: str = "completed"
+    column_id: str
+    prompt: str = ""
+    output_constraint: RepositoryColumnOutputConstraint | None = None
+    notes: list[str] = Field(default_factory=list)
+
+
+class RepositoryColumnRunRowError(BaseModel):
+    source_id: str
+    message: str = ""
+
+
+class RepositoryColumnRunRequest(BaseModel):
+    filters: "RepositoryManifestFilterRequest" = Field(default_factory=lambda: RepositoryManifestFilterRequest())
+    scope: Literal["filtered", "all", "empty_only", "selected"] = "filtered"
+    source_ids: list[str] = Field(default_factory=list)
+    confirm_overwrite: bool = False
+
+
+class RepositoryColumnRunStartResponse(BaseModel):
+    job_id: str = ""
+    status: str = "started"  # started | confirmation_required
+    column_id: str
+    total_rows: int = 0
+    populated_rows: int = 0
+    message: str = ""
+
+
+class RepositoryColumnRunStatus(BaseModel):
+    job_id: str
+    column_id: str
+    column_label: str = ""
+    state: Literal["pending", "running", "completed", "failed", "cancelled"] = "pending"
+    total_rows: int = 0
+    processed_rows: int = 0
+    succeeded_rows: int = 0
+    failed_rows: int = 0
+    current_source_id: str = ""
+    current_source_title: str = ""
+    message: str = ""
+    started_at: str = ""
+    completed_at: str = ""
+    row_errors: list[RepositoryColumnRunRowError] = Field(default_factory=list)
+
+
+class RepositoryManifestFilterRequest(BaseModel):
+    q: str = ""
+    fetch_status: str = ""
+    detected_type: str = ""
+    source_kind: str = ""
+    document_type: str = ""
+    organization_type: str = ""
+    organization_name: str = ""
+    author_names: str = ""
+    publication_date: str = ""
+    tags_text: str = ""
+    has_summary: bool | None = None
+    has_rating: bool | None = None
+    rating_overall_min: float | None = None
+    rating_overall_max: float | None = None
+    rating_overall_relevance_min: float | None = None
+    rating_overall_relevance_max: float | None = None
+    rating_depth_score_min: float | None = None
+    rating_depth_score_max: float | None = None
+    rating_relevant_detail_score_min: float | None = None
+    rating_relevant_detail_score_max: float | None = None
+    citation_type: str = ""
+    citation_doi: str = ""
+    citation_report_number: str = ""
+    citation_standard_number: str = ""
+    citation_missing_fields: str = ""
+    citation_ready: bool | None = None
+    citation_confidence_min: float | None = None
+    citation_confidence_max: float | None = None
+
+
+class RepositoryCitationRisExportRequest(BaseModel):
+    scope: str = "all"  # all | filtered | selected
+    source_ids: list[str] = Field(default_factory=list)
+    filters: RepositoryManifestFilterRequest = Field(default_factory=RepositoryManifestFilterRequest)
+
+
+RepositoryColumnRunRequest.model_rebuild()

@@ -10,7 +10,9 @@ import type {
   RepositoryManifestRow,
 } from "../api/types";
 
+export { AiGuidancePage } from "./AiGuidancePage";
 export { RepositoryBrowserPage } from "./RepositoryBrowserPage";
+export { SettingsPage } from "./SettingsPage";
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -219,7 +221,7 @@ export function LandingPage() {
     }
     const opened = await openRepository(selectedPath);
     if (opened) {
-      navigate("/project/overview");
+      navigate("/browser");
     }
   };
 
@@ -232,7 +234,7 @@ export function LandingPage() {
     }
     const created = await createRepository(selectedPath);
     if (created) {
-      navigate("/project/ingest");
+      navigate("/browser");
     }
   };
 
@@ -1174,7 +1176,30 @@ export function SourceCapturePage() {
                   setSourceTaskDraft((prev) => ({ ...prev, run_catalog: event.target.checked }))
                 }
               />
-              Catalog metadata: title, authors, date, document type, organization
+              Catalog metadata (display): title, authors, date, document type, organization
+            </label>
+            <label className="mb-2 flex items-center gap-2 text-body-md">
+              <input
+                checked={sourceTaskDraft.run_llm_title}
+                type="checkbox"
+                onChange={(event) =>
+                  setSourceTaskDraft((prev) => ({ ...prev, run_llm_title: event.target.checked }))
+                }
+              />
+              Title resolution
+            </label>
+            <label className="mb-2 flex items-center gap-2 text-body-md">
+              <input
+                checked={sourceTaskDraft.run_citation_verify}
+                type="checkbox"
+                onChange={(event) =>
+                  setSourceTaskDraft((prev) => ({
+                    ...prev,
+                    run_citation_verify: event.target.checked,
+                  }))
+                }
+              />
+              Citation verification for RIS export
             </label>
             <label className="mb-2 flex items-center gap-2 text-body-md">
               <input
@@ -1199,6 +1224,8 @@ export function SourceCapturePage() {
             {([
               ["force_llm_cleanup", "Re-run cleanup even if cleanup file exists"],
               ["force_catalog", "Re-run catalog metadata extraction"],
+              ["force_title", "Re-run title resolution"],
+              ["force_citation_verify", "Re-run citation verification"],
               ["force_summary", "Re-run summaries"],
               ["force_rating", "Force re-rate"],
             ] as const).map(([key, label]) => (
@@ -1215,6 +1242,12 @@ export function SourceCapturePage() {
                         : {}),
                       ...(key === "force_catalog" && event.target.checked
                         ? { run_catalog: true }
+                        : {}),
+                      ...(key === "force_title" && event.target.checked
+                        ? { run_llm_title: true }
+                        : {}),
+                      ...(key === "force_citation_verify" && event.target.checked
+                        ? { run_citation_verify: true }
                         : {}),
                       ...(key === "force_summary" && event.target.checked
                         ? { run_llm_summary: true }

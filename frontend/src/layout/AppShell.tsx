@@ -9,28 +9,27 @@ interface NavEntry {
   to: string;
 }
 
-const NAV_GROUPS: Array<{ label: string; items: NavEntry[] }> = [
+export const PRIMARY_NAV: NavEntry[] = [
+  { label: "Browser", to: "/browser" },
+  { label: "AI Guidance", to: "/ai-guidance" },
+  { label: "Settings", to: "/settings" },
+];
+
+export const LEGACY_NAV_GROUPS: Array<{ label: string; items: NavEntry[] }> = [
   {
-    label: "Project",
-    items: [
-      { label: "Overview", to: "/project/overview" },
-      { label: "Ingest", to: "/project/ingest" },
-      { label: "Merge Repositories", to: "/project/merge" },
-    ],
+    label: "Legacy Project",
+    items: [{ label: "Overview", to: "/project/overview" }],
   },
   {
-    label: "Processing",
+    label: "Legacy Processing",
     items: [
-      { label: "Repository Processing", to: "/processing/source-capture" },
-      { label: "Citation Extraction (Legacy)", to: "/processing/citation-extraction" },
+      { label: "Citation Extraction", to: "/processing/citation-extraction" },
       { label: "Job History", to: "/processing/job-history" },
     ],
   },
   {
-    label: "Data",
+    label: "Legacy Data",
     items: [
-      { label: "Manifest", to: "/data/manifest" },
-      { label: "Repository Browser", to: "/data/repository-browser" },
       { label: "Citations", to: "/data/citations" },
       { label: "Bibliography", to: "/data/bibliography" },
       { label: "Contexts", to: "/data/sentences" },
@@ -38,18 +37,9 @@ const NAV_GROUPS: Array<{ label: string; items: NavEntry[] }> = [
     ],
   },
   {
-    label: "Research",
+    label: "Legacy Settings",
     items: [
-      { label: "Research Purpose", to: "/research/purpose" },
-      { label: "Project Profile", to: "/research/project-profile" },
-    ],
-  },
-  {
-    label: "Settings",
-    items: [
-      { label: "LLM Backend", to: "/settings/llm-backend" },
       { label: "Ingestion Profiles", to: "/settings/ingestion-profiles" },
-      { label: "Repository Settings", to: "/settings/repository" },
       { label: "Advanced", to: "/settings/advanced" },
     ],
   },
@@ -77,11 +67,14 @@ export function AppShell() {
     processingRunning,
     sourceRunning,
     sourceStopping,
+    sourceTaskJobId,
     processingStatus,
     sourceStatus,
+    cancelSourceTasks,
   } = useAppState();
 
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [legacyOpen, setLegacyOpen] = useState(false);
 
   const repoName = useMemo(() => {
     if (!repositoryStatus?.path) return "No Repository";
@@ -91,6 +84,9 @@ export function AppShell() {
 
   const jobLabel = useMemo(() => {
     if (sourceRunning) {
+      if (!sourceStatus) {
+        return sourceStopping ? "Repository Processing stopping" : "Repository Processing running";
+      }
       const processed = sourceStatus?.processed_urls || 0;
       const total = sourceStatus?.total_urls || 0;
       return sourceStopping
@@ -134,6 +130,7 @@ export function AppShell() {
   ]);
 
   const repoState = repositoryStatus?.download_state || "idle";
+  const isBrowserRoute = location.pathname === "/browser";
 
   const handleOpenProject = useCallback(async () => {
     const seedPath = repositoryStatus?.path || lastRepositoryPath;
@@ -141,7 +138,7 @@ export function AppShell() {
     if (!selectedPath) return;
     const opened = await openRepository(selectedPath);
     if (opened) {
-      navigate("/project/overview");
+      navigate("/browser");
     }
   }, [
     lastRepositoryPath,
@@ -157,7 +154,7 @@ export function AppShell() {
     if (!selectedPath) return;
     const created = await createRepository(selectedPath);
     if (created) {
-      navigate("/project/ingest");
+      navigate("/browser");
     }
   }, [
     createRepository,
@@ -173,7 +170,7 @@ export function AppShell() {
   }, [navigate, switchRepository]);
 
   return (
-    <div className="flex min-h-screen flex-col bg-surface">
+    <div className="flex h-screen overflow-hidden flex-col bg-surface">
       <header className="sticky top-0 z-40 flex h-14 items-center justify-between border-b border-outline-variant/30 bg-surface px-4 md:px-6">
         <div className="flex items-center gap-4">
           <button
@@ -183,7 +180,7 @@ export function AppShell() {
           >
             Menu
           </button>
-          <button className="text-xl font-bold tracking-tight" onClick={() => navigate("/project/overview")} type="button">
+          <button className="text-xl font-bold tracking-tight" onClick={() => navigate("/browser")} type="button">
             ResearchAssistant
           </button>
           <div className="hidden items-center gap-2 lg:flex">
@@ -204,12 +201,7 @@ export function AppShell() {
         </div>
 
         <div className="flex items-center gap-2">
-          <input
-            className="hidden rounded-md border border-outline-variant bg-surface-container-low px-3 py-1.5 text-body-md text-on-surface placeholder:text-on-surface-variant focus:border-primary focus:outline-none lg:block"
-            placeholder="Search data..."
-            type="text"
-          />
-          <Button variant="secondary" onClick={() => navigate("/project/overview")}>Home</Button>
+          <Button variant="secondary" onClick={() => navigate("/browser")}>Home</Button>
           <Button variant="secondary" onClick={handleSwitchRepository}>Switch Repo</Button>
         </div>
       </header>
@@ -229,43 +221,87 @@ export function AppShell() {
             </div>
           </div>
 
-          <Button className="mb-4 w-full" variant="primary" onClick={() => navigate("/project/ingest")}>New Research</Button>
-
           <nav className="space-y-4 pb-6">
-            {NAV_GROUPS.map((group) => (
-              <section key={group.label}>
-                <div className="px-2 pb-1 text-label-sm uppercase tracking-[0.09em] text-on-surface-variant/60">
-                  {group.label}
-                </div>
-                <div className="space-y-1">
-                  {group.items.map((item) => (
-                    <NavLink
-                      key={item.to}
-                      className={({ isActive }) =>
-                        [
-                          "block rounded-md px-3 py-2 text-body-md transition",
-                          isActive
-                            ? "bg-surface-container-highest text-primary"
-                            : "text-on-surface-variant hover:bg-surface-container hover:text-on-surface",
-                        ].join(" ")
-                      }
-                      onClick={() => setSidebarOpen(false)}
-                      to={item.to}
-                    >
-                      {item.label}
-                    </NavLink>
+            <section>
+              <div className="px-2 pb-2 text-label-sm uppercase tracking-[0.09em] text-on-surface-variant/60">
+                Workspace
+              </div>
+              <div className="space-y-1">
+                {PRIMARY_NAV.map((item) => (
+                  <NavLink
+                    key={item.to}
+                    className={({ isActive }) =>
+                      [
+                        "block rounded-md px-3 py-2 text-body-md transition",
+                        isActive
+                          ? "bg-surface-container-highest text-primary"
+                          : "text-on-surface-variant hover:bg-surface-container hover:text-on-surface",
+                      ].join(" ")
+                    }
+                    onClick={() => setSidebarOpen(false)}
+                    to={item.to}
+                  >
+                    {item.label}
+                  </NavLink>
+                ))}
+              </div>
+            </section>
+
+            <section>
+              <button
+                className="flex w-full items-center justify-between rounded-md px-2 py-2 text-left text-label-sm uppercase tracking-[0.09em] text-on-surface-variant/70 hover:bg-surface-container"
+                onClick={() => setLegacyOpen((prev) => !prev)}
+                type="button"
+              >
+                <span>Legacy</span>
+                <span>{legacyOpen ? "−" : "+"}</span>
+              </button>
+              {legacyOpen && (
+                <div className="mt-2 space-y-4">
+                  {LEGACY_NAV_GROUPS.map((group) => (
+                    <section key={group.label}>
+                      <div className="px-2 pb-1 text-label-sm uppercase tracking-[0.09em] text-on-surface-variant/50">
+                        {group.label}
+                      </div>
+                      <div className="space-y-1">
+                        {group.items.map((item) => (
+                          <NavLink
+                            key={item.to}
+                            className={({ isActive }) =>
+                              [
+                                "block rounded-md px-3 py-2 text-body-md transition",
+                                isActive
+                                  ? "bg-surface-container-highest text-primary"
+                                  : "text-on-surface-variant hover:bg-surface-container hover:text-on-surface",
+                              ].join(" ")
+                            }
+                            onClick={() => setSidebarOpen(false)}
+                            to={item.to}
+                          >
+                            {item.label}
+                          </NavLink>
+                        ))}
+                      </div>
+                    </section>
                   ))}
                 </div>
-              </section>
-            ))}
+              )}
+            </section>
           </nav>
         </aside>
 
-        <main className="thin-scrollbar min-h-0 flex-1 overflow-y-auto bg-surface-container-lowest p-4 pb-24 md:p-6 md:pb-24">
+        <main
+          className={[
+            "thin-scrollbar flex min-h-0 flex-1 flex-col bg-surface-container-lowest p-4 pb-24 md:p-6 md:pb-24",
+            isBrowserRoute ? "overflow-hidden" : "overflow-y-auto",
+          ].join(" ")}
+        >
           <div className="mb-4 font-mono text-label-sm uppercase tracking-[0.08em] text-on-surface-variant/70">
-            {location.pathname.replace(/^\//, "").replace(/\//g, " > ") || "project > overview"}
+            {location.pathname.replace(/^\//, "").replace(/\//g, " > ") || "browser"}
           </div>
-          <Outlet />
+          <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden">
+            <Outlet />
+          </div>
         </main>
       </div>
 
@@ -278,8 +314,19 @@ export function AppShell() {
           <div className="font-mono text-label-sm text-on-surface-variant">{jobLabel}</div>
         </div>
 
-        <div className="text-right font-mono text-label-sm text-on-surface-variant">
-          {dashboard?.recent_jobs?.[0]?.message || "No active jobs"}
+        <div className="ml-4 flex min-w-0 items-center justify-end gap-3">
+          <div className="truncate text-right font-mono text-label-sm text-on-surface-variant">
+            {dashboard?.recent_jobs?.[0]?.message || "No active jobs"}
+          </div>
+          {sourceRunning && sourceTaskJobId && (
+            <Button
+              disabled={sourceStopping}
+              variant="danger"
+              onClick={() => void cancelSourceTasks()}
+            >
+              {sourceStopping ? "Stopping..." : "Stop Run"}
+            </Button>
+          )}
         </div>
       </footer>
     </div>

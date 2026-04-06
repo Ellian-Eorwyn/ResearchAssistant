@@ -1,36 +1,39 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  REPOSITORY_BROWSER_BIBLIOGRAPHY_COLUMNS,
   buildRepositoryBrowserQuery,
+  buildRepositoryBrowserStorageKey,
+  clampRepositoryBrowserColumnWidth,
+  defaultRepositoryBrowserColumnWidth,
+  migrateRepositoryBrowserVisibleColumns,
+  REPOSITORY_BROWSER_COLUMN_CATEGORIES,
   formatRepositoryBrowserExportFilename,
+  nextRepositoryBrowserSort,
   REPOSITORY_BROWSER_DEFAULT_VISIBLE_COLUMNS,
+  REPOSITORY_BROWSER_PAGE_SIZE,
+  resolveRepositoryBrowserColumnWidth,
   toggleRepositoryBrowserSelection,
 } from "./repositoryBrowserUtils";
 
 describe("repositoryBrowserUtils", () => {
   it("exposes stable default visible columns", () => {
     expect(REPOSITORY_BROWSER_DEFAULT_VISIBLE_COLUMNS).toEqual([
-      "id",
-      "source_kind",
-      "source_document_name",
       "title",
       "author_names",
-      "publication_date",
-      "document_type",
-      "organization_name",
+      "publication_year",
       "organization_type",
-      "tags_text",
-      "markdown_char_count",
-      "summary_text",
+      "organization_name",
       "rating_overall_relevance",
-      "rating_depth_score",
-      "rating_relevant_detail_score",
-      "rating_rationale",
-      "file_pdf",
-      "file_html",
-      "file_rendered",
-      "file_md",
     ]);
+  });
+
+  it("groups columns into categorized visibility sections with bibliography first", () => {
+    expect(REPOSITORY_BROWSER_COLUMN_CATEGORIES[0]).toEqual({
+      id: "bibliography",
+      label: "Bibliography",
+      columnKeys: REPOSITORY_BROWSER_BIBLIOGRAPHY_COLUMNS,
+    });
   });
 
   it("builds repository-browser query parameters including threshold filters", () => {
@@ -53,6 +56,14 @@ describe("repositoryBrowserUtils", () => {
       ratingDepthScoreMax: "",
       ratingRelevantDetailScoreMin: "0.5",
       ratingRelevantDetailScoreMax: "",
+      citationType: "report",
+      citationDoi: "10.1234/example",
+      citationReportNumber: "CEC-500-2025-029",
+      citationStandardNumber: "",
+      citationMissingFields: "authors",
+      citationReady: "true",
+      citationConfidenceMin: "0.8",
+      citationConfidenceMax: "",
       sortBy: "rating_depth_score",
       sortDir: "desc",
       limit: 100,
@@ -75,10 +86,62 @@ describe("repositoryBrowserUtils", () => {
     expect(params.get("rating_overall_relevance_min")).toBe("0.6");
     expect(params.get("rating_overall_relevance_max")).toBe("0.9");
     expect(params.get("rating_relevant_detail_score_min")).toBe("0.5");
+    expect(params.get("citation_type")).toBe("report");
+    expect(params.get("citation_doi")).toBe("10.1234/example");
+    expect(params.get("citation_report_number")).toBe("CEC-500-2025-029");
+    expect(params.get("citation_missing_fields")).toBe("authors");
+    expect(params.get("citation_ready")).toBe("true");
+    expect(params.get("citation_confidence_min")).toBe("0.8");
     expect(params.get("sort_by")).toBe("rating_depth_score");
     expect(params.get("sort_dir")).toBe("desc");
     expect(params.get("limit")).toBe("100");
     expect(params.get("offset")).toBe("200");
+  });
+
+  it("scopes browser storage keys per repository path", () => {
+    expect(buildRepositoryBrowserStorageKey("/tmp/repo-a")).not.toBe(
+      buildRepositoryBrowserStorageKey("/tmp/repo-b"),
+    );
+    expect(buildRepositoryBrowserStorageKey("/tmp/repo-a")).toContain("repository-browser:v6:");
+  });
+
+  it("uses a fixed repository browser page size and clamps column widths", () => {
+    expect(REPOSITORY_BROWSER_PAGE_SIZE).toBe(250);
+    expect(clampRepositoryBrowserColumnWidth(40)).toBe(120);
+    expect(clampRepositoryBrowserColumnWidth(810)).toBe(720);
+    expect(clampRepositoryBrowserColumnWidth(242.2)).toBe(242);
+    expect(defaultRepositoryBrowserColumnWidth("title")).toBe(320);
+    expect(defaultRepositoryBrowserColumnWidth("file_pdf")).toBe(110);
+    expect(resolveRepositoryBrowserColumnWidth({ title: 60 }, "title")).toBe(120);
+    expect(resolveRepositoryBrowserColumnWidth({}, "title")).toBe(320);
+  });
+
+  it("migrates unchanged legacy visible columns to the new browser defaults", () => {
+    expect(
+      migrateRepositoryBrowserVisibleColumns(REPOSITORY_BROWSER_BIBLIOGRAPHY_COLUMNS),
+    ).toEqual(REPOSITORY_BROWSER_DEFAULT_VISIBLE_COLUMNS);
+    expect(
+      migrateRepositoryBrowserVisibleColumns(["title", "summary_text", "organization_name"]),
+    ).toEqual(["title", "summary_text", "organization_name"]);
+  });
+
+  it("cycles sort state from asc to desc to unsorted", () => {
+    expect(nextRepositoryBrowserSort("", "", "title")).toEqual({
+      sortBy: "title",
+      sortDir: "asc",
+    });
+    expect(nextRepositoryBrowserSort("title", "asc", "title")).toEqual({
+      sortBy: "title",
+      sortDir: "desc",
+    });
+    expect(nextRepositoryBrowserSort("title", "desc", "title")).toEqual({
+      sortBy: "",
+      sortDir: "",
+    });
+    expect(nextRepositoryBrowserSort("author_names", "desc", "title")).toEqual({
+      sortBy: "title",
+      sortDir: "asc",
+    });
   });
 
   it("supports shift-range selection and clear behavior", () => {

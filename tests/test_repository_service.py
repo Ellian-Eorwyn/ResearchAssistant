@@ -11,11 +11,41 @@ from openpyxl import Workbook
 
 from backend.models.export import EXPORT_COLUMNS, ExportRow
 from backend.models.ingestion_profiles import DocumentNormalizationResult, IngestionProfile
+from backend.models.repository import (
+    RepositoryCitationRisExportRequest,
+    RepositoryColumnRunRequest,
+    RepositoryManifestFilterRequest,
+)
 from backend.models.settings import RepoSettings
 from backend.models.sources import SourceManifestRow
 from backend.pipeline.standardized_markdown import NormalizedDocumentOutput
 from backend.storage.attached_repository import AttachedRepositoryService, repository_dedupe_key
 from backend.storage.file_store import FileStore
+
+
+class _ImmediateThread:
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+        self._target = target
+        self._args = args
+        self._kwargs = kwargs or {}
+
+    def start(self) -> None:
+        if self._target is not None:
+            self._target(*self._args, **self._kwargs)
+
+    def is_alive(self) -> bool:
+        return False
+
+
+class _NoOpThread:
+    def __init__(self, *args, **kwargs):
+        return None
+
+    def start(self) -> None:
+        return None
+
+    def is_alive(self) -> bool:
+        return False
 
 
 class RepositoryServiceTests(unittest.TestCase):
@@ -663,6 +693,326 @@ class RepositoryServiceTests(unittest.TestCase):
         self.assertTrue(manifest_text.startswith("id,repository_source_id,"))
         self.assertTrue(citations_text.startswith(",".join(EXPORT_COLUMNS)))
         self.assertTrue((repo_dir / "manifest.xlsx").exists())
+
+    def test_repo_settings_round_trip_persists_default_project_profile_name(self):
+        repo_dir = self.tmp_path / "repo_settings_round_trip"
+        self.service.create(str(repo_dir))
+
+        settings = RepoSettings(
+            use_llm=True,
+            research_purpose="Track housing retrofit workforce evidence.",
+            default_project_profile_name="housing_retrofit.yaml",
+            fetch_delay=3.5,
+        )
+        self.service.save_repo_settings(settings)
+
+        loaded = self.service.load_repo_settings()
+        raw = json.loads((repo_dir / ".ra_repo" / "settings.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(loaded.default_project_profile_name, "housing_retrofit.yaml")
+        self.assertEqual(loaded.fetch_delay, 3.5)
+        self.assertEqual(raw["default_project_profile_name"], "housing_retrofit.yaml")
+        self.assertEqual(raw["research_purpose"], "Track housing retrofit workforce evidence.")
+
+    def test_column_configs_persist_and_blank_custom_columns_render_in_manifest(self):
+        repo_dir = self._attach_repo("repo_column_configs")
+        self.service.import_source_list(
+            filename="sources.csv",
+            content=(
+                "URL,Title\n"
+                "https://example.com/a,Alpha Source\n"
+                "https://example.com/b,Beta Source\n"
+            ).encode("utf-8"),
+        )
+
+        custom = self.service.create_column("POC")
+        builtin = self.service.update_column(
+            "title",
+            patch={"instruction_prompt": "Normalize the title string and keep it concise."},
+        )
+
+        manifest = self.service.list_manifest(limit=10, offset=0, sort_by="id", sort_dir="asc")
+        columns = {column["key"]: column for column in manifest["columns"]}
+
+        self.assertEqual(custom.kind, "custom")
+        self.assertIn(custom.id, columns)
+        self.assertEqual(columns[custom.id]["label"], "POC")
+        self.assertEqual(columns[custom.id]["kind"], "custom")
+        self.assertEqual(columns[custom.id]["processable"], True)
+        self.assertIn(custom.id, manifest["rows"][0])
+        self.assertEqual(manifest["rows"][0][custom.id], "")
+        self.assertEqual(builtin.instruction_prompt, "Normalize the title string and keep it concise.")
+        self.assertEqual(columns["title"]["instruction_prompt"], builtin.instruction_prompt)
+        self.assertTrue(columns["author_names"]["instruction_prompt"])
+        self.assertTrue(columns["publication_year"]["instruction_prompt"])
+
+        self.service.attach(str(repo_dir))
+        reloaded = self.service.list_manifest(limit=10, offset=0, sort_by="id", sort_dir="asc")
+        reloaded_columns = {column["key"]: column for column in reloaded["columns"]}
+        self.assertEqual(reloaded_columns[custom.id]["label"], "POC")
+        self.assertEqual(reloaded_columns["title"]["instruction_prompt"], builtin.instruction_prompt)
+        self.assertTrue(reloaded_columns["publication_year"]["instruction_prompt"])
+
+    def test_column_run_uses_all_filtered_rows_across_pages(self):
+        self._attach_repo("repo_column_scope")
+        csv_rows = ["URL,Title"]
+        csv_rows.extend(
+            f"https://example.com/source-{index:03d},Scope Source {index:03d}"
+            for index in range(260)
+        )
+        self.service.import_source_list(
+            filename="sources.csv",
+            content=("\n".join(csv_rows) + "\n").encode("utf-8"),
+        )
+
+        settings = self.service.load_repo_settings()
+        settings.use_llm = True
+        settings.llm_backend.model = "test-model"
+        self.service.save_repo_settings(settings)
+
+        column = self.service.create_column("Classification")
+        self.service.update_column(
+            column.id,
+            patch={"instruction_prompt": "Answer yes or no only based on the document."},
+        )
+
+        page = self.service.list_manifest(q="Scope Source", limit=250, offset=0)
+        self.assertEqual(page["total"], 260)
+        self.assertEqual(len(page["rows"]), 250)
+
+        with patch("backend.storage.attached_repository.llm_backend_ready_for_chat", return_value=True), patch(
+            "backend.storage.attached_repository.threading.Thread",
+            _NoOpThread,
+        ):
+            response = self.service.start_column_run(
+                column.id,
+                payload=RepositoryColumnRunRequest(
+                    filters=RepositoryManifestFilterRequest(q="Scope Source"),
+                    confirm_overwrite=True,
+                ),
+            )
+
+        self.assertEqual(response.status, "started")
+        self.assertEqual(response.total_rows, 260)
+
+    def test_column_run_returns_confirmation_when_custom_cells_are_populated(self):
+        self._attach_repo("repo_column_confirmation")
+        self.service.import_source_list(
+            filename="sources.csv",
+            content=(
+                "URL,Title\n"
+                "https://example.com/a,Alpha Source\n"
+                "https://example.com/b,Beta Source\n"
+            ).encode("utf-8"),
+        )
+
+        settings = self.service.load_repo_settings()
+        settings.use_llm = True
+        settings.llm_backend.model = "test-model"
+        self.service.save_repo_settings(settings)
+
+        column = self.service.create_column("POC")
+        self.service.update_column(
+            column.id,
+            patch={"instruction_prompt": "Answer yes or no only based on the document."},
+        )
+        self.service.update_source("000001", patch={"custom_fields": {column.id: "yes"}})
+
+        with patch("backend.storage.attached_repository.llm_backend_ready_for_chat", return_value=True):
+            response = self.service.start_column_run(
+                column.id,
+                payload=RepositoryColumnRunRequest(
+                    filters=RepositoryManifestFilterRequest(),
+                    confirm_overwrite=False,
+                ),
+            )
+
+        self.assertEqual(response.status, "confirmation_required")
+        self.assertEqual(response.total_rows, 2)
+        self.assertEqual(response.populated_rows, 1)
+
+    def test_column_run_can_target_only_selected_rows(self):
+        self._attach_repo("repo_column_selected_scope")
+        self.service.import_source_list(
+            filename="sources.csv",
+            content=(
+                "URL,Title\n"
+                "https://example.com/a,Alpha Source\n"
+                "https://example.com/b,Beta Source\n"
+                "https://example.com/c,Gamma Source\n"
+            ).encode("utf-8"),
+        )
+
+        settings = self.service.load_repo_settings()
+        settings.use_llm = True
+        settings.llm_backend.model = "test-model"
+        self.service.save_repo_settings(settings)
+
+        column = self.service.create_column("POC")
+        self.service.update_column(
+            column.id,
+            patch={"instruction_prompt": "Answer yes or no only based on the document."},
+        )
+
+        with patch("backend.storage.attached_repository.llm_backend_ready_for_chat", return_value=True), patch(
+            "backend.storage.attached_repository.threading.Thread",
+            _NoOpThread,
+        ):
+            response = self.service.start_column_run(
+                column.id,
+                payload=RepositoryColumnRunRequest(
+                    scope="selected",
+                    source_ids=["000002", "000003"],
+                    confirm_overwrite=True,
+                ),
+            )
+
+        self.assertEqual(response.status, "started")
+        self.assertEqual(response.total_rows, 2)
+
+    def test_builtin_column_run_isolates_row_failures_and_updates_catalog_artifacts(self):
+        repo_dir = self._attach_repo("repo_builtin_column_run")
+        self.service.import_source_list(
+            filename="sources.csv",
+            content=(
+                "URL,Title\n"
+                "https://example.com/a,Alpha Source\n"
+                "https://example.com/b,Beta Source\n"
+            ).encode("utf-8"),
+        )
+
+        settings = self.service.load_repo_settings()
+        settings.use_llm = True
+        settings.llm_backend.model = "test-model"
+        self.service.save_repo_settings(settings)
+        manifest = self.service.list_manifest(limit=10, offset=0, sort_by="id", sort_dir="asc")
+        columns = {column["key"]: column for column in manifest["columns"]}
+        self.assertTrue(columns["title"]["instruction_prompt"])
+
+        class DummyClient:
+            call_count = 0
+
+            def __init__(self, *_args, **_kwargs):
+                return None
+
+            def sync_chat_completion(self, **_kwargs):
+                type(self).call_count += 1
+                if type(self).call_count == 1:
+                    return json.dumps({"value": "ALPHA SOURCE REWRITTEN", "status": "ok"})
+                raise RuntimeError("Simulated LLM failure")
+
+            def sync_close(self):
+                return None
+
+        with patch("backend.storage.attached_repository.llm_backend_ready_for_chat", return_value=True), patch(
+            "backend.storage.attached_repository.UnifiedLLMClient",
+            DummyClient,
+        ), patch(
+            "backend.storage.attached_repository.threading.Thread",
+            _NoOpThread,
+        ):
+            response = self.service.start_column_run(
+                "title",
+                payload=RepositoryColumnRunRequest(
+                    filters=RepositoryManifestFilterRequest(),
+                    confirm_overwrite=True,
+                ),
+            )
+            self.service._repository_column_run_worker(
+                response.job_id,
+                "title",
+                ["000001", "000002"],
+                settings,
+            )
+
+        status = self.service.get_column_run_status(response.job_id)
+        self.assertEqual(status.state, "completed")
+        self.assertEqual(status.succeeded_rows, 1)
+        self.assertEqual(status.failed_rows, 1)
+        self.assertEqual(len(status.row_errors), 1)
+
+        manifest = self.service.list_manifest(limit=10, offset=0, sort_by="id", sort_dir="asc")
+        self.assertEqual(manifest["rows"][0]["title"], "ALPHA SOURCE REWRITTEN")
+        self.assertEqual(manifest["rows"][1]["title"], "Beta Source")
+
+        catalog_path = repo_dir / "sources" / "000001" / "000001_catalog.json"
+        self.assertTrue(catalog_path.exists())
+        catalog_payload = json.loads(catalog_path.read_text(encoding="utf-8"))
+        self.assertEqual(catalog_payload["title"], "ALPHA SOURCE REWRITTEN")
+
+    def test_author_column_run_falls_back_to_organization_and_updates_ris_export(self):
+        repo_dir = self._attach_repo("repo_author_column_fallback")
+        self.service.import_source_list(
+            filename="sources.csv",
+            content=("URL,Title\nhttps://example.com/a,Alpha Source\n").encode("utf-8"),
+        )
+
+        self.service.update_source(
+            "000001",
+            patch={
+                "title": "Alpha Source",
+                "publication_date": "2025",
+                "document_type": "report",
+                "organization_name": "California Energy Commission",
+            },
+        )
+
+        settings = self.service.load_repo_settings()
+        settings.use_llm = True
+        settings.llm_backend.model = "test-model"
+        self.service.save_repo_settings(settings)
+
+        class DummyClient:
+            def __init__(self, *_args, **_kwargs):
+                return None
+
+            def sync_chat_completion(self, **_kwargs):
+                return json.dumps({"value": "", "status": "insufficient_evidence"})
+
+            def sync_close(self):
+                return None
+
+        with patch("backend.storage.attached_repository.llm_backend_ready_for_chat", return_value=True), patch(
+            "backend.storage.attached_repository.UnifiedLLMClient",
+            DummyClient,
+        ), patch(
+            "backend.storage.attached_repository.threading.Thread",
+            _NoOpThread,
+        ):
+            response = self.service.start_column_run(
+                "author_names",
+                payload=RepositoryColumnRunRequest(
+                    filters=RepositoryManifestFilterRequest(),
+                    confirm_overwrite=True,
+                ),
+            )
+            self.service._repository_column_run_worker(
+                response.job_id,
+                "author_names",
+                ["000001"],
+                settings,
+            )
+
+        manifest = self.service.list_manifest(limit=10, offset=0, sort_by="id", sort_dir="asc")
+        row = manifest["rows"][0]
+        self.assertEqual(row["author_names"], "California Energy Commission")
+        self.assertEqual(row["citation_authors"], "California Energy Commission")
+        self.assertEqual(row["citation_verification_status"], "verified")
+        self.assertTrue(row["citation_ready"])
+
+        catalog = json.loads(
+            (repo_dir / "sources" / "000001" / "000001_catalog.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(catalog["citation"]["authors"][0]["literal"], "California Energy Commission")
+        self.assertEqual(catalog["citation"]["verification_status"], "verified")
+        self.assertTrue(catalog["citation"]["ready_for_ris"])
+
+        ris_bytes, headers = self.service.export_citations_ris(
+            RepositoryCitationRisExportRequest(scope="all")
+        )
+        decoded = ris_bytes.decode("utf-8")
+        self.assertIn("AU  - California Energy Commission", decoded)
+        self.assertEqual(headers["X-ResearchAssistant-Exported-Count"], "1")
 
     def test_list_ingestion_profiles_reads_repo_bundled_snapshot(self):
         repo_dir = self._attach_repo("repo_bundled_profiles")

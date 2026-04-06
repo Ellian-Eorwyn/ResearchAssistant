@@ -236,12 +236,25 @@ class RepositoryDashboardManifestApiTests(unittest.TestCase):
         self.assertGreaterEqual(len(payload["rows"]), 2)
         self.assertEqual(payload["rows"][0]["id"], "000001")
 
+    def test_repository_manifest_sorts_dates_type_aware(self):
+        resp = self.client.get(
+            "/api/repository/manifest?sort_by=publication_date&sort_dir=desc"
+        )
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.json()
+
+        self.assertEqual(payload["sort_by"], "publication_date")
+        self.assertEqual(payload["rows"][0]["id"], "000003")
+        self.assertEqual(payload["rows"][1]["id"], "000001")
+        self.assertEqual(payload["rows"][2]["id"], "000002")
+
     def test_repository_manifest_returns_column_metadata(self):
         resp = self.client.get("/api/repository/manifest")
         self.assertEqual(resp.status_code, 200)
         payload = resp.json()
 
-        keys = {item["key"] for item in payload["columns"]}
+        column_map = {item["key"]: item for item in payload["columns"]}
+        keys = set(column_map)
         self.assertIn("id", keys)
         self.assertIn("source_kind", keys)
         self.assertIn("author_names", keys)
@@ -250,6 +263,9 @@ class RepositoryDashboardManifestApiTests(unittest.TestCase):
         self.assertIn("tags_text", keys)
         self.assertIn("rating_depth_score", keys)
         self.assertIn("rating_overall_relevance", keys)
+        self.assertTrue(column_map["author_names"]["instruction_prompt"])
+        self.assertTrue(column_map["publication_year"]["instruction_prompt"])
+        self.assertEqual(column_map["publication_year"]["sort_type"], "number")
 
     def test_repository_manifest_filters_by_catalog_fields(self):
         resp = self.client.get(

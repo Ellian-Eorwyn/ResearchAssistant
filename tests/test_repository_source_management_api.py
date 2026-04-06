@@ -187,6 +187,115 @@ class RepositorySourceManagementApiTests(unittest.TestCase):
             "# External cleanup\n",
         )
 
+    def test_patch_source_updates_manifest_catalog_summary_and_rating_artifacts(self):
+        response = self.client.patch(
+            "/api/repository/sources/000001",
+            json={
+                "title": "Alpha Source Revised",
+                "author_names": "Jane Doe; John Roe",
+                "publication_date": "2025-03-15",
+                "document_type": "report",
+                "organization_name": "Alpha Agency",
+                "organization_type": "government",
+                "tags_text": "housing, retrofit",
+                "notes": "Reviewed by analyst",
+                "summary_text": "This report summarizes retrofit pilots.",
+                "overall_relevance": 0.9,
+                "depth_score": 0.75,
+                "relevant_detail_score": 0.8,
+                "rating_rationale": "Directly addresses retrofit implementation evidence.",
+                "relevant_sections": "Executive summary\nAppendix B",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+
+        self.assertEqual(payload["title"], "Alpha Source Revised")
+        self.assertEqual(payload["author_names"], "Jane Doe; John Roe")
+        self.assertEqual(payload["summary_text"], "This report summarizes retrofit pilots.")
+        self.assertEqual(payload["rating_overall_relevance"], 0.9)
+        self.assertEqual(payload["rating_depth_score"], 0.75)
+        self.assertEqual(payload["rating_relevant_detail_score"], 0.8)
+        self.assertEqual(
+            payload["rating_rationale"],
+            "Directly addresses retrofit implementation evidence.",
+        )
+        self.assertEqual(payload["relevant_sections"], "Executive summary\n\nAppendix B")
+
+        summary_path = self.repo_dir / "sources" / "000001" / "000001_summary.md"
+        rating_path = self.repo_dir / "sources" / "000001" / "000001_rating.json"
+        catalog_path = self.repo_dir / "sources" / "000001" / "000001_catalog.json"
+        metadata_path = self.repo_dir / "sources" / "000001" / "000001_metadata.json"
+
+        self.assertTrue(summary_path.exists())
+        self.assertTrue(rating_path.exists())
+        self.assertTrue(catalog_path.exists())
+        self.assertTrue(metadata_path.exists())
+
+        catalog_payload = json.loads(catalog_path.read_text(encoding="utf-8"))
+        self.assertEqual(catalog_payload["title"], "Alpha Source Revised")
+        self.assertEqual(catalog_payload["author_names"], "Jane Doe; John Roe")
+        self.assertEqual(catalog_payload["citation"]["title"], "")
+        self.assertEqual(catalog_payload["citation"]["publisher"], "")
+
+        rating_payload = json.loads(rating_path.read_text(encoding="utf-8"))
+        self.assertEqual(rating_payload["ratings"]["overall_relevance"], 0.9)
+        self.assertEqual(rating_payload["ratings"]["depth_score"], 0.75)
+        self.assertEqual(rating_payload["ratings"]["relevant_detail_score"], 0.8)
+        self.assertEqual(
+            rating_payload["relevant_sections"],
+            ["Executive summary", "Appendix B"],
+        )
+
+        self.assertIn("This report summarizes retrofit pilots.", summary_path.read_text(encoding="utf-8"))
+
+        state = json.loads(
+            (self.repo_dir / ".ra_repo" / "repository_state.json").read_text(encoding="utf-8")
+        )
+        source_row = next(row for row in state["sources"] if row["id"] == "000001")
+        self.assertEqual(source_row["summary_status"], "existing")
+        self.assertEqual(source_row["rating_status"], "existing")
+        self.assertEqual(source_row["catalog_status"], "existing")
+        self.assertEqual(source_row["publication_year"], "2025")
+
+    def test_patch_source_updates_verified_citation_metadata_separately(self):
+        response = self.client.patch(
+            "/api/repository/sources/000001",
+            json={
+                "citation_title": "Alpha Citation Title",
+                "citation_authors": "Jane Doe; John Roe",
+                "citation_issued": "2025-03-15",
+                "citation_type": "report",
+                "citation_publisher": "Alpha Agency",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+
+        self.assertEqual(payload["citation_title"], "Alpha Citation Title")
+        self.assertEqual(payload["citation_authors"], "Jane Doe; John Roe")
+        self.assertEqual(payload["citation_issued"], "2025-03-15")
+        self.assertEqual(payload["citation_type"], "report")
+        self.assertEqual(payload["citation_verification_status"], "verified")
+        self.assertTrue(payload["citation_ready"])
+
+        catalog_path = self.repo_dir / "sources" / "000001" / "000001_catalog.json"
+        catalog_payload = json.loads(catalog_path.read_text(encoding="utf-8"))
+        citation = catalog_payload["citation"]
+
+        self.assertEqual(citation["title"], "Alpha Citation Title")
+        self.assertEqual(citation["issued"], "2025-03-15")
+        self.assertEqual(citation["item_type"], "report")
+        self.assertEqual(citation["publisher"], "Alpha Agency")
+        self.assertEqual(citation["verification_status"], "verified")
+        self.assertTrue(citation["ready_for_ris"])
+        self.assertIn("title", citation["manual_override_fields"])
+        self.assertIn("authors", citation["manual_override_fields"])
+        self.assertIn("issued", citation["manual_override_fields"])
+        self.assertIn("item_type", citation["manual_override_fields"])
+        self.assertTrue(citation["field_evidence"]["title"]["manual_override"])
+        self.assertEqual(citation["field_evidence"]["title"]["source_type"], "manual_override")
+
 
 if __name__ == "__main__":
     unittest.main()

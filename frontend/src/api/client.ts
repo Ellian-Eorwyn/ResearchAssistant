@@ -9,13 +9,24 @@ import type {
   ModelsResponse,
   PickDirectoryResponse,
   ProjectProfile,
+  ProjectProfileGenerateRequest,
+  ProjectProfileGenerateResponse,
+  ProjectProfileSaveRequest,
+  ProjectProfileSaveResponse,
   RepoSettings,
   RepositoryActionResponse,
+  RepositoryColumnConfig,
+  RepositoryColumnPromptFixResponse,
+  RepositoryColumnRunStartResponse,
+  RepositoryColumnRunStatus,
   RepositoryCitationDataResponse,
+  RepositoryCitationRisDownloadResult,
+  RepositoryCitationRisExportRequest,
   RepositoryDashboardResponse,
   RepositoryDocumentImportListResponse,
   RepositoryImportResponse,
   RepositoryManifestResponse,
+  RepositoryManifestFilterPayload,
   RepositoryMergeResponse,
   RepositoryProcessDocumentsResponse,
   RepositoryReprocessDocumentsRequest,
@@ -23,6 +34,7 @@ import type {
   RepositorySourceDeleteResponse,
   RepositorySourceExportRequest,
   RepositorySourceExportResponse,
+  RepositorySourcePatchRequest,
   RepositorySourceTaskRequest,
   RepositorySourceTaskResponse,
   RepositoryStatusResponse,
@@ -61,9 +73,50 @@ async function apiPost<T>(path: string, body: unknown): Promise<T> {
   return parseApiResponse<T>(resp);
 }
 
+function parseContentDispositionFilename(value: string | null): string {
+  const header = value || "";
+  const utf8Match = header.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1]);
+    } catch {
+      return utf8Match[1];
+    }
+  }
+  const simpleMatch = header.match(/filename="([^"]+)"/i) || header.match(/filename=([^;]+)/i);
+  return simpleMatch?.[1]?.trim() || "export.ris";
+}
+
+async function apiPostDownload(path: string, body: unknown): Promise<RepositoryCitationRisDownloadResult> {
+  const resp = await fetch(`/api/${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    await parseApiResponse<never>(resp);
+  }
+  return {
+    blob: await resp.blob(),
+    filename: parseContentDispositionFilename(resp.headers.get("Content-Disposition")),
+    requestedCount: Number(resp.headers.get("X-ResearchAssistant-Requested-Count") || "0"),
+    exportedCount: Number(resp.headers.get("X-ResearchAssistant-Exported-Count") || "0"),
+    skippedCount: Number(resp.headers.get("X-ResearchAssistant-Skipped-Count") || "0"),
+  };
+}
+
 async function apiPut<T>(path: string, body: unknown): Promise<T> {
   const resp = await fetch(`/api/${path}`, {
     method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return parseApiResponse<T>(resp);
+}
+
+async function apiPatch<T>(path: string, body: unknown): Promise<T> {
+  const resp = await fetch(`/api/${path}`, {
+    method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
@@ -172,11 +225,59 @@ export const api = {
   getSourceStatus: (jobId: string) => apiGet<SourceDownloadStatus>(`sources/${jobId}/status`),
   getProjectProfiles: () => apiGet<ProjectProfile[]>("project-profiles"),
   uploadProjectProfile: (file: File) => apiPostFile<{ filename: string; name: string }>("project-profiles/upload", file),
+  generateProjectProfile: (payload: ProjectProfileGenerateRequest) =>
+    apiPost<ProjectProfileGenerateResponse>("project-profiles/generate", payload),
+  saveProjectProfile: (filename: string, payload: ProjectProfileSaveRequest) =>
+    apiPut<ProjectProfileSaveResponse>(`project-profiles/${encodeURIComponent(filename)}`, payload),
   getRepositoryDashboard: () => apiGet<RepositoryDashboardResponse>("repository/dashboard"),
   getRepositoryCitationData: () =>
     apiGet<RepositoryCitationDataResponse>("repository/citation-data"),
   getRepositoryManifest: (query: URLSearchParams) =>
     apiGet<RepositoryManifestResponse>(`repository/manifest?${query.toString()}`),
+  createRepositoryColumn: (label: string) =>
+    apiPost<RepositoryColumnConfig>("repository/columns", { label }),
+  updateRepositoryColumn: (
+    columnId: string,
+    payload: {
+      label?: string;
+      instruction_prompt?: string;
+      output_constraint?: RepositoryColumnConfig["output_constraint"];
+    },
+  ) =>
+    apiPatch<RepositoryColumnConfig>(
+      `repository/columns/${encodeURIComponent(columnId)}`,
+      payload,
+    ),
+  fixRepositoryColumnPrompt: (columnId: string, draftPrompt: string) =>
+    apiPost<RepositoryColumnPromptFixResponse>(
+      `repository/columns/${encodeURIComponent(columnId)}/fix-prompt`,
+      { draft_prompt: draftPrompt },
+    ),
+  startRepositoryColumnRun: (
+    columnId: string,
+      payload: {
+      filters: RepositoryManifestFilterPayload;
+      scope?: "filtered" | "all" | "empty_only" | "selected";
+      source_ids?: string[];
+      confirm_overwrite?: boolean;
+    },
+  ) =>
+    apiPost<RepositoryColumnRunStartResponse>(
+      `repository/columns/${encodeURIComponent(columnId)}/run`,
+      {
+        filters: payload.filters,
+        scope: payload.scope || "filtered",
+        source_ids: payload.source_ids || [],
+        confirm_overwrite: Boolean(payload.confirm_overwrite),
+      },
+    ),
+  getRepositoryColumnRunStatus: (jobId: string) =>
+    apiGet<RepositoryColumnRunStatus>(`repository/column-runs/${encodeURIComponent(jobId)}`),
+  patchRepositorySource: (sourceId: string, payload: RepositorySourcePatchRequest) =>
+    apiPatch<RepositoryManifestResponse["rows"][number]>(
+      `repository/sources/${encodeURIComponent(sourceId)}`,
+      payload,
+    ),
   deleteRepositorySources: (sourceIds: string[]) =>
     apiPost<RepositorySourceDeleteResponse>("repository/sources/bulk-delete", {
       source_ids: sourceIds,
@@ -187,4 +288,6 @@ export const api = {
       file_kinds: payload.file_kinds,
       destination_path: payload.destination_path,
     }),
+  exportRepositoryCitationRis: (payload: RepositoryCitationRisExportRequest) =>
+    apiPostDownload("repository/citations/export-ris", payload),
 };

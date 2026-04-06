@@ -14,13 +14,13 @@ import shutil
 import subprocess
 import tempfile
 import threading
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypeVar
-from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
 import fitz  # PyMuPDF
@@ -31,6 +31,8 @@ from backend.llm.client import UnifiedLLMClient
 from backend.llm.prompts import (
     SOURCE_CATALOG_SYSTEM,
     SOURCE_CATALOG_USER,
+    SOURCE_CITATION_VERIFY_SYSTEM,
+    SOURCE_CITATION_VERIFY_USER,
     SOURCE_MARKDOWN_CLEANUP_SYSTEM,
     SOURCE_MARKDOWN_CLEANUP_USER,
     SOURCE_RATING_SYSTEM,
@@ -40,6 +42,8 @@ from backend.llm.prompts import (
     SOURCE_TITLE_SYSTEM,
     SOURCE_TITLE_USER,
 )
+from backend.models.citation_metadata import CitationAuthor, CitationFieldEvidence, CitationMetadata
+from backend.models.repository import RepositoryColumnConfig
 from backend.models.settings import LLMBackendConfig
 from backend.models.sources import (
     SOURCE_MANIFEST_COLUMNS,
@@ -102,6 +106,7 @@ PHASE_SUMMARIZE = "summarize"
 
 PROMPT_VERSION_CLEANUP = "source_markdown_cleanup.v1"
 PROMPT_VERSION_CATALOG = "source_catalog.v1"
+PROMPT_VERSION_CITATION_VERIFY = "source_citation_verify.v1"
 PROMPT_VERSION_TITLE = "source_title.v1"
 PROMPT_VERSION_SUMMARY = "source_summary.v1"
 PROMPT_VERSION_RATING = "source_rating.v1"
@@ -158,6 +163,29 @@ MANIFEST_DERIVED_COLUMNS = [
     "rating_dimensions_json",
     "flag_scores_json",
     "rating_raw_json",
+    "citation_title",
+    "citation_authors",
+    "citation_issued",
+    "citation_url",
+    "citation_publisher",
+    "citation_container_title",
+    "citation_volume",
+    "citation_issue",
+    "citation_pages",
+    "citation_language",
+    "citation_accessed",
+    "citation_type",
+    "citation_doi",
+    "citation_report_number",
+    "citation_standard_number",
+    "citation_verification_status",
+    "citation_blocked_reasons",
+    "citation_manual_override_fields",
+    "citation_field_evidence_json",
+    "citation_verified_at",
+    "citation_ready",
+    "citation_missing_fields",
+    "citation_confidence",
 ]
 
 RATING_DIMENSION_CONTAINER_KEYS = ("ratings", "scores", "dimensions")
@@ -175,6 +203,123 @@ RATING_RESERVED_KEYS = {
     "overall_rating",
     "overall_score",
     "summary",
+}
+
+CITATION_REQUIRED_FIELDS = ("title", "authors", "issued", "url")
+CITATION_REQUIRED_FIELD_LABELS = {
+    "title": "title",
+    "authors": "authors",
+    "issued": "publication_year",
+    "url": "url",
+}
+CITATION_VERIFIABLE_FIELDS = (
+    "item_type",
+    "title",
+    "authors",
+    "issued",
+    "publisher",
+    "container_title",
+    "volume",
+    "issue",
+    "pages",
+    "doi",
+    "url",
+    "report_number",
+    "standard_number",
+    "language",
+    "accessed",
+)
+CITATION_CONFIDENCE_INCREMENT = 0.05
+DOI_CSL_ACCEPT_HEADER = "application/vnd.citationstyles.csl+json"
+DOI_RIS_ACCEPT_HEADER = "application/x-research-info-systems"
+DOI_PATTERN = re.compile(r"\b(10\.\d{4,9}/[-._;()/:A-Z0-9]+)\b", re.IGNORECASE)
+REPORT_NUMBER_PATTERN = re.compile(
+    r"\b(?:report|publication|document|working paper|technical report|report no\.?|publication no\.?)\s*[:#]?\s*([A-Z0-9][A-Z0-9._/-]{2,})",
+    re.IGNORECASE,
+)
+STANDARD_NUMBER_PATTERN = re.compile(
+    r"\b(?:ANSI|ASHRAE|ASTM|IEC|IEEE|ISO|NIST|UL)\s*[A-Z0-9._/-]{1,20}\b",
+    re.IGNORECASE,
+)
+HTML_META_TAG_PATTERN = re.compile(
+    r"""<meta\s+[^>]*(?:name|property)\s*=\s*["']([^"']+)["'][^>]*content\s*=\s*["']([^"']*)["'][^>]*>""",
+    re.IGNORECASE,
+)
+HTML_TITLE_PATTERN = re.compile(r"(?is)<title[^>]*>(.*?)</title>")
+HTML_JSON_LD_PATTERN = re.compile(
+    r'(?is)<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>'
+)
+CORPORATE_AUTHOR_KEYWORDS = {
+    "agency",
+    "association",
+    "board",
+    "bureau",
+    "center",
+    "centre",
+    "commission",
+    "committee",
+    "company",
+    "corporation",
+    "council",
+    "department",
+    "district",
+    "foundation",
+    "group",
+    "institute",
+    "lab",
+    "laboratory",
+    "ministry",
+    "office",
+    "organization",
+    "programme",
+    "program",
+    "society",
+    "team",
+    "university",
+}
+CANONICAL_CITATION_TYPE_MAP = {
+    "article-journal": "journal article",
+    "journalarticle": "journal article",
+    "journal article": "journal article",
+    "journal-article": "journal article",
+    "journal_article": "journal article",
+    "article": "journal article",
+    "article-magazine": "magazine article",
+    "magazine article": "magazine article",
+    "article-newspaper": "newspaper article",
+    "newspaper article": "newspaper article",
+    "book": "book",
+    "book-chapter": "book chapter",
+    "book chapter": "book chapter",
+    "chapter": "book chapter",
+    "report": "report",
+    "working-paper": "report",
+    "working paper": "report",
+    "technical report": "report",
+    "webpage": "web page",
+    "website": "web page",
+    "web page": "web page",
+    "blog post": "web page",
+    "dataset": "dataset",
+    "dissertation": "thesis",
+    "thesis": "thesis",
+    "conference-paper": "conference paper",
+    "conference paper": "conference paper",
+    "proceedings-article": "conference paper",
+    "standard": "standard",
+}
+RIS_TYPE_MAP = {
+    "journal article": "JOUR",
+    "magazine article": "MGZN",
+    "newspaper article": "NEWS",
+    "book": "BOOK",
+    "book chapter": "CHAP",
+    "report": "RPRT",
+    "web page": "ELEC",
+    "thesis": "THES",
+    "conference paper": "CONF",
+    "standard": "RPRT",
+    "dataset": "DATA",
 }
 
 
@@ -402,6 +547,7 @@ class SourceDownloadOrchestrator:
         run_download: bool = True,
         run_convert: bool = False,
         run_catalog: bool = False,
+        run_citation_verify: bool = False,
         run_llm_cleanup: bool = False,
         run_llm_title: bool = False,
         run_llm_summary: bool = True,
@@ -409,6 +555,7 @@ class SourceDownloadOrchestrator:
         force_redownload: bool = False,
         force_convert: bool = False,
         force_catalog: bool = False,
+        force_citation_verify: bool = False,
         force_llm_cleanup: bool = False,
         force_title: bool = False,
         force_summary: bool = False,
@@ -435,6 +582,7 @@ class SourceDownloadOrchestrator:
         self.force_redownload = bool(force_redownload)
         self.force_convert = bool(force_convert)
         self.force_catalog = bool(force_catalog or force_title)
+        self.force_citation_verify = bool(force_citation_verify)
         self.force_llm_cleanup = bool(force_llm_cleanup)
         self.force_title = bool(force_title)
         self.force_summary = bool(force_summary)
@@ -442,7 +590,10 @@ class SourceDownloadOrchestrator:
         self.output_options = output_options or SourceOutputOptions()
         self.run_download = bool(run_download or self.force_redownload)
         self.run_convert = bool(run_convert or (self.run_download and self.output_options.include_markdown))
-        self.run_catalog = bool(run_catalog or self.force_catalog or run_llm_title)
+        self.run_citation_verify = bool(run_citation_verify or self.force_citation_verify)
+        self.run_catalog = bool(
+            run_catalog or self.force_catalog or run_llm_title or self.run_citation_verify
+        )
         self.run_llm_cleanup = bool(run_llm_cleanup or self.force_llm_cleanup)
         self.run_llm_title = bool(run_llm_title or self.force_title)
         self.run_llm_summary = bool(run_llm_summary or self.force_summary)
@@ -607,6 +758,7 @@ class SourceDownloadOrchestrator:
                 self.run_download
                 or self.run_convert
                 or self.run_catalog
+                or self.run_citation_verify
                 or self.run_llm_cleanup
                 or self.run_llm_title
                 or self.run_llm_summary
@@ -649,6 +801,7 @@ class SourceDownloadOrchestrator:
                     "run_download": self.run_download,
                     "run_convert": self.run_convert,
                     "run_catalog": self.run_catalog,
+                    "run_citation_verify": self.run_citation_verify,
                     "run_llm_cleanup": self.run_llm_cleanup,
                     "run_llm_title": self.run_llm_title,
                     "run_llm_summary": self.run_llm_summary,
@@ -656,6 +809,7 @@ class SourceDownloadOrchestrator:
                     "force_redownload": self.force_redownload,
                     "force_convert": self.force_convert,
                     "force_catalog": self.force_catalog,
+                    "force_citation_verify": self.force_citation_verify,
                     "force_llm_cleanup": self.force_llm_cleanup,
                     "force_title": self.force_title,
                     "force_summary": self.force_summary,
@@ -908,6 +1062,10 @@ class SourceDownloadOrchestrator:
                 original_url=t.original_url,
                 citation_number=t.citation_number,
                 source_kind=existing_by_id.get(t.id, SourceManifestRow(id=t.id)).source_kind,
+                citation_verification_status=_row_citation_verification_status(
+                    existing_by_id.get(t.id),
+                    self.output_dir,
+                ),
             )
             for t in targets
         ]
@@ -918,6 +1076,8 @@ class SourceDownloadOrchestrator:
             phase_bits.append("convert")
         if self.run_catalog:
             phase_bits.append("catalog")
+        if self.run_citation_verify:
+            phase_bits.append("citation verify")
         if self.run_llm_cleanup:
             phase_bits.append("llm cleanup")
         if self.run_llm_title:
@@ -953,6 +1113,7 @@ class SourceDownloadOrchestrator:
             run_download=self.run_download,
             run_convert=self.run_convert,
             run_catalog=self.run_catalog,
+            run_citation_verify=self.run_citation_verify,
             run_llm_cleanup=self.run_llm_cleanup,
             run_llm_title=self.run_llm_title,
             run_llm_summary=self.run_llm_summary,
@@ -960,6 +1121,7 @@ class SourceDownloadOrchestrator:
             force_redownload=self.force_redownload,
             force_convert=self.force_convert,
             force_catalog=self.force_catalog,
+            force_citation_verify=self.force_citation_verify,
             force_llm_cleanup=self.force_llm_cleanup,
             force_title=self.force_title,
             force_summary=self.force_summary,
@@ -1190,6 +1352,7 @@ class SourceDownloadOrchestrator:
         return (
             self.run_convert
             or self.run_catalog
+            or self.run_citation_verify
             or self.run_llm_cleanup
             or self.run_llm_title
             or self.run_llm_summary
@@ -1243,6 +1406,11 @@ class SourceDownloadOrchestrator:
             item.catalog_status = (
                 existing_row.catalog_status if existing_row else item.catalog_status
             )
+            item.citation_verification_status = (
+                _row_citation_verification_status(existing_row, self.output_dir)
+                if existing_row
+                else item.citation_verification_status
+            )
             item.title_status = (
                 existing_row.title_status if existing_row else item.title_status
             )
@@ -1281,6 +1449,9 @@ class SourceDownloadOrchestrator:
         if item:
             item.fetch_status = row.fetch_status
             item.catalog_status = row.catalog_status
+            item.citation_verification_status = _row_citation_verification_status(
+                row, self.output_dir
+            )
             item.title_status = row.title_status
             item.llm_cleanup_status = row.llm_cleanup_status
             item.summary_status = row.summary_status
@@ -2120,6 +2291,9 @@ class SourceDownloadOrchestrator:
         notes: list[str],
     ) -> None:
         should_run_catalog = bool(self.run_catalog or self.run_llm_title or self.force_catalog or self.force_title)
+        should_run_catalog = bool(
+            should_run_catalog or self.run_citation_verify or self.force_citation_verify
+        )
         if not should_run_catalog:
             if row.catalog_file and _has_output_file(self.output_dir, row.catalog_file):
                 row.catalog_status = row.catalog_status or "existing"
@@ -2132,6 +2306,8 @@ class SourceDownloadOrchestrator:
             return
 
         source_digest = self._effective_markdown_digest(row)
+        existing_catalog_payload = _load_manifest_json(self.output_dir, row.catalog_file)
+        existing_citation = _coerce_citation_metadata(existing_catalog_payload.get("citation"))
         self._begin_row_phase(
             row,
             PHASE_CATALOG,
@@ -2153,14 +2329,25 @@ class SourceDownloadOrchestrator:
             )
             return
 
+        citation_verification_requested = bool(
+            self.run_citation_verify or self.force_citation_verify
+        )
+
         if (
             row.catalog_file
             and not self.force_catalog
             and not self.force_title
+            and not self.force_citation_verify
             and _has_output_file(self.output_dir, row.catalog_file)
             and row.phase_metadata.get(PHASE_CATALOG) is not None
             and row.phase_metadata[PHASE_CATALOG].content_digest == source_digest
+            and (
+                not citation_verification_requested
+                or _citation_verification_is_current(existing_citation, source_digest)
+            )
         ):
+            if isinstance(existing_catalog_payload, dict):
+                _merge_catalog_payload_into_row(row, existing_catalog_payload, overwrite_existing=False)
             row.catalog_status = "existing"
             if row.title:
                 row.title_status = row.title_status or "existing"
@@ -2189,9 +2376,76 @@ class SourceDownloadOrchestrator:
             )
             return
 
-        deterministic = _build_deterministic_catalog_metadata(row=row, markdown_text=markdown_text)
+        catalog_html_text = _read_catalog_html_input(row, read_text=self._read_text)
+        deterministic = _build_deterministic_catalog_metadata(
+            row=row,
+            markdown_text=markdown_text,
+            html_text=catalog_html_text,
+        )
+        current_citation = _coerce_citation_metadata(deterministic.get("citation"))
+        doi_citation = CitationMetadata()
+        if current_citation.doi:
+            doi_citation = _resolve_doi_citation_metadata(current_citation.doi)
+            current_citation = _merge_citation_metadata(current_citation, doi_citation)
         _merge_catalog_payload_into_row(row, deterministic, overwrite_existing=bool(self.force_catalog))
         self._generate_source_title(row, notes)
+        current_citation = _merge_citation_metadata(
+            current_citation,
+            {
+                "title": row.title,
+                "authors": [
+                    author.model_dump(mode="json")
+                    for author in normalize_citation_authors(row.author_names)
+                ],
+                "issued": row.publication_date,
+                "publisher": row.organization_name,
+                "item_type": row.document_type,
+                "url": row.original_url or row.final_url,
+            },
+            overwrite_existing=bool(self.force_catalog or self.force_title),
+        )
+        current_citation.verification_status = "candidate"
+        current_citation.verification_content_digest = source_digest
+        current_citation = _finalize_citation_metadata(current_citation)
+
+        candidate_payload = self._build_citation_candidate_payload(
+            row=row,
+            deterministic_metadata=deterministic,
+            html_metadata=extract_html_citation_metadata(
+                catalog_html_text,
+                base_url=row.original_url or row.final_url,
+            ),
+            deterministic_citation=current_citation,
+            doi_registry_citation=doi_citation,
+        )
+        llm_used = False
+        llm_error = ""
+        if citation_verification_requested:
+            verified_citation, llm_used, llm_error = self._verify_citation_with_llm(
+                row=row,
+                markdown_text=markdown_text,
+                source_digest=source_digest,
+                candidate_payload=candidate_payload,
+                base_citation=current_citation,
+            )
+        elif _citation_verification_is_current(existing_citation, source_digest):
+            verified_citation = existing_citation.model_copy(deep=True)
+        else:
+            verified_citation = current_citation.model_copy(deep=True)
+            verified_citation.verification_status = "candidate"
+            verified_citation.verification_content_digest = source_digest
+        verified_citation = _apply_citation_manual_overrides(verified_citation, existing_citation)
+        if verified_citation.ready_for_ris and not verified_citation.verified_at:
+            verified_citation.verified_at = _utc_now_iso()
+        if not verified_citation.verification_content_digest:
+            verified_citation.verification_content_digest = source_digest
+        verified_citation = _finalize_citation_metadata(verified_citation)
+
+        _merge_catalog_payload_into_row(
+            row,
+            {"citation": verified_citation.model_dump(mode="json")},
+            overwrite_existing=False,
+        )
 
         catalog_payload: dict[str, Any] = {
             "title": row.title,
@@ -2204,62 +2458,9 @@ class SourceDownloadOrchestrator:
             "organization_type": row.organization_type,
             "source_kind": row.source_kind,
             "evidence_snippets": deterministic.get("evidence_snippets", []),
+            "citation_candidates": candidate_payload,
+            "citation": verified_citation.model_dump(mode="json"),
         }
-
-        llm_used = False
-        llm_error = ""
-        if self.use_llm and llm_backend_ready_for_chat(self.llm_backend):
-            needs_llm = bool(
-                self.force_catalog
-                or _catalog_missing_core_fields(row)
-                or row.title_status in {"failed", "missing_markdown", ""}
-            )
-            if needs_llm:
-                max_chars = self._effective_max_source_chars()
-                source_text = self._truncate_for_llm(markdown_text.strip(), max_chars)
-                research_purpose = self.research_purpose or (
-                    "No explicit research purpose was provided. Resolve source metadata conservatively."
-                )
-                existing_metadata = {
-                    "title": row.title,
-                    "author_names": row.author_names,
-                    "publication_date": row.publication_date,
-                    "publication_year": row.publication_year,
-                    "document_type": row.document_type,
-                    "organization_name": row.organization_name,
-                    "organization_type": row.organization_type,
-                }
-                user_prompt = SOURCE_CATALOG_USER.format(
-                    research_purpose=research_purpose,
-                    source_kind=row.source_kind,
-                    original_url=row.original_url or row.final_url or "",
-                    existing_metadata_json=json.dumps(existing_metadata, ensure_ascii=False),
-                    source_markdown=source_text,
-                )
-                try:
-                    raw_response = self._llm_client.sync_chat_completion(
-                        system_prompt=SOURCE_CATALOG_SYSTEM,
-                        user_prompt=user_prompt,
-                        response_format="json",
-                    ).strip()
-                    payload = json.loads(raw_response)
-                    if isinstance(payload, dict):
-                        _merge_catalog_payload_into_row(
-                            row,
-                            payload,
-                            overwrite_existing=bool(self.force_catalog),
-                        )
-                        evidence = payload.get("evidence_snippets")
-                        if isinstance(evidence, list):
-                            catalog_payload["evidence_snippets"] = _dedupe_strings(
-                                [*catalog_payload.get("evidence_snippets", []), *[str(item) for item in evidence]]
-                            )
-                        llm_used = True
-                    else:
-                        llm_error = "catalog_generation_failed: invalid JSON payload"
-                except Exception as exc:
-                    llm_error = f"catalog_generation_failed: {type(exc).__name__}: {exc}"
-                    logger.warning("Catalog generation failed for %s: %s", row.id, exc)
 
         catalog_payload.update(
             {
@@ -2272,6 +2473,7 @@ class SourceDownloadOrchestrator:
                 "organization_name": row.organization_name,
                 "organization_type": row.organization_type,
                 "source_kind": row.source_kind,
+                "citation": verified_citation.model_dump(mode="json"),
             }
         )
         catalog_rel = self._catalog_rel(row)
@@ -2282,7 +2484,7 @@ class SourceDownloadOrchestrator:
         row.catalog_file = catalog_rel.as_posix()
         row.catalog_status = "generated"
         if llm_error:
-            notes.append("catalog_generation_failed")
+            notes.append("citation_verification_failed")
         self._complete_row_phase(
             row,
             PHASE_CATALOG,
@@ -2291,8 +2493,134 @@ class SourceDownloadOrchestrator:
             error=llm_error,
             error_code=_phase_error_code(llm_error),
             model=self.llm_backend.model if llm_used else "",
-            prompt_version=PROMPT_VERSION_CATALOG,
+            prompt_version=PROMPT_VERSION_CITATION_VERIFY if llm_used else PROMPT_VERSION_CATALOG,
         )
+
+    def _build_citation_candidate_payload(
+        self,
+        *,
+        row: SourceManifestRow,
+        deterministic_metadata: dict[str, Any],
+        html_metadata: dict[str, Any],
+        deterministic_citation: CitationMetadata,
+        doi_registry_citation: CitationMetadata,
+    ) -> dict[str, Any]:
+        return {
+            "display_metadata": {
+                "title": row.title,
+                "title_status": row.title_status,
+                "author_names": row.author_names,
+                "publication_date": row.publication_date,
+                "publication_year": row.publication_year,
+                "document_type": row.document_type,
+                "organization_name": row.organization_name,
+                "organization_type": row.organization_type,
+            },
+            "deterministic_metadata": deterministic_metadata,
+            "html_metadata": html_metadata,
+            "deterministic_citation": deterministic_citation.model_dump(mode="json"),
+            "doi_registry_citation": doi_registry_citation.model_dump(mode="json"),
+        }
+
+    def _verify_citation_with_llm(
+        self,
+        *,
+        row: SourceManifestRow,
+        markdown_text: str,
+        source_digest: str,
+        candidate_payload: dict[str, Any],
+        base_citation: CitationMetadata,
+    ) -> tuple[CitationMetadata, bool, str]:
+        if not self.use_llm:
+            return (
+                _merge_citation_metadata(
+                    base_citation,
+                    {
+                        "verification_status": "skipped_llm_disabled",
+                        "verification_content_digest": source_digest,
+                        "blocked_reasons": ["Citation verification requires an enabled LLM backend."],
+                    },
+                    overwrite_existing=True,
+                ),
+                False,
+                "",
+            )
+        if not llm_backend_ready_for_chat(self.llm_backend):
+            return (
+                _merge_citation_metadata(
+                    base_citation,
+                    {
+                        "verification_status": "skipped_llm_not_configured",
+                        "verification_content_digest": source_digest,
+                        "blocked_reasons": ["Citation verification requires a chat-capable LLM backend."],
+                    },
+                    overwrite_existing=True,
+                ),
+                False,
+                "",
+            )
+
+        source_text = self._truncate_for_llm(markdown_text.strip(), self._effective_max_source_chars())
+        research_purpose = self.research_purpose or (
+            "No explicit research purpose was provided. Verify citation metadata conservatively."
+        )
+        user_prompt = SOURCE_CITATION_VERIFY_USER.format(
+            research_purpose=research_purpose,
+            source_kind=row.source_kind,
+            original_url=row.original_url or row.final_url or "",
+            candidate_metadata_json=json.dumps(candidate_payload, ensure_ascii=False, indent=2),
+            source_markdown=source_text,
+        )
+        try:
+            raw_response = self._llm_client.sync_chat_completion(
+                system_prompt=SOURCE_CITATION_VERIFY_SYSTEM,
+                user_prompt=user_prompt,
+                response_format="json",
+            ).strip()
+            payload = json.loads(raw_response)
+            if not isinstance(payload, dict):
+                raise ValueError("invalid verification payload")
+            citation_payload = payload.get("citation")
+            field_evidence_payload = payload.get("field_evidence")
+            field_evidence: dict[str, dict[str, Any]] = {}
+            if isinstance(field_evidence_payload, dict):
+                for field_name, field_data in field_evidence_payload.items():
+                    if not isinstance(field_data, dict):
+                        continue
+                    field_evidence[str(field_name)] = {
+                        "source_type": _stringify_manifest_value(field_data.get("source_type")),
+                        "source_label": _stringify_manifest_value(field_data.get("source_label")),
+                        "evidence": _stringify_manifest_value(field_data.get("evidence")),
+                        "confidence": _round_citation_confidence(float(field_data.get("confidence") or 0.0)),
+                    }
+            verified_citation = _merge_citation_metadata(
+                base_citation,
+                {
+                    **(citation_payload if isinstance(citation_payload, dict) else {}),
+                    "field_evidence": field_evidence,
+                    "blocked_reasons": payload.get("blocked_reasons"),
+                    "notes": payload.get("notes"),
+                    "verification_status": "verified",
+                    "verification_confidence": payload.get("verification_confidence"),
+                    "verification_model": self.llm_backend.model,
+                    "verification_content_digest": source_digest,
+                    "verified_at": _utc_now_iso(),
+                },
+                overwrite_existing=True,
+            )
+            return verified_citation, True, ""
+        except Exception as exc:
+            logger.warning("Citation verification failed for %s: %s", row.id, exc)
+            failed_citation = _merge_citation_metadata(
+                base_citation,
+                {
+                    "verification_status": "failed",
+                    "verification_content_digest": source_digest,
+                    "blocked_reasons": ["Citation verification failed."],
+                },
+                overwrite_existing=True,
+            )
+            return failed_citation, False, f"citation_verification_failed: {type(exc).__name__}: {exc}"
 
     def _generate_source_title(
         self,
@@ -2853,8 +3181,17 @@ class SourceDownloadOrchestrator:
             await client.close()
 
 
-def build_manifest_csv(rows: list[SourceManifestRow], base_dir: Path | None = None) -> str:
-    fieldnames, records = _build_manifest_records(rows, base_dir=base_dir)
+def build_manifest_csv(
+    rows: list[SourceManifestRow],
+    base_dir: Path | None = None,
+    *,
+    column_configs: Sequence[RepositoryColumnConfig] | None = None,
+) -> str:
+    fieldnames, records = _build_manifest_records(
+        rows,
+        base_dir=base_dir,
+        column_configs=column_configs,
+    )
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=fieldnames)
     writer.writeheader()
@@ -2863,8 +3200,17 @@ def build_manifest_csv(rows: list[SourceManifestRow], base_dir: Path | None = No
     return output.getvalue()
 
 
-def build_manifest_xlsx(rows: list[SourceManifestRow], base_dir: Path | None = None) -> bytes:
-    fieldnames, records = _build_manifest_records(rows, base_dir=base_dir)
+def build_manifest_xlsx(
+    rows: list[SourceManifestRow],
+    base_dir: Path | None = None,
+    *,
+    column_configs: Sequence[RepositoryColumnConfig] | None = None,
+) -> bytes:
+    fieldnames, records = _build_manifest_records(
+        rows,
+        base_dir=base_dir,
+        column_configs=column_configs,
+    )
     wb = Workbook()
     ws = wb.active
     ws.title = "manifest"
@@ -2912,6 +3258,8 @@ def build_manifest_xlsx(rows: list[SourceManifestRow], base_dir: Path | None = N
 def build_manifest_record(
     row: SourceManifestRow,
     base_dir: Path | None = None,
+    *,
+    column_configs: Sequence[RepositoryColumnConfig] | None = None,
 ) -> dict[str, str | int | float | bool]:
     data = row.model_dump()
     serialized: dict[str, str | int | float | bool] = {}
@@ -2925,19 +3273,30 @@ def build_manifest_record(
     derived = _derive_manifest_fields(row, base_dir=base_dir)
     serialized.update(derived["base"])
     serialized.update(derived["dynamic"])
+    for column in column_configs or []:
+        if column.kind != "custom":
+            continue
+        serialized[column.id] = str((row.custom_fields or {}).get(column.id) or "")
     return serialized
 
 
 def _build_manifest_records(
     rows: list[SourceManifestRow],
     base_dir: Path | None = None,
+    *,
+    column_configs: Sequence[RepositoryColumnConfig] | None = None,
 ) -> tuple[list[str], list[dict[str, str | int | float | bool]]]:
     records: list[dict[str, str | int | float | bool]] = []
     dynamic_columns: list[str] = []
     dynamic_seen: set[str] = set()
+    custom_column_ids = [column.id for column in column_configs or [] if column.kind == "custom"]
 
     for row in rows:
-        record = build_manifest_record(row, base_dir=base_dir)
+        record = build_manifest_record(
+            row,
+            base_dir=base_dir,
+            column_configs=column_configs,
+        )
         records.append(record)
         for column in record.keys():
             if column in SOURCE_MANIFEST_COLUMNS or column in MANIFEST_DERIVED_COLUMNS:
@@ -2947,7 +3306,13 @@ def _build_manifest_records(
             dynamic_seen.add(column)
             dynamic_columns.append(column)
 
-    fieldnames = SOURCE_MANIFEST_COLUMNS + MANIFEST_DERIVED_COLUMNS + sorted(dynamic_columns)
+    custom_fields = [column_id for column_id in custom_column_ids if column_id not in dynamic_seen]
+    fieldnames = (
+        SOURCE_MANIFEST_COLUMNS
+        + MANIFEST_DERIVED_COLUMNS
+        + custom_fields
+        + sorted(dynamic_columns)
+    )
     return fieldnames, records
 
 
@@ -2956,6 +3321,7 @@ def _derive_manifest_fields(
     base_dir: Path | None = None,
 ) -> dict[str, dict[str, str | int | float | bool]]:
     catalog_payload = _load_manifest_json(base_dir, row.catalog_file)
+    citation = _coerce_citation_metadata(catalog_payload.get("citation"))
     summary_text = _load_manifest_text(base_dir, row.summary_file)
     rating_payload = _load_manifest_json(base_dir, row.rating_file)
 
@@ -2984,11 +3350,12 @@ def _derive_manifest_fields(
     )
 
     base: dict[str, str | int | float | bool] = {
-        "author_names": row.author_names or _stringify_manifest_value(catalog_payload.get("author_names")),
-        "publication_date": row.publication_date or _stringify_manifest_value(catalog_payload.get("publication_date")),
-        "publication_year": row.publication_year or _stringify_manifest_value(catalog_payload.get("publication_year")),
-        "document_type": row.document_type or _stringify_manifest_value(catalog_payload.get("document_type")),
-        "organization_name": row.organization_name or _stringify_manifest_value(catalog_payload.get("organization_name")),
+        "title": row.title or _stringify_manifest_value(catalog_payload.get("title")) or citation.title,
+        "author_names": row.author_names or _stringify_manifest_value(catalog_payload.get("author_names")) or _citation_author_names(citation),
+        "publication_date": row.publication_date or _stringify_manifest_value(catalog_payload.get("publication_date")) or citation.issued,
+        "publication_year": row.publication_year or _stringify_manifest_value(catalog_payload.get("publication_year")) or _citation_publication_year(citation),
+        "document_type": row.document_type or _stringify_manifest_value(catalog_payload.get("document_type")) or citation.item_type,
+        "organization_name": row.organization_name or _stringify_manifest_value(catalog_payload.get("organization_name")) or citation.publisher,
         "organization_type": row.organization_type or _stringify_manifest_value(catalog_payload.get("organization_type")),
         "tags_text": tags_text,
         "summary_text": summary_text,
@@ -2999,6 +3366,29 @@ def _derive_manifest_fields(
         "rating_dimensions_json": _json_or_blank(rating_dimensions),
         "flag_scores_json": _json_or_blank(flag_scores),
         "rating_raw_json": _json_or_blank(rating_payload),
+        "citation_title": citation.title,
+        "citation_authors": _citation_author_names(citation),
+        "citation_issued": citation.issued,
+        "citation_url": citation.url,
+        "citation_publisher": citation.publisher,
+        "citation_container_title": citation.container_title,
+        "citation_volume": citation.volume,
+        "citation_issue": citation.issue,
+        "citation_pages": citation.pages,
+        "citation_language": citation.language,
+        "citation_accessed": citation.accessed,
+        "citation_type": citation.item_type,
+        "citation_doi": citation.doi,
+        "citation_report_number": citation.report_number,
+        "citation_standard_number": citation.standard_number,
+        "citation_verification_status": citation.verification_status,
+        "citation_blocked_reasons": _citation_blocked_reasons_text(citation),
+        "citation_manual_override_fields": _citation_manual_override_fields_text(citation),
+        "citation_field_evidence_json": _citation_field_evidence_json(citation),
+        "citation_verified_at": citation.verified_at,
+        "citation_ready": citation.ready_for_ris,
+        "citation_missing_fields": _citation_missing_fields_text(citation),
+        "citation_confidence": citation.verification_confidence or citation.confidence,
     }
 
     dynamic: dict[str, str | int | float | bool] = {}
@@ -3040,6 +3430,17 @@ def _resolve_manifest_path(base_dir: Path | None, rel_path: str | None) -> Path 
     if base_dir is None:
         return None
     return base_dir / candidate
+
+
+def _row_citation_verification_status(
+    row: SourceManifestRow | None,
+    base_dir: Path | None = None,
+) -> str:
+    if row is None:
+        return ""
+    catalog_payload = _load_manifest_json(base_dir, row.catalog_file)
+    citation = _coerce_citation_metadata(catalog_payload.get("citation"))
+    return str(citation.verification_status or "").strip()
 
 
 def _extract_rating_overall(payload: dict[str, Any]) -> str | int | float | bool:
@@ -3140,6 +3541,16 @@ def _json_or_blank(value: Any) -> str:
         return str(value)
 
 
+def _citation_field_evidence_json(citation: CitationMetadata) -> str:
+    if not citation.field_evidence:
+        return ""
+    payload = {
+        key: value.model_dump(mode="json")
+        for key, value in citation.field_evidence.items()
+    }
+    return _json_or_blank(payload)
+
+
 def _normalize_manifest_scalar(value: Any) -> str | int | float | bool:
     if value is None:
         return ""
@@ -3152,6 +3563,1276 @@ def _manifest_slug(value: str) -> str:
     normalized = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower())
     normalized = normalized.strip("_")
     return normalized or "value"
+
+
+def _coerce_citation_metadata(value: Any) -> CitationMetadata:
+    if isinstance(value, CitationMetadata):
+        return value
+    if not isinstance(value, dict):
+        return CitationMetadata()
+    try:
+        return CitationMetadata.model_validate(value)
+    except Exception:
+        return CitationMetadata()
+
+
+def _citation_author_display(author: CitationAuthor) -> str:
+    if author.literal:
+        return author.literal.strip()
+    pieces = [author.given.strip(), author.family.strip()]
+    return " ".join(piece for piece in pieces if piece).strip()
+
+
+def _citation_author_names(citation: CitationMetadata) -> str:
+    names = [_citation_author_display(author) for author in citation.authors]
+    return "; ".join(name for name in names if name)
+
+
+def _citation_publication_year(citation: CitationMetadata) -> str:
+    return _extract_publication_year(citation.issued)
+
+
+def _citation_missing_fields_text(citation: CitationMetadata) -> str:
+    return "; ".join(_dedupe_strings(citation.missing_fields))
+
+
+def _citation_blocked_reasons_text(citation: CitationMetadata) -> str:
+    return "; ".join(_dedupe_strings(citation.blocked_reasons))
+
+
+def _citation_manual_override_fields_text(citation: CitationMetadata) -> str:
+    return "; ".join(_dedupe_strings(citation.manual_override_fields))
+
+
+def _round_citation_confidence(value: float) -> float:
+    normalized = max(0.0, min(float(value), 1.0))
+    step = round(normalized / CITATION_CONFIDENCE_INCREMENT)
+    return round(step * CITATION_CONFIDENCE_INCREMENT, 2)
+
+
+def _citation_field_value_text(citation: CitationMetadata, field_name: str) -> str:
+    if field_name == "authors":
+        return _citation_author_names(citation)
+    return _stringify_manifest_value(getattr(citation, field_name, ""))
+
+
+def _normalize_citation_field_evidence(value: Any) -> CitationFieldEvidence:
+    if isinstance(value, CitationFieldEvidence):
+        raw = value.model_dump(mode="json")
+    elif isinstance(value, dict):
+        raw = dict(value)
+    else:
+        raw = {}
+    return CitationFieldEvidence(
+        value=_stringify_manifest_value(raw.get("value")),
+        source_type=_stringify_manifest_value(raw.get("source_type")),
+        source_label=_stringify_manifest_value(raw.get("source_label")),
+        evidence=_stringify_manifest_value(raw.get("evidence")),
+        confidence=_round_citation_confidence(float(raw.get("confidence") or 0.0)),
+        manual_override=bool(raw.get("manual_override")),
+    )
+
+
+def _empty_citation_field_evidence(
+    *,
+    value: str = "",
+    source_type: str = "",
+    source_label: str = "",
+    evidence: str = "",
+    confidence: float = 0.0,
+    manual_override: bool = False,
+) -> CitationFieldEvidence:
+    return CitationFieldEvidence(
+        value=_stringify_manifest_value(value),
+        source_type=_stringify_manifest_value(source_type),
+        source_label=_stringify_manifest_value(source_label),
+        evidence=_stringify_manifest_value(evidence),
+        confidence=_round_citation_confidence(confidence),
+        manual_override=manual_override,
+    )
+
+
+def _apply_organization_author_fallback(citation: CitationMetadata) -> CitationMetadata:
+    if citation.authors:
+        return citation
+    publisher = _collapse_whitespace(citation.publisher).strip(" ,.;:")
+    if not publisher or not _looks_like_corporate_author_name(publisher):
+        return citation
+    fallback_authors = normalize_citation_authors([publisher])
+    if not fallback_authors:
+        return citation
+    updated = citation.model_copy(deep=True)
+    updated.authors = fallback_authors
+    updated.notes = _dedupe_strings([*updated.notes, "organization_author_fallback"])
+    existing = _normalize_citation_field_evidence(updated.field_evidence.get("authors"))
+    if not existing.value:
+        existing.value = publisher
+    if not existing.source_type:
+        existing.source_type = "publisher_fallback"
+    if not existing.source_label:
+        existing.source_label = "Publisher fallback"
+    if not existing.evidence:
+        existing.evidence = publisher
+    existing.confidence = max(existing.confidence, 0.55)
+    updated.field_evidence["authors"] = existing
+    return updated
+
+
+def _collapse_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def _normalize_citation_type(
+    value: str,
+    *,
+    fallback_document_type: str = "",
+    source_kind: str = "",
+    url: str = "",
+) -> str:
+    for candidate in (value, fallback_document_type):
+        normalized = re.sub(r"[^a-z0-9]+", " ", str(candidate or "").strip().lower()).strip()
+        if not normalized:
+            continue
+        if normalized in CANONICAL_CITATION_TYPE_MAP:
+            return CANONICAL_CITATION_TYPE_MAP[normalized]
+        if "journal" in normalized and "article" in normalized:
+            return "journal article"
+        if "conference" in normalized:
+            return "conference paper"
+        if "standard" in normalized:
+            return "standard"
+        if "thesis" in normalized or "dissertation" in normalized:
+            return "thesis"
+        if "report" in normalized or "working paper" in normalized:
+            return "report"
+        if "book" in normalized and "chapter" in normalized:
+            return "book chapter"
+        if "book" in normalized:
+            return "book"
+        if "web" in normalized or "site" in normalized or "blog" in normalized:
+            return "web page"
+    lowered_url = str(url or "").lower()
+    if lowered_url.startswith("http"):
+        return "web page" if source_kind == "url" else ""
+    return ""
+
+
+def _looks_like_corporate_author_name(text: str) -> bool:
+    candidate = _collapse_whitespace(text).strip(" ,.;:")
+    if not candidate:
+        return True
+    lowered = candidate.lower()
+    if any(keyword in lowered for keyword in CORPORATE_AUTHOR_KEYWORDS):
+        return True
+    words = re.findall(r"[A-Za-z][A-Za-z'.-]*", candidate)
+    if len(words) > 4:
+        return True
+    if any(char.isdigit() for char in candidate):
+        return True
+    if ":" in candidate or "&" in candidate:
+        return True
+    return False
+
+
+def _normalize_citation_author(author: Any) -> CitationAuthor | None:
+    if isinstance(author, CitationAuthor):
+        normalized = author
+    elif isinstance(author, dict):
+        literal = _collapse_whitespace(str(author.get("literal") or author.get("name") or "")).strip()
+        family = _collapse_whitespace(str(author.get("family") or author.get("familyName") or "")).strip()
+        given = _collapse_whitespace(str(author.get("given") or author.get("givenName") or "")).strip()
+        if literal and not family and not given:
+            normalized = CitationAuthor(literal=literal)
+        else:
+            normalized = CitationAuthor(family=family, given=given, literal=literal if _looks_like_corporate_author_name(literal) else "")
+    else:
+        text = _collapse_whitespace(str(author or "")).strip(" ,.;:")
+        if not text:
+            return None
+        normalized = _parse_citation_author_text(text)
+    if normalized.literal:
+        return CitationAuthor(literal=normalized.literal.strip())
+    if normalized.family or normalized.given:
+        return CitationAuthor(family=normalized.family.strip(), given=normalized.given.strip())
+    return None
+
+
+def _parse_citation_author_text(text: str) -> CitationAuthor:
+    candidate = _collapse_whitespace(text).strip(" ,.;:")
+    if not candidate:
+        return CitationAuthor()
+    if _looks_like_corporate_author_name(candidate):
+        return CitationAuthor(literal=candidate)
+    if "," in candidate:
+        family, given = [piece.strip() for piece in candidate.split(",", 1)]
+        if family and given and not _looks_like_corporate_author_name(family):
+            return CitationAuthor(family=family, given=given)
+        return CitationAuthor(literal=candidate)
+    words = candidate.split()
+    if len(words) == 1:
+        return CitationAuthor(literal=candidate)
+    family = words[-1]
+    given = " ".join(words[:-1]).strip()
+    if not family or not given:
+        return CitationAuthor(literal=candidate)
+    return CitationAuthor(family=family, given=given)
+
+
+def normalize_citation_authors(value: Any) -> list[CitationAuthor]:
+    if value is None:
+        return []
+    raw_items: list[Any]
+    if isinstance(value, str):
+        delimiter = ";" if ";" in value else "|"
+        raw_items = [item.strip() for item in value.split(delimiter)] if delimiter in value else [value]
+    elif isinstance(value, list):
+        raw_items = list(value)
+    else:
+        raw_items = [value]
+    authors: list[CitationAuthor] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in raw_items:
+        normalized = _normalize_citation_author(item)
+        if normalized is None:
+            continue
+        key = (
+            normalized.family.lower(),
+            normalized.given.lower(),
+            normalized.literal.lower(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        authors.append(normalized)
+    return authors
+
+
+def _clean_doi_candidate(value: str) -> str:
+    match = DOI_PATTERN.search(str(value or ""))
+    if not match:
+        return ""
+    return match.group(1).rstrip(".,;:)")
+
+
+def _extract_publication_year(value: str) -> str:
+    match = re.search(r"\b(19|20)\d{2}\b", str(value or ""))
+    return match.group(0) if match else ""
+
+
+def _normalize_date_string(value: str) -> str:
+    candidate = _collapse_whitespace(str(value or "")).strip(" ,.;:")
+    if not candidate:
+        return ""
+    iso_match = re.match(r"^(\d{4})[-/](\d{2})[-/](\d{2})", candidate)
+    if iso_match:
+        return f"{iso_match.group(1)}-{iso_match.group(2)}-{iso_match.group(3)}"
+    ym_match = re.match(r"^(\d{4})[-/](\d{2})", candidate)
+    if ym_match:
+        return f"{ym_match.group(1)}-{ym_match.group(2)}"
+    year = _extract_publication_year(candidate)
+    if year:
+        return year
+    return candidate
+
+
+def _normalize_pages_value(value: Any) -> str:
+    text = _collapse_whitespace(str(value or "")).strip(" ,.;:")
+    if not text:
+        return ""
+    match = re.search(r"(\d+)\s*[-\u2013]\s*(\d+)", text)
+    if match:
+        return f"{match.group(1)}-{match.group(2)}"
+    return text
+
+
+def _split_page_range(value: str) -> tuple[str, str]:
+    match = re.search(r"^\s*(\S+)\s*[-\u2013]\s*(\S+)\s*$", str(value or ""))
+    if not match:
+        text = str(value or "").strip()
+        return (text, "")
+    return match.group(1), match.group(2)
+
+
+def _citation_has_material_fields(citation: CitationMetadata) -> bool:
+    return any(
+        [
+            citation.item_type,
+            citation.title,
+            citation.authors,
+            citation.issued,
+            citation.publisher,
+            citation.container_title,
+            citation.volume,
+            citation.issue,
+            citation.pages,
+            citation.doi,
+            citation.url,
+            citation.report_number,
+            citation.standard_number,
+            citation.language,
+            citation.accessed,
+            citation.evidence,
+        ]
+    )
+
+
+def _normalize_citation_payload(payload: dict[str, Any] | CitationMetadata | None) -> CitationMetadata:
+    if isinstance(payload, CitationMetadata):
+        raw = payload.model_dump(mode="json")
+    elif isinstance(payload, dict):
+        raw = dict(payload)
+    else:
+        raw = {}
+
+    evidence_values = raw.get("evidence") or []
+    if isinstance(evidence_values, str):
+        evidence_items = [evidence_values]
+    elif isinstance(evidence_values, list):
+        evidence_items = list(evidence_values)
+    else:
+        evidence_items = [evidence_values] if evidence_values else []
+    missing_field_values = raw.get("missing_fields") or []
+    if isinstance(missing_field_values, str):
+        missing_items = [item.strip() for item in missing_field_values.split(";") if item.strip()]
+    elif isinstance(missing_field_values, list):
+        missing_items = list(missing_field_values)
+    else:
+        missing_items = [missing_field_values] if missing_field_values else []
+    blocked_reason_values = raw.get("blocked_reasons") or []
+    if isinstance(blocked_reason_values, str):
+        blocked_reason_items = [item.strip() for item in blocked_reason_values.split(";") if item.strip()]
+    elif isinstance(blocked_reason_values, list):
+        blocked_reason_items = list(blocked_reason_values)
+    else:
+        blocked_reason_items = [blocked_reason_values] if blocked_reason_values else []
+    note_values = raw.get("notes") or []
+    if isinstance(note_values, str):
+        note_items = [item.strip() for item in note_values.split(";") if item.strip()]
+    elif isinstance(note_values, list):
+        note_items = list(note_values)
+    else:
+        note_items = [note_values] if note_values else []
+    manual_override_values = raw.get("manual_override_fields") or []
+    if isinstance(manual_override_values, str):
+        manual_override_items = [item.strip() for item in manual_override_values.split(";") if item.strip()]
+    elif isinstance(manual_override_values, list):
+        manual_override_items = list(manual_override_values)
+    else:
+        manual_override_items = [manual_override_values] if manual_override_values else []
+    raw_field_evidence = raw.get("field_evidence") or {}
+    field_evidence: dict[str, CitationFieldEvidence] = {}
+    if isinstance(raw_field_evidence, dict):
+        for field_name, value in raw_field_evidence.items():
+            normalized_field = _normalize_citation_field_evidence(value)
+            if (
+                normalized_field.value
+                or normalized_field.source_type
+                or normalized_field.source_label
+                or normalized_field.evidence
+                or normalized_field.confidence > 0
+                or normalized_field.manual_override
+            ):
+                field_evidence[str(field_name)] = normalized_field
+
+    citation = CitationMetadata(
+        item_type=_normalize_citation_type(str(raw.get("item_type") or raw.get("type") or "")),
+        title=normalize_generated_title(_stringify_manifest_value(raw.get("title"))),
+        authors=normalize_citation_authors(raw.get("authors")),
+        issued=_normalize_date_string(_stringify_manifest_value(raw.get("issued") or raw.get("publication_date") or raw.get("date"))),
+        publisher=_stringify_manifest_value(raw.get("publisher")),
+        container_title=_stringify_manifest_value(raw.get("container_title") or raw.get("journal") or raw.get("publication_title")),
+        volume=_stringify_manifest_value(raw.get("volume")),
+        issue=_stringify_manifest_value(raw.get("issue")),
+        pages=_normalize_pages_value(raw.get("pages")),
+        doi=_clean_doi_candidate(_stringify_manifest_value(raw.get("doi"))),
+        url=clean_url_candidate(_stringify_manifest_value(raw.get("url"))),
+        report_number=_stringify_manifest_value(raw.get("report_number")),
+        standard_number=_stringify_manifest_value(raw.get("standard_number")),
+        language=_stringify_manifest_value(raw.get("language")),
+        accessed=_normalize_date_string(_stringify_manifest_value(raw.get("accessed"))),
+        evidence=_dedupe_strings([_stringify_manifest_value(item) for item in evidence_items if _stringify_manifest_value(item)]),
+        confidence=_round_citation_confidence(float(raw.get("confidence") or 0.0)),
+        missing_fields=[
+            _stringify_manifest_value(item)
+            for item in missing_items
+            if _stringify_manifest_value(item)
+        ],
+        ready_for_ris=bool(raw.get("ready_for_ris")),
+        verification_status=_stringify_manifest_value(raw.get("verification_status")),
+        verification_confidence=_round_citation_confidence(float(raw.get("verification_confidence") or 0.0)),
+        verification_model=_stringify_manifest_value(raw.get("verification_model")),
+        verification_content_digest=_stringify_manifest_value(raw.get("verification_content_digest")),
+        verified_at=_stringify_manifest_value(raw.get("verified_at")),
+        blocked_reasons=[
+            _stringify_manifest_value(item)
+            for item in blocked_reason_items
+            if _stringify_manifest_value(item)
+        ],
+        notes=[
+            _stringify_manifest_value(item)
+            for item in note_items
+            if _stringify_manifest_value(item)
+        ],
+        manual_override_fields=[
+            _stringify_manifest_value(item)
+            for item in manual_override_items
+            if _stringify_manifest_value(item)
+        ],
+        field_evidence=field_evidence,
+    )
+    return _finalize_citation_metadata(citation)
+
+
+def _merge_citation_metadata(
+    base: CitationMetadata,
+    candidate: dict[str, Any] | CitationMetadata | None,
+    *,
+    overwrite_existing: bool = False,
+) -> CitationMetadata:
+    incoming = _normalize_citation_payload(candidate)
+    if not _citation_has_material_fields(incoming) and not any(
+        [
+            incoming.verification_status,
+            incoming.blocked_reasons,
+            incoming.notes,
+            incoming.manual_override_fields,
+            incoming.field_evidence,
+        ]
+    ):
+        return _finalize_citation_metadata(base)
+
+    current = base.model_copy(deep=True)
+    scalar_fields = (
+        "item_type",
+        "title",
+        "issued",
+        "publisher",
+        "container_title",
+        "volume",
+        "issue",
+        "pages",
+        "doi",
+        "url",
+        "report_number",
+        "standard_number",
+        "language",
+        "accessed",
+    )
+    for field_name in scalar_fields:
+        current_value = getattr(current, field_name)
+        incoming_value = getattr(incoming, field_name)
+        if incoming_value and (overwrite_existing or not current_value):
+            setattr(current, field_name, incoming_value)
+    if incoming.authors and (overwrite_existing or not current.authors):
+        current.authors = incoming.authors
+    current.evidence = _dedupe_strings([*current.evidence, *incoming.evidence])
+    current.confidence = _round_citation_confidence(max(current.confidence, incoming.confidence))
+    current.verification_confidence = _round_citation_confidence(
+        max(current.verification_confidence, incoming.verification_confidence)
+    )
+    current.missing_fields = _dedupe_strings([*current.missing_fields, *incoming.missing_fields])
+    current.blocked_reasons = _dedupe_strings([*current.blocked_reasons, *incoming.blocked_reasons])
+    current.notes = _dedupe_strings([*current.notes, *incoming.notes])
+    current.manual_override_fields = _dedupe_strings(
+        [*current.manual_override_fields, *incoming.manual_override_fields]
+    )
+    for field_name, field_data in incoming.field_evidence.items():
+        existing = current.field_evidence.get(field_name)
+        if (
+            overwrite_existing
+            or existing is None
+            or (not existing.manual_override and field_data.manual_override)
+            or (
+                not existing.source_type
+                and not existing.evidence
+                and field_data.confidence >= existing.confidence
+            )
+        ):
+            current.field_evidence[field_name] = field_data
+    if incoming.verification_status and (
+        overwrite_existing or current.verification_status in {"", "candidate", "blocked", "legacy_unverified"}
+    ):
+        current.verification_status = incoming.verification_status
+    if incoming.verification_model and (overwrite_existing or not current.verification_model):
+        current.verification_model = incoming.verification_model
+    if incoming.verification_content_digest and (
+        overwrite_existing or not current.verification_content_digest
+    ):
+        current.verification_content_digest = incoming.verification_content_digest
+    if incoming.verified_at and (overwrite_existing or not current.verified_at):
+        current.verified_at = incoming.verified_at
+    return _finalize_citation_metadata(current)
+
+
+def _finalize_citation_metadata(citation: CitationMetadata) -> CitationMetadata:
+    normalized = citation.model_copy(deep=True)
+    normalized.item_type = _normalize_citation_type(normalized.item_type)
+    normalized.title = normalize_generated_title(normalized.title)
+    normalized.issued = _normalize_date_string(normalized.issued)
+    normalized.doi = _clean_doi_candidate(normalized.doi)
+    normalized.url = clean_url_candidate(normalized.url)
+    normalized.pages = _normalize_pages_value(normalized.pages)
+    normalized.confidence = _round_citation_confidence(normalized.confidence)
+    normalized.verification_confidence = _round_citation_confidence(normalized.verification_confidence)
+    normalized.authors = normalize_citation_authors(normalized.authors)
+    normalized = _apply_organization_author_fallback(normalized)
+    normalized.evidence = _dedupe_strings(normalized.evidence)
+    normalized.blocked_reasons = _dedupe_strings(normalized.blocked_reasons)
+    normalized.notes = _dedupe_strings(normalized.notes)
+    normalized.manual_override_fields = _dedupe_strings(normalized.manual_override_fields)
+
+    normalized_field_evidence: dict[str, CitationFieldEvidence] = {}
+    for field_name in CITATION_VERIFIABLE_FIELDS:
+        field_data = _normalize_citation_field_evidence(normalized.field_evidence.get(field_name))
+        field_data.value = field_data.value or _citation_field_value_text(normalized, field_name)
+        if field_name in normalized.manual_override_fields:
+            field_data.manual_override = True
+            field_data.source_type = field_data.source_type or "manual_override"
+            field_data.source_label = field_data.source_label or "Manual override"
+            field_data.confidence = max(field_data.confidence, 1.0)
+        if field_data.manual_override and field_name not in normalized.manual_override_fields:
+            normalized.manual_override_fields.append(field_name)
+        normalized_field_evidence[field_name] = _normalize_citation_field_evidence(field_data)
+    normalized.manual_override_fields = _dedupe_strings(normalized.manual_override_fields)
+    normalized.field_evidence = normalized_field_evidence
+
+    missing_fields: list[str] = []
+    for field_name in CITATION_REQUIRED_FIELDS:
+        value = getattr(normalized, field_name)
+        if field_name == "authors":
+            if not normalized.authors:
+                missing_fields.append(CITATION_REQUIRED_FIELD_LABELS.get(field_name, field_name))
+            continue
+        if not str(value or "").strip():
+            missing_fields.append(CITATION_REQUIRED_FIELD_LABELS.get(field_name, field_name))
+    normalized.missing_fields = _dedupe_strings([*normalized.missing_fields, *missing_fields])
+    status = str(normalized.verification_status or "").strip().lower()
+    if status == "legacy_complete":
+        status = "legacy_unverified"
+    if normalized.manual_override_fields and not missing_fields:
+        status = "verified"
+    elif status == "verified" and missing_fields:
+        status = "blocked"
+    elif status not in {"verified", "skipped_llm_disabled", "skipped_llm_not_configured", "failed"}:
+        if missing_fields or normalized.blocked_reasons:
+            status = "blocked" if _citation_has_material_fields(normalized) else status
+        elif not status and _citation_has_material_fields(normalized):
+            status = "candidate"
+        elif status == "legacy_unverified":
+            status = "candidate"
+    if missing_fields:
+        normalized.blocked_reasons = _dedupe_strings(
+            [
+                *normalized.blocked_reasons,
+                f"Missing required citation fields: {', '.join(missing_fields)}",
+            ]
+        )
+    elif status == "verified":
+        normalized.blocked_reasons = []
+    normalized.verification_status = status
+    normalized.ready_for_ris = status == "verified" and len(missing_fields) == 0
+    score = 0.0
+    if normalized.item_type:
+        score += 0.2
+    if normalized.title:
+        score += 0.2
+    if normalized.authors:
+        score += 0.2
+    if normalized.issued:
+        score += 0.15
+    if normalized.url:
+        score += 0.15
+    if normalized.doi:
+        score += 0.05
+    if normalized.publisher or normalized.container_title:
+        score += 0.05
+    if normalized.report_number or normalized.standard_number:
+        score += 0.05
+    normalized.confidence = _round_citation_confidence(
+        max(normalized.confidence, normalized.verification_confidence, score)
+    )
+    if normalized.verification_status == "verified":
+        normalized.verification_confidence = _round_citation_confidence(
+            max(normalized.verification_confidence, normalized.confidence)
+        )
+    return normalized
+
+
+def _effective_manual_override_fields(citation: CitationMetadata) -> list[str]:
+    fields = list(citation.manual_override_fields)
+    fields.extend(
+        field_name
+        for field_name, field_data in citation.field_evidence.items()
+        if field_data.manual_override
+    )
+    return _dedupe_strings(fields)
+
+
+def _apply_citation_manual_overrides(
+    citation: CitationMetadata,
+    manual_source: CitationMetadata | dict[str, Any] | None,
+) -> CitationMetadata:
+    manual_citation = _normalize_citation_payload(manual_source)
+    override_fields = _effective_manual_override_fields(manual_citation)
+    if not override_fields:
+        return _finalize_citation_metadata(citation)
+
+    updated = citation.model_copy(deep=True)
+    for field_name in override_fields:
+        if field_name == "authors":
+            updated.authors = manual_citation.authors
+        elif hasattr(updated, field_name):
+            setattr(updated, field_name, getattr(manual_citation, field_name))
+        field_data = _normalize_citation_field_evidence(manual_citation.field_evidence.get(field_name))
+        field_data.value = _citation_field_value_text(manual_citation, field_name)
+        field_data.manual_override = True
+        field_data.source_type = field_data.source_type or "manual_override"
+        field_data.source_label = field_data.source_label or "Manual override"
+        field_data.confidence = max(field_data.confidence, 1.0)
+        updated.field_evidence[field_name] = field_data
+    updated.manual_override_fields = _dedupe_strings(
+        [*updated.manual_override_fields, *override_fields]
+    )
+    return _finalize_citation_metadata(updated)
+
+
+def _citation_verification_is_current(citation: CitationMetadata, source_digest: str) -> bool:
+    status = str(citation.verification_status or "").strip().lower()
+    if not source_digest:
+        return False
+    if str(citation.verification_content_digest or "").strip() != source_digest:
+        return False
+    return status in {
+        "verified",
+        "blocked",
+        "skipped_llm_disabled",
+        "skipped_llm_not_configured",
+        "failed",
+    }
+
+
+def _citation_payload_to_catalog_fields(citation: CitationMetadata) -> dict[str, Any]:
+    author_names = _citation_author_names(citation)
+    return {
+        "title": citation.title,
+        "author_names": author_names,
+        "publication_date": citation.issued,
+        "publication_year": _citation_publication_year(citation),
+        "document_type": citation.item_type,
+        "organization_name": citation.publisher,
+    }
+
+
+def _extract_first_html_title(html_text: str) -> str:
+    match = HTML_TITLE_PATTERN.search(html_text or "")
+    if not match:
+        return ""
+    return _collapse_whitespace(html.unescape(match.group(1))).strip(" ,.;:")
+
+
+def _parse_html_meta_tags(html_text: str) -> dict[str, list[str]]:
+    values: dict[str, list[str]] = {}
+    for key, content in HTML_META_TAG_PATTERN.findall(html_text or ""):
+        normalized_key = _collapse_whitespace(str(key or "")).strip().lower()
+        normalized_content = _collapse_whitespace(html.unescape(str(content or ""))).strip()
+        if not normalized_key or not normalized_content:
+            continue
+        values.setdefault(normalized_key, []).append(normalized_content)
+    return values
+
+
+def _parse_html_json_ld(html_text: str) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for raw in HTML_JSON_LD_PATTERN.findall(html_text or ""):
+        candidate = str(raw or "").strip()
+        if not candidate:
+            continue
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        payloads.extend(_flatten_json_ld_nodes(parsed))
+    return payloads
+
+
+def _flatten_json_ld_nodes(value: Any) -> list[dict[str, Any]]:
+    nodes: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        if "@graph" in value and isinstance(value["@graph"], list):
+            for item in value["@graph"]:
+                nodes.extend(_flatten_json_ld_nodes(item))
+        else:
+            nodes.append(value)
+    elif isinstance(value, list):
+        for item in value:
+            nodes.extend(_flatten_json_ld_nodes(item))
+    return nodes
+
+
+def _select_json_ld_citation_node(nodes: list[dict[str, Any]]) -> dict[str, Any]:
+    scored: list[tuple[int, dict[str, Any]]] = []
+    for node in nodes:
+        raw_type = node.get("@type") or node.get("type") or ""
+        types = [str(item).lower() for item in raw_type] if isinstance(raw_type, list) else [str(raw_type).lower()]
+        score = 0
+        if any(item in {"scholarlyarticle", "article", "report", "webpage", "book", "thesis", "dataset"} for item in types):
+            score += 4
+        if node.get("author"):
+            score += 1
+        if node.get("headline") or node.get("name"):
+            score += 1
+        scored.append((score, node))
+    if not scored:
+        return {}
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return scored[0][1]
+
+
+def extract_html_citation_metadata(html_text: str, *, base_url: str = "") -> dict[str, Any]:
+    if not html_text.strip():
+        return {}
+
+    meta = _parse_html_meta_tags(html_text)
+    title = ""
+    authors: list[str] = []
+    issued = ""
+    doi = ""
+    url = ""
+    publisher = ""
+    container_title = ""
+    volume = ""
+    issue = ""
+    first_page = ""
+    last_page = ""
+    item_type = ""
+    language = ""
+    report_number = ""
+    standard_number = ""
+    evidence: list[str] = []
+
+    def first_value(*keys: str) -> str:
+        for key in keys:
+            values = meta.get(key.lower()) or []
+            for value in values:
+                if value:
+                    return value
+        return ""
+
+    def all_values(*keys: str) -> list[str]:
+        items: list[str] = []
+        for key in keys:
+            items.extend(meta.get(key.lower()) or [])
+        return _dedupe_strings(items)
+
+    title = first_value("citation_title", "dc.title", "og:title", "twitter:title") or _extract_first_html_title(html_text)
+    authors = all_values("citation_author", "author", "dc.creator", "article:author")
+    issued = first_value(
+        "citation_publication_date",
+        "citation_online_date",
+        "dc.date",
+        "article:published_time",
+        "og:updated_time",
+    )
+    doi = _clean_doi_candidate(first_value("citation_doi", "dc.identifier", "doi"))
+    url = clean_url_candidate(first_value("citation_public_url", "og:url", "twitter:url")) or clean_url_candidate(base_url)
+    publisher = first_value("citation_publisher", "publisher", "dc.publisher", "og:site_name")
+    container_title = first_value(
+        "citation_journal_title",
+        "citation_conference_title",
+        "citation_inbook_title",
+        "citation_collection_title",
+        "citation_dissertation_institution",
+    )
+    volume = first_value("citation_volume")
+    issue = first_value("citation_issue")
+    first_page = first_value("citation_firstpage")
+    last_page = first_value("citation_lastpage")
+    item_type = first_value("citation_type", "dc.type", "og:type")
+    language = first_value("citation_language", "dc.language", "og:locale")
+    report_number = first_value("citation_technical_report_number", "citation_report_number")
+    standard_number = first_value("citation_standard_number")
+
+    if not standard_number:
+        standard_number = _first_pattern_match(STANDARD_NUMBER_PATTERN, html_text)
+    if not report_number:
+        report_number = _first_pattern_match(REPORT_NUMBER_PATTERN, html_text)
+
+    json_ld_node = _select_json_ld_citation_node(_parse_html_json_ld(html_text))
+    if json_ld_node:
+        title = title or _stringify_manifest_value(json_ld_node.get("headline") or json_ld_node.get("name"))
+        json_ld_authors = _extract_json_ld_authors(json_ld_node.get("author"))
+        if json_ld_authors and not authors:
+            authors = json_ld_authors
+        issued = issued or _stringify_manifest_value(
+            json_ld_node.get("datePublished") or json_ld_node.get("dateCreated")
+        )
+        publisher = publisher or _extract_json_ld_publisher(json_ld_node.get("publisher"))
+        container_title = container_title or _extract_json_ld_container_title(json_ld_node.get("isPartOf"))
+        doi = doi or _clean_doi_candidate(
+            _extract_json_ld_identifier(json_ld_node.get("identifier"))
+        )
+        url = url or clean_url_candidate(_stringify_manifest_value(json_ld_node.get("url")))
+        volume = volume or _stringify_manifest_value(json_ld_node.get("volumeNumber"))
+        issue = issue or _stringify_manifest_value(json_ld_node.get("issueNumber"))
+        if not first_page and json_ld_node.get("pageStart"):
+            first_page = _stringify_manifest_value(json_ld_node.get("pageStart"))
+        if not last_page and json_ld_node.get("pageEnd"):
+            last_page = _stringify_manifest_value(json_ld_node.get("pageEnd"))
+        item_type = item_type or _normalize_json_ld_type(json_ld_node.get("@type"))
+        language = language or _stringify_manifest_value(json_ld_node.get("inLanguage"))
+        report_number = report_number or _stringify_manifest_value(
+            json_ld_node.get("reportNumber") or json_ld_node.get("identifier")
+        )
+        evidence.extend(
+            _dedupe_strings(
+                [
+                    _stringify_manifest_value(json_ld_node.get("headline") or json_ld_node.get("name")),
+                    _stringify_manifest_value(json_ld_node.get("datePublished")),
+                    _extract_json_ld_publisher(json_ld_node.get("publisher")),
+                ]
+            )
+        )
+
+    if trafilatura is not None:
+        try:
+            meta_doc = trafilatura.extract_metadata(html_text, default_url=base_url or None)
+        except Exception:
+            meta_doc = None
+        if meta_doc is not None:
+            title = title or _stringify_manifest_value(getattr(meta_doc, "title", ""))
+            issued = issued or _stringify_manifest_value(getattr(meta_doc, "date", ""))
+            publisher = publisher or _stringify_manifest_value(getattr(meta_doc, "sitename", ""))
+            if not authors:
+                authors = _dedupe_strings(
+                    [item.strip() for item in re.split(r"[;|]", str(getattr(meta_doc, "author", "") or "")) if item.strip()]
+                )
+            evidence.extend(
+                _dedupe_strings(
+                    [
+                        _stringify_manifest_value(getattr(meta_doc, "title", "")),
+                        _stringify_manifest_value(getattr(meta_doc, "author", "")),
+                        _stringify_manifest_value(getattr(meta_doc, "date", "")),
+                    ]
+                )
+            )
+
+    pages = f"{first_page}-{last_page}" if first_page and last_page else first_page or last_page
+    return {
+        "title": title,
+        "authors": authors,
+        "issued": issued,
+        "publisher": publisher,
+        "container_title": container_title,
+        "volume": volume,
+        "issue": issue,
+        "pages": pages,
+        "doi": doi,
+        "url": url or clean_url_candidate(base_url),
+        "report_number": report_number,
+        "standard_number": standard_number,
+        "language": language,
+        "item_type": _normalize_citation_type(item_type),
+        "evidence": _dedupe_strings([title, publisher, container_title, issued, *authors, *evidence])[:8],
+    }
+
+
+def _read_catalog_html_input(
+    row: SourceManifestRow,
+    *,
+    read_text: Callable[[Path], str],
+) -> str:
+    for rel_path in (row.raw_file, row.rendered_file):
+        candidate = Path(str(rel_path or ""))
+        if not candidate.suffix.lower() in {".html", ".htm"}:
+            continue
+        html_text = read_text(candidate)
+        if html_text.strip():
+            return html_text
+    return ""
+
+
+def _extract_json_ld_authors(value: Any) -> list[str]:
+    authors: list[str] = []
+    items = value if isinstance(value, list) else [value]
+    for item in items:
+        if isinstance(item, dict):
+            name = _stringify_manifest_value(item.get("name"))
+            if not name:
+                family = _stringify_manifest_value(item.get("familyName"))
+                given = _stringify_manifest_value(item.get("givenName"))
+                name = ", ".join(part for part in [family, given] if part).strip(", ")
+            if name:
+                authors.append(name)
+        else:
+            name = _stringify_manifest_value(item)
+            if name:
+                authors.append(name)
+    return _dedupe_strings(authors)
+
+
+def _extract_json_ld_publisher(value: Any) -> str:
+    if isinstance(value, dict):
+        return _stringify_manifest_value(value.get("name"))
+    return _stringify_manifest_value(value)
+
+
+def _extract_json_ld_container_title(value: Any) -> str:
+    if isinstance(value, dict):
+        return _stringify_manifest_value(value.get("name"))
+    return ""
+
+
+def _extract_json_ld_identifier(value: Any) -> str:
+    if isinstance(value, dict):
+        return _stringify_manifest_value(value.get("value") or value.get("@id") or value.get("identifier"))
+    if isinstance(value, list):
+        for item in value:
+            identifier = _extract_json_ld_identifier(item)
+            if identifier:
+                return identifier
+        return ""
+    return _stringify_manifest_value(value)
+
+
+def _normalize_json_ld_type(value: Any) -> str:
+    if isinstance(value, list):
+        for item in value:
+            normalized = _normalize_json_ld_type(item)
+            if normalized:
+                return normalized
+        return ""
+    raw = _stringify_manifest_value(value).lower()
+    if not raw:
+        return ""
+    if "scholarlyarticle" in raw or "article" == raw:
+        return "journal article"
+    if "webpage" in raw or "website" in raw:
+        return "web page"
+    if "report" in raw:
+        return "report"
+    if "book" in raw:
+        return "book"
+    if "thesis" in raw or "dissertation" in raw:
+        return "thesis"
+    if "dataset" in raw:
+        return "dataset"
+    return ""
+
+
+def _first_pattern_match(pattern: re.Pattern[str], text: str) -> str:
+    match = pattern.search(text or "")
+    if not match:
+        return ""
+    groups = [item for item in match.groups() if item] if match.groups() else [match.group(0)]
+    return _collapse_whitespace(str(groups[0] if groups else match.group(0))).strip(" ,.;:")
+
+
+def _extract_doi_from_text_sources(*values: str) -> str:
+    for value in values:
+        doi = _clean_doi_candidate(value)
+        if doi:
+            return doi
+    return ""
+
+
+def _build_citation_metadata(
+    *,
+    row: SourceManifestRow,
+    title: str,
+    author_names: str,
+    publication_date: str,
+    document_type: str,
+    organization_name: str,
+    html_metadata: dict[str, Any] | None = None,
+) -> CitationMetadata:
+    html_payload = _normalize_citation_payload(html_metadata or {})
+    base_url = clean_url_candidate(row.original_url or row.final_url or "")
+    citation = CitationMetadata(
+        item_type=_normalize_citation_type(
+            html_payload.item_type or document_type,
+            fallback_document_type=document_type,
+            source_kind=row.source_kind,
+            url=base_url,
+        ),
+        title=html_payload.title or title,
+        authors=html_payload.authors or normalize_citation_authors(author_names),
+        issued=html_payload.issued or publication_date,
+        publisher=html_payload.publisher or organization_name,
+        container_title=html_payload.container_title,
+        volume=html_payload.volume,
+        issue=html_payload.issue,
+        pages=html_payload.pages,
+        doi=html_payload.doi or _extract_doi_from_text_sources(base_url, row.notes, row.title),
+        url=html_payload.url or base_url,
+        report_number=html_payload.report_number or _first_pattern_match(REPORT_NUMBER_PATTERN, title),
+        standard_number=html_payload.standard_number or _first_pattern_match(STANDARD_NUMBER_PATTERN, title),
+        language=html_payload.language,
+        evidence=_dedupe_strings(
+            [
+                title,
+                author_names,
+                publication_date,
+                organization_name,
+                *(html_payload.evidence or []),
+            ]
+        )[:10],
+        confidence=html_payload.confidence,
+    )
+    return _finalize_citation_metadata(citation)
+
+
+def _citation_needs_llm_review(citation: CitationMetadata) -> bool:
+    return (
+        str(citation.verification_status or "").strip().lower() != "verified"
+        or citation.verification_confidence < 0.75
+    )
+
+
+def _enrich_citation_from_csl_json(citation: CitationMetadata, payload: dict[str, Any]) -> CitationMetadata:
+    title_values = payload.get("title")
+    title = ""
+    if isinstance(title_values, list):
+        title = _stringify_manifest_value(title_values[0] if title_values else "")
+    else:
+        title = _stringify_manifest_value(title_values)
+
+    container_values = payload.get("container-title")
+    container_title = ""
+    if isinstance(container_values, list):
+        container_title = _stringify_manifest_value(container_values[0] if container_values else "")
+    else:
+        container_title = _stringify_manifest_value(container_values)
+
+    issued = _csl_date_parts_to_string(payload.get("issued"))
+    url = clean_url_candidate(_stringify_manifest_value(payload.get("URL") or payload.get("url")))
+    doi = _clean_doi_candidate(_stringify_manifest_value(payload.get("DOI") or payload.get("doi")))
+    authors = normalize_citation_authors(payload.get("author"))
+    citation_payload = {
+        "item_type": _normalize_citation_type(_stringify_manifest_value(payload.get("type"))),
+        "title": title,
+        "authors": [author.model_dump(mode="json") for author in authors],
+        "issued": issued,
+        "publisher": _stringify_manifest_value(payload.get("publisher")),
+        "container_title": container_title,
+        "volume": _stringify_manifest_value(payload.get("volume")),
+        "issue": _stringify_manifest_value(payload.get("issue")),
+        "pages": _normalize_pages_value(payload.get("page")),
+        "doi": doi,
+        "url": url,
+        "language": _stringify_manifest_value(payload.get("language")),
+        "report_number": _extract_report_number_from_payload(payload),
+        "standard_number": _extract_standard_number_from_payload(payload),
+        "evidence": [title, container_title, doi, url],
+        "confidence": 0.95,
+    }
+    return _merge_citation_metadata(citation, citation_payload)
+
+
+def _csl_date_parts_to_string(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ""
+    date_parts = value.get("date-parts")
+    if not isinstance(date_parts, list) or not date_parts:
+        return ""
+    first = date_parts[0]
+    if not isinstance(first, list) or not first:
+        return ""
+    pieces = [str(item) for item in first[:3]]
+    if len(pieces) >= 3:
+        return f"{pieces[0]}-{str(pieces[1]).zfill(2)}-{str(pieces[2]).zfill(2)}"
+    if len(pieces) == 2:
+        return f"{pieces[0]}-{str(pieces[1]).zfill(2)}"
+    return pieces[0]
+
+
+def _extract_report_number_from_payload(payload: dict[str, Any]) -> str:
+    for key in ("number", "report-number", "reportNumber"):
+        value = _stringify_manifest_value(payload.get(key))
+        if value:
+            return value
+    identifiers = payload.get("identifier")
+    if isinstance(identifiers, list):
+        for item in identifiers:
+            value = _stringify_manifest_value(item)
+            if value and REPORT_NUMBER_PATTERN.search(value):
+                return _first_pattern_match(REPORT_NUMBER_PATTERN, value)
+    return ""
+
+
+def _extract_standard_number_from_payload(payload: dict[str, Any]) -> str:
+    for key in ("standard_number", "standardNumber"):
+        value = _stringify_manifest_value(payload.get(key))
+        if value:
+            return value
+    for key in ("number", "identifier"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            for item in value:
+                text = _stringify_manifest_value(item)
+                if STANDARD_NUMBER_PATTERN.search(text):
+                    return _first_pattern_match(STANDARD_NUMBER_PATTERN, text)
+        text = _stringify_manifest_value(value)
+        if STANDARD_NUMBER_PATTERN.search(text):
+            return _first_pattern_match(STANDARD_NUMBER_PATTERN, text)
+    return ""
+
+
+def _resolve_doi_citation_metadata(doi: str) -> CitationMetadata:
+    cleaned = _clean_doi_candidate(doi)
+    if not cleaned:
+        return CitationMetadata()
+    user_agent = "ResearchAssistant/1.0 (+https://local.app)"
+    headers = {"Accept": DOI_CSL_ACCEPT_HEADER, "User-Agent": user_agent}
+    try:
+        response = httpx.get(
+            f"https://doi.org/{quote(cleaned, safe='')}",
+            headers=headers,
+            timeout=HTTP_TIMEOUT_SECONDS,
+            follow_redirects=True,
+        )
+        if response.status_code < 400:
+            payload = response.json()
+            if isinstance(payload, dict):
+                return _enrich_citation_from_csl_json(CitationMetadata(doi=cleaned), payload)
+    except Exception:
+        pass
+
+    for url in (
+        f"https://api.crossref.org/works/{quote(cleaned, safe='')}",
+        f"https://api.datacite.org/dois/{quote(cleaned, safe='')}",
+    ):
+        try:
+            response = httpx.get(
+                url,
+                headers={"User-Agent": user_agent},
+                timeout=HTTP_TIMEOUT_SECONDS,
+                follow_redirects=True,
+            )
+            if response.status_code >= 400:
+                continue
+            payload = response.json()
+        except Exception:
+            continue
+        candidate = _citation_from_agency_payload(cleaned, payload)
+        if candidate.ready_for_ris or candidate.confidence >= 0.85:
+            return candidate
+    return CitationMetadata(doi=cleaned)
+
+
+def _citation_from_agency_payload(doi: str, payload: Any) -> CitationMetadata:
+    if not isinstance(payload, dict):
+        return CitationMetadata(doi=doi)
+    if isinstance(payload.get("message"), dict):
+        return _enrich_citation_from_csl_json(CitationMetadata(doi=doi), payload["message"])
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return CitationMetadata(doi=doi)
+    attributes = data.get("attributes")
+    if not isinstance(attributes, dict):
+        return CitationMetadata(doi=doi)
+    title = ""
+    titles = attributes.get("titles")
+    if isinstance(titles, list) and titles:
+        first_title = titles[0]
+        if isinstance(first_title, dict):
+            title = _stringify_manifest_value(first_title.get("title"))
+    creators = attributes.get("creators")
+    authors: list[dict[str, str]] = []
+    if isinstance(creators, list):
+        for creator in creators:
+            if not isinstance(creator, dict):
+                continue
+            authors.append(
+                {
+                    "family": _stringify_manifest_value(creator.get("familyName")),
+                    "given": _stringify_manifest_value(creator.get("givenName")),
+                    "literal": _stringify_manifest_value(creator.get("name")),
+                }
+            )
+    citation_payload = {
+        "item_type": _normalize_citation_type(
+            _stringify_manifest_value(
+                (attributes.get("types") or {}).get("resourceTypeGeneral")
+                if isinstance(attributes.get("types"), dict)
+                else ""
+            )
+        ),
+        "title": title,
+        "authors": authors,
+        "issued": _stringify_manifest_value(attributes.get("publicationYear")),
+        "publisher": _stringify_manifest_value(attributes.get("publisher")),
+        "container_title": "",
+        "doi": doi,
+        "url": _stringify_manifest_value(attributes.get("url")),
+        "language": _stringify_manifest_value(attributes.get("language")),
+        "report_number": _extract_report_number_from_payload(attributes),
+        "standard_number": _extract_standard_number_from_payload(attributes),
+        "confidence": 0.9,
+        "evidence": [title, _stringify_manifest_value(attributes.get("publisher")), doi],
+    }
+    return _normalize_citation_payload(citation_payload)
+
+
+def build_ris_records(rows: list[SourceManifestRow], *, base_dir: Path | None = None) -> tuple[str, int, int]:
+    records: list[str] = []
+    skipped = 0
+    for row in rows:
+        catalog_payload = _load_manifest_json(base_dir, row.catalog_file)
+        citation = _coerce_citation_metadata(catalog_payload.get("citation"))
+        citation = _finalize_citation_metadata(citation)
+        if not citation.ready_for_ris:
+            skipped += 1
+            continue
+        records.append(build_ris_record(citation))
+    return ("\r\n".join(record.rstrip("\r\n") for record in records) + ("\r\n" if records else "")), len(records), skipped
+
+
+def build_ris_record(citation: CitationMetadata) -> str:
+    lines: list[str] = []
+    ris_type = RIS_TYPE_MAP.get(citation.item_type, "GEN")
+    lines.append(f"TY  - {ris_type}")
+    for author in citation.authors:
+        if author.literal:
+            lines.append(f"AU  - {author.literal}")
+        else:
+            formatted = ", ".join(part for part in [author.family, author.given] if part)
+            if formatted:
+                lines.append(f"AU  - {formatted}")
+    lines.append(f"TI  - {citation.title}")
+    year = _citation_publication_year(citation)
+    if year:
+        lines.append(f"PY  - {year}")
+    if citation.issued:
+        lines.append(f"DA  - {citation.issued.replace('-', '/')}")
+    if citation.item_type == "journal article":
+        if citation.container_title:
+            lines.append(f"T2  - {citation.container_title}")
+            lines.append(f"JO  - {citation.container_title}")
+            lines.append(f"JF  - {citation.container_title}")
+    elif citation.item_type in {"web page", "report", "conference paper", "book chapter"} and citation.container_title:
+        lines.append(f"T2  - {citation.container_title}")
+    if citation.publisher:
+        lines.append(f"PB  - {citation.publisher}")
+    if citation.volume:
+        lines.append(f"VL  - {citation.volume}")
+    if citation.issue:
+        lines.append(f"IS  - {citation.issue}")
+    start_page, end_page = _split_page_range(citation.pages)
+    if start_page:
+        lines.append(f"SP  - {start_page}")
+    if end_page:
+        lines.append(f"EP  - {end_page}")
+    if citation.doi:
+        lines.append(f"DO  - {citation.doi}")
+    if citation.url:
+        lines.append(f"UR  - {citation.url}")
+    if citation.report_number:
+        lines.append(f"SN  - {citation.report_number}")
+    if citation.standard_number:
+        lines.append("M3  - Standard")
+        lines.append(f"VO  - {citation.standard_number}")
+    lines.append("ER  -")
+    return "\r\n".join(lines)
 
 
 def _count_fetch_outcomes(rows: list[SourceManifestRow]) -> dict[str, int]:
@@ -3385,14 +5066,33 @@ def _merge_catalog_payload_into_row(
     if organization_type and should_set(row.organization_type):
         row.organization_type = organization_type
 
+    citation = _normalize_citation_payload(payload.get("citation"))
+    citation_fields = _citation_payload_to_catalog_fields(citation)
+    if citation_fields["title"] and should_set(row.title):
+        row.title = citation_fields["title"]
+    if citation_fields["author_names"] and should_set(row.author_names):
+        row.author_names = citation_fields["author_names"]
+    if citation_fields["publication_date"] and should_set(row.publication_date):
+        row.publication_date = citation_fields["publication_date"]
+    if citation_fields["publication_year"] and should_set(row.publication_year):
+        row.publication_year = citation_fields["publication_year"]
+    if citation_fields["document_type"] and should_set(row.document_type):
+        row.document_type = citation_fields["document_type"]
+    if citation_fields["organization_name"] and should_set(row.organization_name):
+        row.organization_name = citation_fields["organization_name"]
+
 
 def _build_deterministic_catalog_metadata(
     *,
     row: SourceManifestRow,
     markdown_text: str,
+    html_text: str = "",
 ) -> dict[str, Any]:
     front_matter = _parse_markdown_front_matter(markdown_text)
     lines = [line.strip() for line in markdown_text.splitlines() if line.strip()]
+    title_candidate = extract_markdown_title_candidate(markdown_text) or _stringify_manifest_value(
+        front_matter.get("title")
+    )
     author_names = _front_matter_list(front_matter, ("authors", "author", "byline"))
     if not author_names:
         author_names = _extract_byline_authors(lines[:10])
@@ -3420,22 +5120,51 @@ def _build_deterministic_catalog_metadata(
         organization_name = _organization_name_from_url(row.original_url or row.final_url)
 
     document_type = _infer_document_type(row=row, markdown_text=markdown_text)
+    html_metadata = extract_html_citation_metadata(html_text, base_url=row.original_url or row.final_url)
+    if html_metadata.get("authors") and not author_names:
+        author_names = _citation_author_names(_normalize_citation_payload(html_metadata))
+    if html_metadata.get("issued") and not publication_date:
+        publication_date = _normalize_date_string(_stringify_manifest_value(html_metadata.get("issued")))
+    if html_metadata.get("publisher") and not organization_name:
+        organization_name = _stringify_manifest_value(html_metadata.get("publisher"))
+    if html_metadata.get("item_type"):
+        document_type = _normalize_citation_type(
+            _stringify_manifest_value(html_metadata.get("item_type")),
+            fallback_document_type=document_type,
+            source_kind=row.source_kind,
+            url=row.original_url or row.final_url,
+        ) or document_type
+    if publication_date:
+        publication_year = _extract_publication_year(publication_date) or publication_year
     organization_type = _infer_organization_type(
         organization_name=organization_name,
         url=row.original_url or row.final_url,
         source_kind=row.source_kind,
     )
 
+    citation = _build_citation_metadata(
+        row=row,
+        title=title_candidate,
+        author_names=author_names,
+        publication_date=publication_date,
+        document_type=document_type,
+        organization_name=organization_name,
+        html_metadata=html_metadata,
+    )
+
     evidence_snippets = _dedupe_strings(
         [
+            title_candidate,
             _stringify_manifest_value(front_matter.get("title")),
             _stringify_manifest_value(front_matter.get("authors")),
             _stringify_manifest_value(front_matter.get("date")),
+            *(html_metadata.get("evidence") or []),
             *(lines[:3]),
         ]
     )[:5]
 
     return {
+        "title": title_candidate,
         "author_names": author_names,
         "publication_date": publication_date,
         "publication_year": publication_year,
@@ -3443,6 +5172,7 @@ def _build_deterministic_catalog_metadata(
         "organization_name": organization_name,
         "organization_type": organization_type,
         "evidence_snippets": evidence_snippets,
+        "citation": citation.model_dump(mode="json"),
     }
 
 

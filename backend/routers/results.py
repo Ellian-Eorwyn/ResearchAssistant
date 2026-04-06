@@ -9,6 +9,12 @@ from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 
 from backend.models.export import ExportArtifact
+from backend.models.project_profiles import (
+    ProjectProfileGenerateRequest,
+    ProjectProfileGenerateResponse,
+    ProjectProfileSaveRequest,
+    ProjectProfileSaveResponse,
+)
 from backend.models.sources import SourceManifestRow
 from backend.pipeline.stage_export_sqlite import build_wikiclaude_sqlite_db
 from backend.storage.project_profiles import list_project_profiles_in_dir
@@ -213,6 +219,45 @@ async def upload_project_profile(
     dest.write_bytes(content)
 
     return {"filename": safe_name, "name": Path(safe_name).stem}
+
+
+@router.post(
+    "/project-profiles/generate",
+    response_model=ProjectProfileGenerateResponse,
+)
+async def generate_project_profile(
+    request: Request,
+    payload: ProjectProfileGenerateRequest,
+) -> ProjectProfileGenerateResponse:
+    service = request.app.state.repository_service
+    if not service.is_attached:
+        raise HTTPException(status_code=400, detail="No repository attached")
+    try:
+        return service.generate_project_profile(
+            research_purpose=payload.research_purpose,
+            profile_name=payload.profile_name,
+            filename=payload.filename,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put(
+    "/project-profiles/{filename}",
+    response_model=ProjectProfileSaveResponse,
+)
+async def save_project_profile(
+    filename: str,
+    request: Request,
+    payload: ProjectProfileSaveRequest,
+) -> ProjectProfileSaveResponse:
+    service = request.app.state.repository_service
+    if not service.is_attached:
+        raise HTTPException(status_code=400, detail="No repository attached")
+    try:
+        return service.save_project_profile(filename=filename, content=payload.content)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 # ---- Source Ratings ----

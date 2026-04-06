@@ -34,6 +34,7 @@ from backend.models.agent import (
     AgentSourceProvenance,
     AgentSourceRecord,
 )
+from backend.models.citation_metadata import CitationFieldEvidence, CitationMetadata
 from backend.models.export import ExportArtifact, ExportRow
 from backend.models.common import ProcessingConfig
 from backend.models.ingestion import IngestedDocument
@@ -48,6 +49,16 @@ from backend.models.ingestion_profiles import (
 )
 from backend.models.repository import (
     RepositoryActionResponse,
+    RepositoryCitationRisExportRequest,
+    RepositoryColumnConfig,
+    RepositoryColumnCreateRequest,
+    RepositoryColumnOutputConstraint,
+    RepositoryColumnPromptFixResponse,
+    RepositoryColumnRunRequest,
+    RepositoryColumnRunRowError,
+    RepositoryColumnRunStartResponse,
+    RepositoryColumnRunStatus,
+    RepositoryColumnUpdateRequest,
     RepositoryDocumentImportDocument,
     RepositoryDocumentImportListResponse,
     RepositoryDocumentImportRecord,
@@ -64,6 +75,10 @@ from backend.models.repository import (
     RepositorySourceTaskResponse,
     RepositoryStatusResponse,
 )
+from backend.models.project_profiles import (
+    ProjectProfileGenerateResponse,
+    ProjectProfileSaveResponse,
+)
 from backend.models.settings import RepoSettings
 from backend.models.sources import (
     SOURCE_MANIFEST_COLUMNS,
@@ -73,6 +88,15 @@ from backend.models.sources import (
     SourceManifestArtifact,
     SourceManifestRow,
     SourceOutputOptions,
+)
+from backend.llm.client import UnifiedLLMClient
+from backend.llm.prompts import (
+    COLUMN_PROMPT_FIX_SYSTEM,
+    COLUMN_PROMPT_FIX_USER,
+    COLUMN_RUN_SYSTEM,
+    COLUMN_RUN_USER,
+    PROJECT_PROFILE_GENERATION_SYSTEM,
+    PROJECT_PROFILE_GENERATION_USER,
 )
 from backend.pipeline.orchestrator import PipelineOrchestrator
 from backend.pipeline.standardized_markdown import (
@@ -84,13 +108,21 @@ from backend.pipeline.standardized_markdown import (
 )
 from backend.pipeline.source_downloader import (
     MANIFEST_DERIVED_COLUMNS,
+    _apply_citation_manual_overrides,
+    _coerce_citation_metadata,
+    _effective_manual_override_fields,
+    _finalize_citation_metadata,
+    _merge_citation_metadata,
     SourceDownloadOrchestrator,
+    build_ris_records,
     build_manifest_record,
     build_manifest_csv,
     build_manifest_xlsx,
     clean_url_candidate,
     dedupe_url_key,
+    llm_backend_ready_for_chat,
     normalize_url,
+    normalize_citation_authors,
     summarize_output_rows,
 )
 from backend.pipeline.source_list_parser import parse_source_list_upload
@@ -104,7 +136,10 @@ from backend.pipeline.stage_export_sqlite import build_wikiclaude_sqlite_db
 from backend.pipeline.stage_ingest import run_ingestion
 from backend.pipeline.stage_references import detect_references_section
 from backend.storage.file_store import FileStore
-from backend.storage.project_profiles import resolve_project_profile_yaml
+from backend.storage.project_profiles import (
+    DEFAULT_PROJECT_PROFILE_FILENAME,
+    resolve_project_profile_yaml,
+)
 
 try:  # pragma: no cover - POSIX only
     import fcntl
@@ -112,7 +147,7 @@ except Exception:  # pragma: no cover - Windows fallback
     fcntl = None
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 INTERNAL_DIR_NAME = ".ra_repo"
 META_FILE_NAME = "repository.json"
 STATE_FILE_NAME = "repository_state.json"
@@ -266,6 +301,1142 @@ class AttachedRepositoryService:
             json.dumps(settings.model_dump(mode="json"), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+
+    def generate_project_profile(
+        self,
+        *,
+        research_purpose: str = "",
+        profile_name: str = "",
+        filename: str = "",
+        settings: RepoSettings | None = None,
+    ) -> ProjectProfileGenerateResponse:
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+
+        repo_settings = settings or self.load_repo_settings()
+        if not repo_settings.use_llm:
+            raise ValueError("Project profile generation requires LLM features to be enabled.")
+        if not llm_backend_ready_for_chat(repo_settings.llm_backend):
+            raise ValueError("Project profile generation requires a configured chat-capable LLM backend.")
+
+        template_filename = (
+            repo_settings.default_project_profile_name.strip()
+            or DEFAULT_PROJECT_PROFILE_FILENAME
+        )
+        template_yaml = self._load_project_profile_template(template_filename)
+        effective_research_purpose = (research_purpose or repo_settings.research_purpose or "").strip()
+
+        client = UnifiedLLMClient(repo_settings.llm_backend)
+        try:
+            raw_response = client.sync_chat_completion(
+                system_prompt=PROJECT_PROFILE_GENERATION_SYSTEM,
+                user_prompt=PROJECT_PROFILE_GENERATION_USER.format(
+                    research_purpose=effective_research_purpose or "No explicit research purpose was provided.",
+                    profile_name=(profile_name or "").strip(),
+                    template_yaml=template_yaml,
+                ),
+                response_format="json",
+            ).strip()
+        except Exception as exc:
+            raise ValueError(f"Project profile generation failed: {type(exc).__name__}: {exc}") from exc
+        finally:
+            client.sync_close()
+
+        try:
+            payload = json.loads(raw_response or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError("Project profile generation returned invalid JSON.") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("Project profile generation returned an invalid payload.")
+
+        content = str(payload.get("yaml") or "").strip()
+        if not content:
+            raise ValueError("Project profile generation returned an empty YAML draft.")
+
+        resolved_profile_name = (
+            (profile_name or "").strip()
+            or str(payload.get("profile_name") or "").strip()
+            or "Generated Project Profile"
+        )
+        resolved_filename = self._normalize_project_profile_filename(
+            filename=filename,
+            filename_stem=str(payload.get("filename_stem") or "").strip(),
+            profile_name=resolved_profile_name,
+        )
+        return ProjectProfileGenerateResponse(
+            status="generated",
+            filename=resolved_filename,
+            profile_name=resolved_profile_name,
+            content=content.rstrip() + "\n",
+        )
+
+    def save_project_profile(
+        self,
+        *,
+        filename: str,
+        content: str,
+    ) -> ProjectProfileSaveResponse:
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+        safe_name = self._normalize_project_profile_filename(
+            filename=filename,
+            filename_stem="",
+            profile_name=Path(filename or "profile").stem,
+        )
+        normalized_content = str(content or "").strip()
+        if not normalized_content:
+            raise ValueError("Project profile content cannot be empty.")
+
+        destination = self.project_profiles_dir / safe_name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(normalized_content + "\n", encoding="utf-8")
+        return ProjectProfileSaveResponse(
+            status="saved",
+            filename=safe_name,
+            name=Path(safe_name).stem,
+            content=normalized_content + "\n",
+        )
+
+    def _normalize_column_label(self, value: str, fallback: str = "New Column") -> str:
+        normalized = " ".join(str(value or "").split()).strip()
+        return normalized or fallback
+
+    def _resolve_column_config_locked(
+        self,
+        column_id: str,
+        column_configs: list[RepositoryColumnConfig],
+        *,
+        create_builtin: bool = False,
+    ) -> tuple[RepositoryColumnConfig, int | None]:
+        normalized_id = str(column_id or "").strip()
+        if not normalized_id:
+            raise ValueError("column_id is required")
+
+        for index, config in enumerate(column_configs):
+            builtin_key = str(config.builtin_key or config.id or "").strip()
+            if config.id == normalized_id or (
+                config.kind == "builtin" and builtin_key == normalized_id
+            ):
+                return config.model_copy(deep=True), index
+
+        if create_builtin and normalized_id in PROCESSABLE_BUILTIN_COLUMNS:
+            return (
+                RepositoryColumnConfig(
+                    id=normalized_id,
+                    label=_manifest_column_label(normalized_id),
+                    kind="builtin",
+                    builtin_key=normalized_id,
+                ),
+                None,
+            )
+
+        raise ValueError(f"Unknown or unsupported column_id: {normalized_id}")
+
+    def create_column(self, label: str = "") -> RepositoryColumnConfig:
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+
+        with self._writer_lock():
+            state = self._load_state_locked()
+            rows = _load_source_rows(state.get("sources", []))
+            citations = _load_citation_rows(state.get("citations", []))
+            column_configs = _load_column_configs(state.get("column_configs", []))
+            existing_ids = {config.id for config in column_configs}
+
+            column_id = ""
+            while not column_id or column_id in existing_ids:
+                column_id = f"custom_{uuid.uuid4().hex[:8]}"
+
+            config = RepositoryColumnConfig(
+                id=column_id,
+                label=self._normalize_column_label(label, fallback="New Column"),
+                kind="custom",
+            )
+            column_configs.append(config)
+            self._save_state_locked(
+                sources=rows,
+                citations=citations,
+                imports=state.get("imports", []),
+                column_configs=column_configs,
+            )
+            self._save_meta_locked(
+                {
+                    **self._load_meta_locked(),
+                    "updated_at": _utc_now_iso(),
+                }
+            )
+            self._rebuild_outputs_locked(rows, citations)
+            return config
+
+    def update_column(
+        self,
+        column_id: str,
+        *,
+        patch: dict[str, Any],
+    ) -> RepositoryColumnConfig:
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+        if not patch:
+            raise ValueError("At least one column field is required.")
+
+        with self._writer_lock():
+            state = self._load_state_locked()
+            rows = _load_source_rows(state.get("sources", []))
+            citations = _load_citation_rows(state.get("citations", []))
+            column_configs = _load_column_configs(state.get("column_configs", []))
+            config, index = self._resolve_column_config_locked(
+                column_id,
+                column_configs,
+                create_builtin=True,
+            )
+
+            if "label" in patch and patch.get("label") is not None:
+                if config.kind != "custom":
+                    raise ValueError("Only custom columns can be renamed.")
+                config.label = self._normalize_column_label(str(patch.get("label") or ""))
+
+            if "instruction_prompt" in patch and patch.get("instruction_prompt") is not None:
+                config.instruction_prompt = self._normalize_source_patch_multiline_text(
+                    patch.get("instruction_prompt")
+                )
+
+            if "output_constraint" in patch and patch.get("output_constraint") is not None:
+                candidate = patch.get("output_constraint")
+                config.output_constraint = (
+                    candidate
+                    if isinstance(candidate, RepositoryColumnOutputConstraint)
+                    else RepositoryColumnOutputConstraint.model_validate(candidate)
+                )
+            elif "instruction_prompt" in patch and patch.get("instruction_prompt") is not None:
+                if config.instruction_prompt:
+                    config.output_constraint = _infer_column_output_constraint(
+                        config.instruction_prompt,
+                        existing=config.output_constraint,
+                    )
+                else:
+                    config.output_constraint = None
+
+            if index is None:
+                column_configs.append(config)
+            else:
+                column_configs[index] = config
+
+            self._save_state_locked(
+                sources=rows,
+                citations=citations,
+                imports=state.get("imports", []),
+                column_configs=column_configs,
+            )
+            self._save_meta_locked(
+                {
+                    **self._load_meta_locked(),
+                    "updated_at": _utc_now_iso(),
+                }
+            )
+            return config
+
+    def fix_column_prompt(
+        self,
+        column_id: str,
+        *,
+        draft_prompt: str,
+    ) -> RepositoryColumnPromptFixResponse:
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+
+        normalized_prompt = self._normalize_source_patch_multiline_text(draft_prompt)
+        if not normalized_prompt:
+            raise ValueError("draft_prompt is required")
+
+        repo_settings = self.load_repo_settings()
+        if not repo_settings.use_llm or not llm_backend_ready_for_chat(repo_settings.llm_backend):
+            raise ValueError("Prompt fix requires an enabled chat-capable LLM backend.")
+
+        with self._writer_lock():
+            column_configs = _load_column_configs(
+                self._load_state_locked().get("column_configs", [])
+            )
+            config, _ = self._resolve_column_config_locked(
+                column_id,
+                column_configs,
+                create_builtin=True,
+            )
+
+        client = UnifiedLLMClient(repo_settings.llm_backend)
+        try:
+            current_prompt = _effective_column_instruction_prompt(config)
+            current_constraint = _effective_column_output_constraint(config)
+            raw_response = client.sync_chat_completion(
+                system_prompt=COLUMN_PROMPT_FIX_SYSTEM,
+                user_prompt=COLUMN_PROMPT_FIX_USER.format(
+                    column_label=config.label,
+                    current_prompt=current_prompt,
+                    current_constraint_json=json.dumps(
+                        _serialize_column_output_constraint(current_constraint),
+                        ensure_ascii=False,
+                    ),
+                    draft_prompt=normalized_prompt,
+                ),
+                response_format="json",
+            )
+        finally:
+            client.sync_close()
+
+        payload = _parse_json_object(raw_response)
+        rewritten_prompt = self._normalize_source_patch_multiline_text(
+            payload.get("prompt") or normalized_prompt
+        )
+        output_constraint = _coerce_column_output_constraint_payload(
+            payload.get("output_constraint")
+        ) or _infer_column_output_constraint(
+            rewritten_prompt,
+            existing=current_constraint,
+        )
+        notes = [
+            str(item).strip()
+            for item in payload.get("notes", [])
+            if str(item or "").strip()
+        ] if isinstance(payload.get("notes"), list) else []
+        return RepositoryColumnPromptFixResponse(
+            status="completed",
+            column_id=str(config.builtin_key or config.id or column_id).strip(),
+            prompt=rewritten_prompt,
+            output_constraint=output_constraint,
+            notes=notes,
+        )
+
+    def start_column_run(
+        self,
+        column_id: str,
+        *,
+        payload: RepositoryColumnRunRequest,
+    ) -> RepositoryColumnRunStartResponse:
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+
+        repo_settings = self.load_repo_settings()
+        if not repo_settings.use_llm or not llm_backend_ready_for_chat(repo_settings.llm_backend):
+            raise ValueError("Column runs require an enabled chat-capable LLM backend.")
+
+        with self._writer_lock():
+            if self._download_thread and self._download_thread.is_alive():
+                raise ValueError("A repository operation is already running")
+
+            state = self._load_state_locked()
+            rows = _load_source_rows(state.get("sources", []))
+            citations = _load_citation_rows(state.get("citations", []))
+            column_configs = _load_column_configs(state.get("column_configs", []))
+            config, index = self._resolve_column_config_locked(
+                column_id,
+                column_configs,
+                create_builtin=True,
+            )
+            config.instruction_prompt = self._normalize_source_patch_multiline_text(config.instruction_prompt)
+            effective_prompt = _effective_column_instruction_prompt(config)
+            if not effective_prompt:
+                raise ValueError("Save instructions for this column before running it.")
+            if config.output_constraint is None:
+                config.output_constraint = _effective_column_output_constraint(config)
+
+            records = [
+                build_manifest_record(row, base_dir=self.path, column_configs=column_configs)
+                for row in rows
+            ]
+            columns = _build_manifest_column_metadata(records, column_configs)
+            row_by_id = {row.id: row.model_copy(deep=True) for row in rows}
+            normalized_scope = str(payload.scope or "filtered").strip().lower()
+            if normalized_scope == "filtered":
+                base_records, _, _ = self._filter_manifest_records(
+                    records,
+                    columns,
+                    **payload.filters.model_dump(mode="json"),
+                    sort_by="",
+                    sort_dir="",
+                )
+            elif normalized_scope == "selected":
+                selected_ids = [
+                    str(source_id or "").strip()
+                    for source_id in payload.source_ids
+                    if str(source_id or "").strip() in row_by_id
+                ]
+                selected_id_set = set(selected_ids)
+                base_records = [
+                    record for record in records if str(record.get("id") or "") in selected_id_set
+                ]
+            elif normalized_scope in {"all", "empty_only"}:
+                base_records = list(records)
+            else:
+                raise ValueError(f"Unsupported column run scope: {normalized_scope}")
+
+            if normalized_scope == "empty_only":
+                target_records = [
+                    record
+                    for record in base_records
+                    if not str(record.get(str(config.builtin_key or config.id) or "")).strip()
+                ]
+            else:
+                target_records = base_records
+
+            if not target_records:
+                if normalized_scope == "selected":
+                    raise ValueError("No selected repository rows are available for this column run.")
+                if normalized_scope == "empty_only":
+                    raise ValueError(f"No blank {config.label} cells are available for this column run.")
+                raise ValueError("No repository rows match the current filters.")
+
+            target_row_ids = [
+                str(record.get("id") or "")
+                for record in target_records
+                if str(record.get("id") or "") in row_by_id
+            ]
+            populated_rows = sum(
+                1
+                for record in target_records
+                if str(record.get(str(config.builtin_key or config.id) or "")).strip()
+            )
+            normalized_column_id = str(config.builtin_key or config.id or column_id).strip()
+
+            if populated_rows > 0 and not payload.confirm_overwrite:
+                return RepositoryColumnRunStartResponse(
+                    job_id="",
+                    status="confirmation_required",
+                    column_id=normalized_column_id,
+                    total_rows=len(target_row_ids),
+                    populated_rows=populated_rows,
+                    message=(
+                        f"{populated_rows} matching row(s) already have values in "
+                        f"{config.label}. Confirm overwrite to continue."
+                    ),
+                )
+
+            if index is None:
+                column_configs.append(config)
+            else:
+                column_configs[index] = config
+            column_configs[
+                next(
+                    idx
+                    for idx, item in enumerate(column_configs)
+                    if item.id == config.id
+                )
+            ].last_run_status = "running"
+
+            self._save_state_locked(
+                sources=rows,
+                citations=citations,
+                imports=state.get("imports", []),
+                column_configs=column_configs,
+            )
+            self._save_meta_locked(
+                {
+                    **self._load_meta_locked(),
+                    "updated_at": _utc_now_iso(),
+                }
+            )
+
+            job_store = self.repo_job_store()
+            job_id = job_store.create_job(prefix=REPO_JOB_PREFIX)
+            initial_status = RepositoryColumnRunStatus(
+                job_id=job_id,
+                column_id=normalized_column_id,
+                column_label=config.label,
+                state="pending",
+                total_rows=len(target_row_ids),
+                message=f"Queued {len(target_row_ids)} row(s) for {config.label}.",
+            )
+            job_store.save_artifact(
+                job_id,
+                "repo_column_run_context",
+                {
+                    "column_id": normalized_column_id,
+                    "column_label": config.label,
+                    "target_row_ids": target_row_ids,
+                    "scope": normalized_scope,
+                    "filters": payload.filters.model_dump(mode="json"),
+                    "repository_path": str(self.path),
+                },
+            )
+            job_store.save_source_status(job_id, initial_status.model_dump(mode="json"))
+
+            self._download_state = "running"
+            self._download_message = initial_status.message
+            self._download_thread = threading.Thread(
+                target=self._repository_column_run_worker,
+                args=(job_id, normalized_column_id, target_row_ids, repo_settings),
+                daemon=True,
+            )
+            self._download_thread.start()
+
+            return RepositoryColumnRunStartResponse(
+                job_id=job_id,
+                status="started",
+                column_id=normalized_column_id,
+                total_rows=len(target_row_ids),
+                populated_rows=populated_rows,
+                message=initial_status.message,
+            )
+
+    def get_column_run_status(self, job_id: str) -> RepositoryColumnRunStatus:
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+        normalized_job_id = str(job_id or "").strip()
+        if not normalized_job_id:
+            raise ValueError("job_id is required")
+        raw_status = self.job_store_for(normalized_job_id).get_source_status(normalized_job_id)
+        if raw_status is None:
+            raise ValueError("Column run status not found.")
+        return RepositoryColumnRunStatus.model_validate(raw_status)
+
+    def _repository_column_run_worker(
+        self,
+        job_id: str,
+        column_id: str,
+        source_ids: list[str],
+        repo_settings: RepoSettings,
+    ) -> None:
+        job_store = self.job_store_for(job_id)
+        raw_status = job_store.get_source_status(job_id) or {}
+        try:
+            status = RepositoryColumnRunStatus.model_validate(raw_status)
+        except Exception:
+            status = RepositoryColumnRunStatus(
+                job_id=job_id,
+                column_id=column_id,
+                total_rows=len(source_ids),
+            )
+
+        status.state = "running"
+        status.started_at = status.started_at or _utc_now_iso()
+        status.message = f"Running {status.column_label or column_id} for {len(source_ids)} row(s)."
+        job_store.save_source_status(job_id, status.model_dump(mode="json"))
+
+        try:
+            for source_id in source_ids:
+                with self._writer_lock():
+                    state = self._load_state_locked()
+                    rows = _load_source_rows(state.get("sources", []))
+                    column_configs = _load_column_configs(state.get("column_configs", []))
+                    row = next((item for item in rows if item.id == source_id), None)
+                    if row is None:
+                        raise ValueError(f"Unknown source_id: {source_id}")
+                    config, _ = self._resolve_column_config_locked(
+                        column_id,
+                        column_configs,
+                        create_builtin=True,
+                    )
+                    manifest_record = build_manifest_record(
+                        row,
+                        base_dir=self.path,
+                        column_configs=column_configs,
+                    )
+
+                status.current_source_id = source_id
+                status.current_source_title = str(manifest_record.get("title") or "")
+                status.message = f"Running {status.processed_rows + 1} of {status.total_rows}."
+                job_store.save_source_status(job_id, status.model_dump(mode="json"))
+
+                try:
+                    next_value = self._generate_column_value_for_row(
+                        config=config,
+                        row=row,
+                        manifest_record=manifest_record,
+                        repo_settings=repo_settings,
+                    )
+                    self.update_source(
+                        source_id,
+                        patch=_column_value_patch_for_field(config, next_value),
+                    )
+                    status.succeeded_rows += 1
+                except Exception as exc:
+                    status.failed_rows += 1
+                    if len(status.row_errors) < 10:
+                        status.row_errors.append(
+                            RepositoryColumnRunRowError(
+                                source_id=source_id,
+                                message=str(exc),
+                            )
+                        )
+                status.processed_rows += 1
+                job_store.save_source_status(job_id, status.model_dump(mode="json"))
+
+            status.state = "failed" if status.failed_rows == status.total_rows else "completed"
+            status.current_source_id = ""
+            status.current_source_title = ""
+            status.completed_at = _utc_now_iso()
+            status.message = (
+                f"Processed {status.total_rows} row(s): "
+                f"{status.succeeded_rows} succeeded, {status.failed_rows} failed."
+            )
+            job_store.save_source_status(job_id, status.model_dump(mode="json"))
+
+            with self._writer_lock():
+                state = self._load_state_locked()
+                rows = _load_source_rows(state.get("sources", []))
+                citations = _load_citation_rows(state.get("citations", []))
+                column_configs = _load_column_configs(state.get("column_configs", []))
+                config, index = self._resolve_column_config_locked(
+                    column_id,
+                    column_configs,
+                    create_builtin=True,
+                )
+                config.last_run_at = status.completed_at
+                config.last_run_status = "failed" if status.state == "failed" else "completed"
+                if index is None:
+                    column_configs.append(config)
+                else:
+                    column_configs[index] = config
+                self._save_state_locked(
+                    sources=rows,
+                    citations=citations,
+                    imports=state.get("imports", []),
+                    column_configs=column_configs,
+                )
+                self._save_meta_locked(
+                    {
+                        **self._load_meta_locked(),
+                        "updated_at": _utc_now_iso(),
+                    }
+                )
+        finally:
+            raw_status = job_store.get_source_status(job_id) or {}
+            final_state = str(raw_status.get("state") or "completed").strip().lower()
+            final_message = str(raw_status.get("message") or "Repository column run completed")
+            with self._mutex:
+                self._download_state = "failed" if final_state == "failed" else "completed"
+                self._download_message = final_message
+
+    def _generate_column_value_for_row(
+        self,
+        *,
+        config: RepositoryColumnConfig,
+        row: SourceManifestRow,
+        manifest_record: dict[str, str | int | float | bool],
+        repo_settings: RepoSettings,
+    ) -> str:
+        instruction_prompt = _effective_column_instruction_prompt(config)
+        output_constraint = _effective_column_output_constraint(config) or RepositoryColumnOutputConstraint(
+            kind="text",
+            fallback_value="",
+        )
+        current_value = _cell_string_value(
+            manifest_record.get(str(config.builtin_key or config.id))
+        )
+        source_text = self._load_repository_text_artifact(row, "llm_cleanup_file")
+        if not source_text:
+            source_text = self._load_repository_text_artifact(row, "markdown_file")
+        source_text = _truncate_column_run_text(
+            source_text,
+            int(repo_settings.llm_backend.max_source_chars or 0),
+        )
+
+        row_metadata = {
+            key: value
+            for key, value in manifest_record.items()
+            if key
+            not in {
+                "raw_file",
+                "rendered_file",
+                "rendered_pdf_file",
+                "markdown_file",
+                "llm_cleanup_file",
+                "catalog_file",
+                "summary_file",
+                "rating_file",
+                "metadata_file",
+                "rating_raw_json",
+                "citation_field_evidence_json",
+            }
+        }
+        hard_rules = "\n".join(
+            [
+                "- Output only the target cell value.",
+                "- No markdown.",
+                "- No explanations.",
+                "- Keep the value single-cell-safe.",
+                f"- Use `{output_constraint.fallback_value}` when evidence is insufficient."
+                if output_constraint.fallback_value
+                else "- Use a blank value when evidence is insufficient.",
+            ]
+        )
+
+        client = UnifiedLLMClient(repo_settings.llm_backend)
+        try:
+            raw_response = client.sync_chat_completion(
+                system_prompt=COLUMN_RUN_SYSTEM,
+                user_prompt=COLUMN_RUN_USER.format(
+                    research_purpose=repo_settings.research_purpose or "",
+                    column_label=config.label,
+                    column_prompt=instruction_prompt,
+                    output_constraint_json=json.dumps(
+                        _serialize_column_output_constraint(output_constraint),
+                        ensure_ascii=False,
+                    ),
+                    hard_rules=hard_rules,
+                    current_value=current_value,
+                    row_metadata_json=json.dumps(row_metadata, ensure_ascii=False, indent=2),
+                    document_text=source_text or "",
+                ),
+                response_format="json",
+            )
+        finally:
+            client.sync_close()
+
+        payload = _parse_json_object(raw_response)
+        normalized_status = str(payload.get("status") or "").strip().lower()
+        normalized_value = _coerce_column_output_value(
+            payload.get("value"),
+            output_constraint,
+        )
+        normalized_value = _column_run_author_fallback(
+            config=config,
+            value=normalized_value,
+            row=row,
+            manifest_record=manifest_record,
+        )
+        if normalized_status == "insufficient_evidence" and not normalized_value:
+            return str(output_constraint.fallback_value or "")
+        if not normalized_value and normalized_status == "insufficient_evidence":
+            return normalized_value
+        if normalized_status not in {"ok", "insufficient_evidence"} and not normalized_value:
+            return str(output_constraint.fallback_value or "")
+        return normalized_value
+
+    def update_source(
+        self,
+        source_id: str,
+        *,
+        patch: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+
+        normalized_id = str(source_id or "").strip()
+        if not normalized_id:
+            raise ValueError("source_id is required")
+
+        requested_fields = {key for key, value in (patch or {}).items() if key and value is not ...}
+        if not requested_fields:
+            raise ValueError("At least one editable field is required.")
+
+        metadata_fields = {
+            "title",
+            "author_names",
+            "publication_date",
+            "publication_year",
+            "document_type",
+            "organization_name",
+            "organization_type",
+            "tags_text",
+            "notes",
+        }
+        rating_fields = {
+            "overall_relevance",
+            "depth_score",
+            "relevant_detail_score",
+            "rating_rationale",
+            "relevant_sections",
+        }
+        citation_fields = {
+            "citation_title",
+            "citation_authors",
+            "citation_issued",
+            "citation_type",
+            "citation_url",
+            "citation_publisher",
+            "citation_container_title",
+            "citation_volume",
+            "citation_issue",
+            "citation_pages",
+            "citation_doi",
+            "citation_report_number",
+            "citation_standard_number",
+            "citation_language",
+            "citation_accessed",
+        }
+
+        with self._writer_lock():
+            state = self._load_state_locked()
+            rows = _load_source_rows(state.get("sources", []))
+            citations = _load_citation_rows(state.get("citations", []))
+            column_configs = _load_column_configs(state.get("column_configs", []))
+            row_index = next((index for index, item in enumerate(rows) if item.id == normalized_id), -1)
+            if row_index < 0:
+                raise ValueError(f"Unknown source_id: {normalized_id}")
+
+            row = rows[row_index].model_copy(deep=True)
+
+            if requested_fields.intersection(metadata_fields):
+                for field_name in metadata_fields:
+                    if field_name not in requested_fields:
+                        continue
+                    setattr(row, field_name, self._normalize_source_patch_text(patch.get(field_name)))
+                if "publication_date" in requested_fields and "publication_year" not in requested_fields:
+                    row.publication_year = _publication_year_from_date_text(row.publication_date)
+                self._write_catalog_patch(row)
+
+            if requested_fields.intersection(citation_fields) or "citation_override_fields" in requested_fields:
+                override_fields = patch.get("citation_override_fields")
+                self._write_citation_patch(
+                    row,
+                    patch={
+                        key: patch.get(key)
+                        for key in citation_fields
+                        if key in requested_fields
+                    },
+                    override_fields=override_fields if isinstance(override_fields, list) else [],
+                )
+
+            if "summary_text" in requested_fields:
+                self._write_summary_patch(
+                    row,
+                    self._normalize_source_patch_multiline_text(patch.get("summary_text")),
+                )
+
+            if requested_fields.intersection(rating_fields):
+                self._write_rating_patch(
+                    row,
+                    patch={
+                        key: patch.get(key)
+                        for key in rating_fields
+                        if key in requested_fields
+                    },
+                )
+
+            if "custom_fields" in requested_fields:
+                custom_updates = patch.get("custom_fields") or {}
+                if not isinstance(custom_updates, dict):
+                    raise ValueError("custom_fields must be an object.")
+                allowed_custom_ids = {
+                    config.id for config in column_configs if config.kind == "custom"
+                }
+                next_custom_fields = dict(row.custom_fields or {})
+                for field_name, raw_value in custom_updates.items():
+                    normalized_field_name = str(field_name or "").strip()
+                    if not normalized_field_name:
+                        continue
+                    if normalized_field_name not in allowed_custom_ids:
+                        raise ValueError(f"Unknown custom column: {normalized_field_name}")
+                    normalized_value = self._normalize_source_patch_text(raw_value)
+                    if normalized_value:
+                        next_custom_fields[normalized_field_name] = normalized_value
+                    else:
+                        next_custom_fields.pop(normalized_field_name, None)
+                row.custom_fields = next_custom_fields
+
+            self._write_repository_source_metadata(row)
+            rows[row_index] = row
+            rows = self._sort_rows(rows)
+            self._save_state_locked(
+                sources=rows,
+                citations=citations,
+                imports=state.get("imports", []),
+                column_configs=column_configs,
+            )
+            self._save_meta_locked(
+                {
+                    **self._load_meta_locked(),
+                    "next_source_id": _next_source_id_from_rows(rows),
+                    "updated_at": _utc_now_iso(),
+                }
+            )
+            self._rebuild_outputs_locked(rows, citations)
+            return build_manifest_record(
+                row,
+                base_dir=self.path,
+                column_configs=column_configs,
+            )
+
+    def _load_project_profile_template(self, filename: str) -> str:
+        safe_name = Path(filename or DEFAULT_PROJECT_PROFILE_FILENAME).name
+        if safe_name != (filename or DEFAULT_PROJECT_PROFILE_FILENAME):
+            raise ValueError(f"Invalid project profile filename: {filename}")
+        template_path = self.project_profiles_dir / safe_name
+        if not template_path.is_file():
+            template_path = self.project_profiles_dir / DEFAULT_PROJECT_PROFILE_FILENAME
+        if not template_path.is_file():
+            raise ValueError("No compatible project profile template is available.")
+        return template_path.read_text(encoding="utf-8")
+
+    def _normalize_project_profile_filename(
+        self,
+        *,
+        filename: str,
+        filename_stem: str,
+        profile_name: str,
+    ) -> str:
+        requested = Path(filename or "").name
+        if requested:
+            if requested != (filename or ""):
+                raise ValueError(f"Invalid project profile filename: {filename}")
+            if not requested.endswith((".yaml", ".yml")):
+                raise ValueError("Project profile filename must end in .yaml or .yml")
+            return requested
+
+        stem_source = filename_stem or profile_name or "generated_project_profile"
+        normalized_stem = re.sub(r"[^a-zA-Z0-9]+", "_", stem_source).strip("_").lower()
+        normalized_stem = normalized_stem or "generated_project_profile"
+        return f"{normalized_stem}.yaml"
+
+    def _normalize_source_patch_text(self, value: Any) -> str:
+        return " ".join(str(value or "").split()).strip()
+
+    def _normalize_source_patch_multiline_text(self, value: Any) -> str:
+        text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+        lines = [line.rstrip() for line in text.split("\n")]
+        return "\n".join(lines).strip()
+
+    def _source_catalog_rel(self, row: SourceManifestRow) -> Path:
+        return Path(SOURCES_DIR_NAME) / row.id / f"{row.id}_catalog.json"
+
+    def _source_summary_rel(self, row: SourceManifestRow) -> Path:
+        return Path(SOURCES_DIR_NAME) / row.id / f"{row.id}_summary.md"
+
+    def _source_rating_rel(self, row: SourceManifestRow) -> Path:
+        return Path(SOURCES_DIR_NAME) / row.id / f"{row.id}_rating.json"
+
+    def _load_repository_json_artifact(
+        self,
+        row: SourceManifestRow,
+        field_name: str,
+    ) -> dict[str, Any]:
+        rel_value = str(getattr(row, field_name) or "").strip()
+        source_path = self._resolve_repository_artifact_path(row, field_name, rel_value)
+        if source_path is None or not source_path.is_file():
+            return {}
+        try:
+            payload = json.loads(source_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _load_repository_text_artifact(
+        self,
+        row: SourceManifestRow,
+        field_name: str,
+    ) -> str:
+        rel_value = str(getattr(row, field_name) or "").strip()
+        source_path = self._resolve_repository_artifact_path(row, field_name, rel_value)
+        if source_path is None or not source_path.is_file():
+            return ""
+        try:
+            return source_path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            return ""
+
+    def _write_repository_text_file(self, rel_path: Path, content: str) -> None:
+        destination = self.path / rel_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(content, encoding="utf-8")
+
+    def _write_repository_json_file(self, rel_path: Path, payload: dict[str, Any]) -> None:
+        destination = self.path / rel_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def _delete_repository_artifact(self, row: SourceManifestRow, field_name: str) -> None:
+        rel_value = str(getattr(row, field_name) or "").strip()
+        source_path = self._resolve_repository_artifact_path(row, field_name, rel_value)
+        if source_path is not None and source_path.is_file():
+            try:
+                source_path.unlink()
+            except OSError:
+                pass
+        setattr(row, field_name, "")
+
+    def _write_catalog_patch(self, row: SourceManifestRow) -> None:
+        catalog_payload = self._load_repository_json_artifact(row, "catalog_file")
+        citation = _coerce_citation_metadata(catalog_payload.get("citation"))
+        catalog_payload.update(
+            {
+                "title": row.title,
+                "title_status": "existing" if row.title else row.title_status,
+                "author_names": row.author_names,
+                "publication_date": row.publication_date,
+                "publication_year": row.publication_year,
+                "document_type": row.document_type,
+                "organization_name": row.organization_name,
+                "organization_type": row.organization_type,
+                "source_kind": row.source_kind,
+                "citation": citation.model_dump(mode="json"),
+            }
+        )
+        catalog_rel = self._source_catalog_rel(row)
+        self._write_repository_json_file(catalog_rel, catalog_payload)
+        row.catalog_file = catalog_rel.as_posix()
+        row.catalog_status = "existing"
+        row.title_status = "existing" if row.title else row.title_status
+
+    def _write_citation_patch(
+        self,
+        row: SourceManifestRow,
+        *,
+        patch: dict[str, Any],
+        override_fields: list[str],
+    ) -> None:
+        catalog_payload = self._load_repository_json_artifact(row, "catalog_file")
+        citation = _coerce_citation_metadata(catalog_payload.get("citation"))
+        citation = _merge_citation_metadata(
+            citation,
+            {
+                "title": row.title,
+                "authors": [
+                    author.model_dump(mode="json")
+                    for author in normalize_citation_authors(row.author_names)
+                ],
+                "issued": row.publication_date,
+                "publisher": row.organization_name,
+                "item_type": row.document_type,
+                "url": row.original_url or row.final_url,
+            },
+            overwrite_existing=False,
+        )
+
+        field_map = {
+            "citation_title": "title",
+            "citation_authors": "authors",
+            "citation_issued": "issued",
+            "citation_type": "item_type",
+            "citation_url": "url",
+            "citation_publisher": "publisher",
+            "citation_container_title": "container_title",
+            "citation_volume": "volume",
+            "citation_issue": "issue",
+            "citation_pages": "pages",
+            "citation_doi": "doi",
+            "citation_report_number": "report_number",
+            "citation_standard_number": "standard_number",
+            "citation_language": "language",
+            "citation_accessed": "accessed",
+        }
+        effective_override_fields = set(_effective_manual_override_fields(citation))
+        effective_override_fields.update(
+            str(item).strip() for item in override_fields if str(item).strip()
+        )
+
+        for patch_key, citation_field in field_map.items():
+            if patch_key not in patch:
+                continue
+            normalized_value = self._normalize_source_patch_text(patch.get(patch_key))
+            if citation_field == "authors":
+                citation.authors = normalize_citation_authors(normalized_value)
+            else:
+                setattr(citation, citation_field, normalized_value)
+            effective_override_fields.add(citation_field)
+
+        for field_name in effective_override_fields:
+            field_data = citation.field_evidence.get(field_name)
+            if field_data is None:
+                field_data = CitationFieldEvidence()
+            if field_name == "authors":
+                field_data.value = "; ".join(
+                    author.literal or ", ".join(part for part in [author.family, author.given] if part)
+                    for author in citation.authors
+                    if author.literal or author.family or author.given
+                )
+            else:
+                field_data.value = str(getattr(citation, field_name, "") or "")
+            field_data.manual_override = True
+            field_data.source_type = "manual_override"
+            field_data.source_label = "Manual override"
+            field_data.confidence = 1.0
+            citation.field_evidence[field_name] = field_data
+
+        citation.manual_override_fields = sorted(effective_override_fields)
+        citation.verification_status = "verified"
+        citation.verification_confidence = max(citation.verification_confidence, 1.0)
+        citation.verified_at = _utc_now_iso()
+        markdown_path = self._resolve_source_file_path_for_kind(row, "md")
+        citation.verification_content_digest = _file_sha256(markdown_path)
+        citation = _finalize_citation_metadata(citation)
+        citation = _apply_citation_manual_overrides(citation, citation)
+
+        catalog_payload.update(
+            {
+                "title": row.title,
+                "title_status": "existing" if row.title else row.title_status,
+                "author_names": row.author_names,
+                "publication_date": row.publication_date,
+                "publication_year": row.publication_year,
+                "document_type": row.document_type,
+                "organization_name": row.organization_name,
+                "organization_type": row.organization_type,
+                "source_kind": row.source_kind,
+                "citation": citation.model_dump(mode="json"),
+            }
+        )
+        catalog_rel = self._source_catalog_rel(row)
+        self._write_repository_json_file(catalog_rel, catalog_payload)
+        row.catalog_file = catalog_rel.as_posix()
+        row.catalog_status = "existing"
+
+    def _write_summary_patch(self, row: SourceManifestRow, summary_text: str) -> None:
+        if not summary_text:
+            self._delete_repository_artifact(row, "summary_file")
+            row.summary_status = ""
+            return
+        summary_rel = self._source_summary_rel(row)
+        self._write_repository_text_file(summary_rel, summary_text + "\n")
+        row.summary_file = summary_rel.as_posix()
+        row.summary_status = "existing"
+
+    def _write_rating_patch(self, row: SourceManifestRow, *, patch: dict[str, Any]) -> None:
+        rating_payload = self._load_repository_json_artifact(row, "rating_file")
+        ratings = rating_payload.get("ratings")
+        if not isinstance(ratings, dict):
+            ratings = {}
+        ratings = dict(ratings)
+
+        if "overall_relevance" in patch:
+            value = _normalize_rating_score(patch.get("overall_relevance"))
+            if value is None:
+                ratings.pop("overall_relevance", None)
+                rating_payload.pop("overall_score", None)
+            else:
+                ratings["overall_relevance"] = value
+                rating_payload["overall_score"] = value
+        if "depth_score" in patch:
+            value = _normalize_rating_score(patch.get("depth_score"))
+            if value is None:
+                ratings.pop("depth_score", None)
+            else:
+                ratings["depth_score"] = value
+        if "relevant_detail_score" in patch:
+            value = _normalize_rating_score(patch.get("relevant_detail_score"))
+            if value is None:
+                ratings.pop("relevant_detail_score", None)
+            else:
+                ratings["relevant_detail_score"] = value
+        if ratings:
+            rating_payload["ratings"] = ratings
+        else:
+            rating_payload.pop("ratings", None)
+
+        if "rating_rationale" in patch:
+            rationale = self._normalize_source_patch_multiline_text(patch.get("rating_rationale"))
+            if rationale:
+                rating_payload["rationale"] = rationale
+            else:
+                rating_payload.pop("rationale", None)
+
+        if "relevant_sections" in patch:
+            relevant_sections = _split_relevant_sections_text(patch.get("relevant_sections"))
+            if relevant_sections:
+                rating_payload["relevant_sections"] = relevant_sections
+            else:
+                rating_payload.pop("relevant_sections", None)
+
+        if not rating_payload:
+            self._delete_repository_artifact(row, "rating_file")
+            row.rating_status = ""
+            return
+
+        rating_rel = self._source_rating_rel(row)
+        self._write_repository_json_file(rating_rel, rating_payload)
+        row.rating_file = rating_rel.as_posix()
+        row.rating_status = "existing"
 
     def list_ingestion_profiles(self) -> IngestionProfileListResponse:
         profiles = self._load_bundled_ingestion_profiles()
@@ -654,7 +1825,7 @@ class AttachedRepositoryService:
         (internal / META_FILE_NAME).write_text(
             json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        state = {"sources": [], "citations": [], "imports": []}
+        state = {"sources": [], "citations": [], "imports": [], "column_configs": []}
         (internal / STATE_FILE_NAME).write_text(
             json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
         )
@@ -830,131 +2001,58 @@ class AttachedRepositoryService:
         rating_depth_score_max: float | None = None,
         rating_relevant_detail_score_min: float | None = None,
         rating_relevant_detail_score_max: float | None = None,
-        sort_by: str = "id",
-        sort_dir: str = "asc",
+        citation_type: str = "",
+        citation_doi: str = "",
+        citation_report_number: str = "",
+        citation_standard_number: str = "",
+        citation_missing_fields: str = "",
+        citation_ready: bool | None = None,
+        citation_confidence_min: float | None = None,
+        citation_confidence_max: float | None = None,
+        sort_by: str = "",
+        sort_dir: str = "",
         limit: int = 50,
         offset: int = 0,
     ) -> dict[str, Any]:
         if not self.is_attached:
             raise ValueError("No repository attached")
 
-        normalized_sort_dir = (sort_dir or "asc").strip().lower()
-        if normalized_sort_dir not in {"asc", "desc"}:
-            raise ValueError("Invalid sort_dir. Use `asc` or `desc`.")
-
-        normalized_sort_by = (sort_by or "id").strip() or "id"
-
         safe_limit = max(1, min(int(limit), 500))
         safe_offset = max(0, int(offset))
-
-        q_norm = (q or "").strip().lower()
-        fetch_status_norm = (fetch_status or "").strip().lower()
-        detected_type_norm = (detected_type or "").strip().lower()
-        source_kind_norm = (source_kind or "").strip().lower()
-        document_type_norm = (document_type or "").strip().lower()
-        organization_type_norm = (organization_type or "").strip().lower()
-        organization_name_norm = (organization_name or "").strip().lower()
-        author_names_norm = (author_names or "").strip().lower()
-        publication_date_norm = (publication_date or "").strip().lower()
-        tags_text_norm = (tags_text or "").strip().lower()
-        rating_filters = {
-            "rating_overall": (rating_overall_min, rating_overall_max),
-            "rating_overall_relevance": (
-                rating_overall_relevance_min,
-                rating_overall_relevance_max,
-            ),
-            "rating_depth_score": (rating_depth_score_min, rating_depth_score_max),
-            "rating_relevant_detail_score": (
-                rating_relevant_detail_score_min,
-                rating_relevant_detail_score_max,
-            ),
-        }
-
-        with self._writer_lock():
-            state = self._load_state_locked()
-            rows = _load_source_rows(state.get("sources", []))
-
-        records = [build_manifest_record(row, base_dir=self.path) for row in rows]
-        columns = _build_manifest_column_metadata(records)
-        allowed_sort_fields = {str(item.get("key") or "") for item in columns}
-        if normalized_sort_by not in allowed_sort_fields:
-            raise ValueError(f"Invalid sort_by. Allowed: {sorted(item for item in allowed_sort_fields if item)}")
-
-        filtered: list[dict[str, str | int | float | bool]] = []
-        for record in records:
-            if fetch_status_norm and str(record.get("fetch_status") or "").strip().lower() != fetch_status_norm:
-                continue
-            if detected_type_norm and str(record.get("detected_type") or "").strip().lower() != detected_type_norm:
-                continue
-            if source_kind_norm and str(record.get("source_kind") or "").strip().lower() != source_kind_norm:
-                continue
-            if document_type_norm and document_type_norm not in str(record.get("document_type") or "").strip().lower():
-                continue
-            if organization_type_norm and organization_type_norm not in str(record.get("organization_type") or "").strip().lower():
-                continue
-            if organization_name_norm and organization_name_norm not in str(record.get("organization_name") or "").strip().lower():
-                continue
-            if author_names_norm and author_names_norm not in str(record.get("author_names") or "").strip().lower():
-                continue
-            if publication_date_norm and publication_date_norm not in str(record.get("publication_date") or "").strip().lower():
-                continue
-            if tags_text_norm and tags_text_norm not in str(record.get("tags_text") or "").strip().lower():
-                continue
-
-            summary_present = bool(str(record.get("summary_file") or "").strip()) or (
-                str(record.get("summary_status") or "").strip().lower()
-                in {"generated", "existing"}
-            )
-            rating_present = bool(str(record.get("rating_file") or "").strip()) or (
-                str(record.get("rating_status") or "").strip().lower()
-                in {"generated", "existing"}
-            )
-
-            if has_summary is True and not summary_present:
-                continue
-            if has_summary is False and summary_present:
-                continue
-            if has_rating is True and not rating_present:
-                continue
-            if has_rating is False and rating_present:
-                continue
-
-            if not _manifest_record_matches_thresholds(record, rating_filters):
-                continue
-
-            if q_norm:
-                haystack = " ".join(
-                    [
-                        str(record.get("id") or ""),
-                        str(record.get("source_kind") or ""),
-                        str(record.get("title") or ""),
-                        str(record.get("author_names") or ""),
-                        str(record.get("publication_date") or ""),
-                        str(record.get("document_type") or ""),
-                        str(record.get("organization_name") or ""),
-                        str(record.get("organization_type") or ""),
-                        str(record.get("tags_text") or ""),
-                        str(record.get("original_url") or ""),
-                        str(record.get("final_url") or ""),
-                        str(record.get("source_document_name") or ""),
-                        str(record.get("provenance_ref") or ""),
-                        str(record.get("summary_text") or ""),
-                        str(record.get("rating_rationale") or ""),
-                        str(record.get("relevant_sections") or ""),
-                        str(record.get("notes") or ""),
-                        str(record.get("error_message") or ""),
-                    ]
-                ).lower()
-                if q_norm not in haystack:
-                    continue
-
-            filtered.append(record)
-
-        reverse = normalized_sort_dir == "desc"
-        filtered = _sort_manifest_records(
-            filtered,
-            sort_by=normalized_sort_by,
-            reverse=reverse,
+        records, columns = self._manifest_records()
+        filtered, normalized_sort_by, normalized_sort_dir = self._filter_manifest_records(
+            records,
+            columns,
+            q=q,
+            fetch_status=fetch_status,
+            detected_type=detected_type,
+            source_kind=source_kind,
+            document_type=document_type,
+            organization_type=organization_type,
+            organization_name=organization_name,
+            author_names=author_names,
+            publication_date=publication_date,
+            tags_text=tags_text,
+            has_summary=has_summary,
+            has_rating=has_rating,
+            rating_overall_min=rating_overall_min,
+            rating_overall_max=rating_overall_max,
+            rating_overall_relevance_min=rating_overall_relevance_min,
+            rating_overall_relevance_max=rating_overall_relevance_max,
+            rating_depth_score_min=rating_depth_score_min,
+            rating_depth_score_max=rating_depth_score_max,
+            rating_relevant_detail_score_min=rating_relevant_detail_score_min,
+            rating_relevant_detail_score_max=rating_relevant_detail_score_max,
+            citation_type=citation_type,
+            citation_doi=citation_doi,
+            citation_report_number=citation_report_number,
+            citation_standard_number=citation_standard_number,
+            citation_missing_fields=citation_missing_fields,
+            citation_ready=citation_ready,
+            citation_confidence_min=citation_confidence_min,
+            citation_confidence_max=citation_confidence_max,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
         )
         paged_rows = filtered[safe_offset : safe_offset + safe_limit]
 
@@ -987,8 +2085,213 @@ class AttachedRepositoryService:
                 "rating_depth_score_max": rating_depth_score_max,
                 "rating_relevant_detail_score_min": rating_relevant_detail_score_min,
                 "rating_relevant_detail_score_max": rating_relevant_detail_score_max,
+                "citation_type": citation_type,
+                "citation_doi": citation_doi,
+                "citation_report_number": citation_report_number,
+                "citation_standard_number": citation_standard_number,
+                "citation_missing_fields": citation_missing_fields,
+                "citation_ready": citation_ready,
+                "citation_confidence_min": citation_confidence_min,
+                "citation_confidence_max": citation_confidence_max,
             },
         }
+
+    def _manifest_records(
+        self,
+    ) -> tuple[list[dict[str, str | int | float | bool]], list[dict[str, Any]]]:
+        with self._writer_lock():
+            state = self._load_state_locked()
+            rows = _load_source_rows(state.get("sources", []))
+            column_configs = _load_column_configs(state.get("column_configs", []))
+        records = [
+            build_manifest_record(row, base_dir=self.path, column_configs=column_configs)
+            for row in rows
+        ]
+        return records, _build_manifest_column_metadata(records, column_configs)
+
+    def _filter_manifest_records(
+        self,
+        records: list[dict[str, str | int | float | bool]],
+        columns: list[dict[str, Any]],
+        *,
+        q: str = "",
+        fetch_status: str = "",
+        detected_type: str = "",
+        source_kind: str = "",
+        document_type: str = "",
+        organization_type: str = "",
+        organization_name: str = "",
+        author_names: str = "",
+        publication_date: str = "",
+        tags_text: str = "",
+        has_summary: bool | None = None,
+        has_rating: bool | None = None,
+        rating_overall_min: float | None = None,
+        rating_overall_max: float | None = None,
+        rating_overall_relevance_min: float | None = None,
+        rating_overall_relevance_max: float | None = None,
+        rating_depth_score_min: float | None = None,
+        rating_depth_score_max: float | None = None,
+        rating_relevant_detail_score_min: float | None = None,
+        rating_relevant_detail_score_max: float | None = None,
+        citation_type: str = "",
+        citation_doi: str = "",
+        citation_report_number: str = "",
+        citation_standard_number: str = "",
+        citation_missing_fields: str = "",
+        citation_ready: bool | None = None,
+        citation_confidence_min: float | None = None,
+        citation_confidence_max: float | None = None,
+        sort_by: str = "",
+        sort_dir: str = "",
+    ) -> tuple[list[dict[str, str | int | float | bool]], str, str]:
+        normalized_sort_by = (sort_by or "").strip()
+        normalized_sort_dir = (sort_dir or "").strip().lower()
+        if normalized_sort_dir and normalized_sort_dir not in {"asc", "desc"}:
+            raise ValueError("Invalid sort_dir. Use `asc` or `desc`.")
+        allowed_sort_fields = {str(item.get("key") or "") for item in columns}
+        if normalized_sort_by and normalized_sort_by not in allowed_sort_fields:
+            raise ValueError(
+                f"Invalid sort_by. Allowed: {sorted(item for item in allowed_sort_fields if item)}"
+            )
+        if not normalized_sort_by:
+            normalized_sort_dir = ""
+
+        q_norm = (q or "").strip().lower()
+        fetch_status_norm = (fetch_status or "").strip().lower()
+        detected_type_norm = (detected_type or "").strip().lower()
+        source_kind_norm = (source_kind or "").strip().lower()
+        document_type_norm = (document_type or "").strip().lower()
+        organization_type_norm = (organization_type or "").strip().lower()
+        organization_name_norm = (organization_name or "").strip().lower()
+        author_names_norm = (author_names or "").strip().lower()
+        publication_date_norm = (publication_date or "").strip().lower()
+        tags_text_norm = (tags_text or "").strip().lower()
+        citation_type_norm = (citation_type or "").strip().lower()
+        citation_doi_norm = (citation_doi or "").strip().lower()
+        citation_report_number_norm = (citation_report_number or "").strip().lower()
+        citation_standard_number_norm = (citation_standard_number or "").strip().lower()
+        citation_missing_fields_norm = (citation_missing_fields or "").strip().lower()
+        rating_filters = {
+            "rating_overall": (rating_overall_min, rating_overall_max),
+            "rating_overall_relevance": (
+                rating_overall_relevance_min,
+                rating_overall_relevance_max,
+            ),
+            "rating_depth_score": (rating_depth_score_min, rating_depth_score_max),
+            "rating_relevant_detail_score": (
+                rating_relevant_detail_score_min,
+                rating_relevant_detail_score_max,
+            ),
+            "citation_confidence": (citation_confidence_min, citation_confidence_max),
+        }
+
+        filtered: list[dict[str, str | int | float | bool]] = []
+        for record in records:
+            if fetch_status_norm and str(record.get("fetch_status") or "").strip().lower() != fetch_status_norm:
+                continue
+            if detected_type_norm and str(record.get("detected_type") or "").strip().lower() != detected_type_norm:
+                continue
+            if source_kind_norm and str(record.get("source_kind") or "").strip().lower() != source_kind_norm:
+                continue
+            if document_type_norm and document_type_norm not in str(record.get("document_type") or "").strip().lower():
+                continue
+            if organization_type_norm and organization_type_norm not in str(record.get("organization_type") or "").strip().lower():
+                continue
+            if organization_name_norm and organization_name_norm not in str(record.get("organization_name") or "").strip().lower():
+                continue
+            if author_names_norm and author_names_norm not in str(record.get("author_names") or "").strip().lower():
+                continue
+            if publication_date_norm and publication_date_norm not in str(record.get("publication_date") or "").strip().lower():
+                continue
+            if tags_text_norm and tags_text_norm not in str(record.get("tags_text") or "").strip().lower():
+                continue
+            if citation_type_norm and citation_type_norm not in str(record.get("citation_type") or "").strip().lower():
+                continue
+            if citation_doi_norm and citation_doi_norm not in str(record.get("citation_doi") or "").strip().lower():
+                continue
+            if citation_report_number_norm and citation_report_number_norm not in str(record.get("citation_report_number") or "").strip().lower():
+                continue
+            if citation_standard_number_norm and citation_standard_number_norm not in str(record.get("citation_standard_number") or "").strip().lower():
+                continue
+            if citation_missing_fields_norm and citation_missing_fields_norm not in str(record.get("citation_missing_fields") or "").strip().lower():
+                continue
+
+            summary_present = bool(str(record.get("summary_file") or "").strip()) or (
+                str(record.get("summary_status") or "").strip().lower()
+                in {"generated", "existing"}
+            )
+            rating_present = bool(str(record.get("rating_file") or "").strip()) or (
+                str(record.get("rating_status") or "").strip().lower()
+                in {"generated", "existing"}
+            )
+
+            if has_summary is True and not summary_present:
+                continue
+            if has_summary is False and summary_present:
+                continue
+            if has_rating is True and not rating_present:
+                continue
+            if has_rating is False and rating_present:
+                continue
+            if citation_ready is True and not bool(record.get("citation_ready")):
+                continue
+            if citation_ready is False and bool(record.get("citation_ready")):
+                continue
+
+            if not _manifest_record_matches_thresholds(record, rating_filters):
+                continue
+
+            if q_norm:
+                haystack = " ".join(
+                    [
+                        str(record.get("id") or ""),
+                        str(record.get("source_kind") or ""),
+                        str(record.get("title") or ""),
+                        str(record.get("author_names") or ""),
+                        str(record.get("publication_date") or ""),
+                        str(record.get("document_type") or ""),
+                        str(record.get("organization_name") or ""),
+                        str(record.get("organization_type") or ""),
+                        str(record.get("tags_text") or ""),
+                        str(record.get("original_url") or ""),
+                        str(record.get("final_url") or ""),
+                        str(record.get("source_document_name") or ""),
+                        str(record.get("provenance_ref") or ""),
+                        str(record.get("summary_text") or ""),
+                        str(record.get("rating_rationale") or ""),
+                        str(record.get("relevant_sections") or ""),
+                        str(record.get("citation_type") or ""),
+                        str(record.get("citation_doi") or ""),
+                        str(record.get("citation_report_number") or ""),
+                        str(record.get("citation_standard_number") or ""),
+                        str(record.get("citation_missing_fields") or ""),
+                        str(record.get("notes") or ""),
+                        str(record.get("error_message") or ""),
+                    ]
+                ).lower()
+                if q_norm not in haystack:
+                    continue
+
+            filtered.append(record)
+
+        if normalized_sort_by:
+            reverse = normalized_sort_dir == "desc"
+            sort_type = next(
+                (
+                    str(item.get("sort_type") or "text")
+                    for item in columns
+                    if str(item.get("key") or "") == normalized_sort_by
+                ),
+                "text",
+            )
+            filtered = _sort_manifest_records(
+                filtered,
+                sort_by=normalized_sort_by,
+                reverse=reverse,
+                sort_type=sort_type,
+            )
+        return filtered, normalized_sort_by, normalized_sort_dir
 
     def list_agent_sources(
         self,
@@ -1662,6 +2965,92 @@ class AttachedRepositoryService:
             destination_path=str(destination_dir),
             message=message,
         )
+
+    def export_citations_ris(
+        self,
+        payload: RepositoryCitationRisExportRequest,
+    ) -> tuple[bytes, dict[str, str]]:
+        if not self.is_attached:
+            raise ValueError("Attach a repository before exporting RIS citations")
+
+        normalized_scope = str(payload.scope or "all").strip().lower() or "all"
+        if normalized_scope not in {"all", "filtered", "selected"}:
+            raise ValueError("Invalid scope. Use `all`, `filtered`, or `selected`.")
+
+        filters = payload.filters
+        records, columns = self._manifest_records()
+        filtered_records, _, _ = self._filter_manifest_records(
+            records,
+            columns,
+            q=filters.q,
+            fetch_status=filters.fetch_status,
+            detected_type=filters.detected_type,
+            source_kind=filters.source_kind,
+            document_type=filters.document_type,
+            organization_type=filters.organization_type,
+            organization_name=filters.organization_name,
+            author_names=filters.author_names,
+            publication_date=filters.publication_date,
+            tags_text=filters.tags_text,
+            has_summary=filters.has_summary,
+            has_rating=filters.has_rating,
+            rating_overall_min=filters.rating_overall_min,
+            rating_overall_max=filters.rating_overall_max,
+            rating_overall_relevance_min=filters.rating_overall_relevance_min,
+            rating_overall_relevance_max=filters.rating_overall_relevance_max,
+            rating_depth_score_min=filters.rating_depth_score_min,
+            rating_depth_score_max=filters.rating_depth_score_max,
+            rating_relevant_detail_score_min=filters.rating_relevant_detail_score_min,
+            rating_relevant_detail_score_max=filters.rating_relevant_detail_score_max,
+            citation_type=filters.citation_type,
+            citation_doi=filters.citation_doi,
+            citation_report_number=filters.citation_report_number,
+            citation_standard_number=filters.citation_standard_number,
+            citation_missing_fields=filters.citation_missing_fields,
+            citation_ready=filters.citation_ready,
+            citation_confidence_min=filters.citation_confidence_min,
+            citation_confidence_max=filters.citation_confidence_max,
+            sort_by="id",
+            sort_dir="asc",
+        )
+
+        with self._writer_lock():
+            state = self._load_state_locked()
+            rows = _load_source_rows(state.get("sources", []))
+
+        row_by_id = {row.id: row for row in rows}
+        if normalized_scope == "all":
+            target_records = _sort_manifest_records(records, sort_by="id", reverse=False)
+        elif normalized_scope == "filtered":
+            target_records = filtered_records
+        else:
+            normalized_ids = _normalize_source_ids(payload.source_ids)
+            if not normalized_ids:
+                raise ValueError("At least one source id is required for selected RIS export")
+            target_records = [record for record in records if str(record.get("id") or "") in normalized_ids]
+            missing = sorted(normalized_ids.difference({str(record.get("id") or "") for record in target_records}))
+            if missing:
+                raise ValueError(f"Unknown source_ids: {', '.join(missing[:20])}")
+
+        target_rows = [
+            row_by_id[source_id]
+            for source_id in [str(record.get("id") or "") for record in target_records]
+            if source_id in row_by_id
+        ]
+        ris_text, exported_count, skipped_count = build_ris_records(target_rows, base_dir=self.path)
+        requested_count = len(target_rows)
+        filename = {
+            "all": "repository-citations.ris",
+            "filtered": "filtered-citations.ris",
+            "selected": "selected-citations.ris",
+        }[normalized_scope]
+        headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-ResearchAssistant-Requested-Count": str(requested_count),
+            "X-ResearchAssistant-Exported-Count": str(exported_count),
+            "X-ResearchAssistant-Skipped-Count": str(skipped_count),
+        }
+        return ris_text.encode("utf-8"), headers
 
     def get_citation_data(self) -> dict[str, Any]:
         if not self.is_attached:
@@ -3715,7 +5104,14 @@ class AttachedRepositoryService:
             raise ValueError("Attach a repository before running source tasks")
         run_download = bool(payload.run_download or payload.force_redownload)
         run_convert = bool(payload.run_convert or payload.force_convert or (run_download and payload.include_markdown))
-        run_catalog = bool(payload.run_catalog or payload.force_catalog or payload.run_llm_title or payload.force_title)
+        run_citation_verify = bool(payload.run_citation_verify or payload.force_citation_verify)
+        run_catalog = bool(
+            payload.run_catalog
+            or payload.force_catalog
+            or payload.run_llm_title
+            or payload.force_title
+            or run_citation_verify
+        )
         run_llm_cleanup = bool(payload.run_llm_cleanup or payload.force_llm_cleanup)
         run_llm_title = bool(payload.run_llm_title or payload.force_title)
         run_llm_summary = bool(payload.run_llm_summary or payload.force_summary)
@@ -3724,6 +5120,7 @@ class AttachedRepositoryService:
             run_download
             or run_convert
             or run_catalog
+            or run_citation_verify
             or run_llm_cleanup
             or run_llm_title
             or run_llm_summary
@@ -3767,6 +5164,18 @@ class AttachedRepositoryService:
                 import_id=payload.import_id,
                 source_ids=normalized_source_ids,
                 limit=requested_limit,
+                run_download=run_download,
+                run_convert=run_convert,
+                run_catalog=run_catalog,
+                run_llm_cleanup=run_llm_cleanup,
+                run_llm_summary=run_llm_summary,
+                run_llm_rating=run_llm_rating,
+                output_options=SourceOutputOptions(
+                    include_raw_file=payload.include_raw_file,
+                    include_rendered_html=payload.include_rendered_html,
+                    include_rendered_pdf=payload.include_rendered_pdf,
+                    include_markdown=payload.include_markdown,
+                ),
             )
             if not selected_rows:
                 raise ValueError(f"No repository rows available for scope `{effective_scope}`.")
@@ -3806,6 +5215,7 @@ class AttachedRepositoryService:
                 run_download=run_download,
                 run_convert=run_convert,
                 run_catalog=run_catalog,
+                run_citation_verify=run_citation_verify,
                 run_llm_cleanup=run_llm_cleanup,
                 run_llm_title=run_llm_title,
                 run_llm_summary=run_llm_summary,
@@ -3813,6 +5223,7 @@ class AttachedRepositoryService:
                 force_redownload=payload.force_redownload,
                 force_convert=payload.force_convert,
                 force_catalog=payload.force_catalog or payload.force_title,
+                force_citation_verify=payload.force_citation_verify,
                 force_llm_cleanup=payload.force_llm_cleanup,
                 force_title=payload.force_title,
                 force_summary=payload.force_summary,
@@ -3898,6 +5309,7 @@ class AttachedRepositoryService:
             state = self._load_state_locked()
             rows = _load_source_rows(state.get("sources", []))
             citations = _load_citation_rows(state.get("citations", []))
+            column_configs = _load_column_configs(state.get("column_configs", []))
             updated = False
 
             for index, existing in enumerate(rows):
@@ -3907,6 +5319,7 @@ class AttachedRepositoryService:
                 preserved.import_type = existing.import_type or row.import_type
                 preserved.imported_at = existing.imported_at or row.imported_at
                 preserved.provenance_ref = existing.provenance_ref or row.provenance_ref
+                preserved.custom_fields = dict(existing.custom_fields or {})
                 rows[index] = preserved
                 updated = True
                 break
@@ -3919,6 +5332,7 @@ class AttachedRepositoryService:
                 sources=rows,
                 citations=citations,
                 imports=state.get("imports", []),
+                column_configs=column_configs,
             )
             self._save_meta_locked(
                 {
@@ -4246,12 +5660,15 @@ class AttachedRepositoryService:
             failed_count=failed_count,
             partial_count=partial_count,
         )
+        column_configs = _load_column_configs(self._load_state_locked().get("column_configs", []))
         job_store.save_artifact(job_id, "06_sources_manifest", artifact.model_dump(mode="json"))
         job_store.save_sources_manifest_csv(
-            job_id, build_manifest_csv(seeded_rows, base_dir=output_dir)
+            job_id,
+            build_manifest_csv(seeded_rows, base_dir=output_dir, column_configs=column_configs),
         )
         job_store.save_sources_manifest_xlsx(
-            job_id, build_manifest_xlsx(seeded_rows, base_dir=output_dir)
+            job_id,
+            build_manifest_xlsx(seeded_rows, base_dir=output_dir, column_configs=column_configs),
         )
 
         return {"seeded_rows": len(seeded_rows), "copied_files": copied_files}
@@ -4359,7 +5776,7 @@ class AttachedRepositoryService:
             scope = "import"
 
         if scope != "import":
-            raise ValueError("Invalid scope. Use `all`, `queued`, `import`, or `latest_import`.")
+            raise ValueError("Invalid scope. Use `all`, `queued`, `import`, `latest_import`, or `empty_only`.")
         if not normalized_import_id:
             raise ValueError("`import_id` is required when scope is `import`.")
 
@@ -4384,8 +5801,16 @@ class AttachedRepositoryService:
         import_id: str,
         source_ids: set[str] | None = None,
         limit: int | None = None,
+        run_download: bool = False,
+        run_convert: bool = False,
+        run_catalog: bool = False,
+        run_llm_cleanup: bool = False,
+        run_llm_summary: bool = False,
+        run_llm_rating: bool = False,
+        output_options: SourceOutputOptions | None = None,
     ) -> tuple[list[SourceManifestRow], str, str]:
         normalized_source_ids = source_ids or set()
+        effective_output_options = output_options or SourceOutputOptions()
         if normalized_source_ids:
             ordered_rows = self._sort_rows(rows)
             selected_rows = [row for row in ordered_rows if row.id in normalized_source_ids]
@@ -4393,6 +5818,24 @@ class AttachedRepositoryService:
             if missing:
                 raise ValueError(f"Unknown source_ids: {', '.join(missing[:20])}")
             effective_scope = "source_ids"
+            selected_import_id = ""
+        elif scope == "empty_only":
+            ordered_rows = self._sort_rows(rows)
+            selected_rows = [
+                row
+                for row in ordered_rows
+                if self._row_matches_empty_only_scope(
+                    row,
+                    run_download=run_download,
+                    run_convert=run_convert,
+                    run_catalog=run_catalog,
+                    run_llm_cleanup=run_llm_cleanup,
+                    run_llm_summary=run_llm_summary,
+                    run_llm_rating=run_llm_rating,
+                    output_options=effective_output_options,
+                )
+            ]
+            effective_scope = "empty_only"
             selected_import_id = ""
         else:
             selected_rows, selected_import_id = self._select_rows_for_scope(
@@ -4407,6 +5850,46 @@ class AttachedRepositoryService:
         if safe_limit is not None:
             selected_rows = selected_rows[:safe_limit]
         return selected_rows, selected_import_id, effective_scope
+
+    def _row_matches_empty_only_scope(
+        self,
+        row: SourceManifestRow,
+        *,
+        run_download: bool,
+        run_convert: bool,
+        run_catalog: bool,
+        run_llm_cleanup: bool,
+        run_llm_summary: bool,
+        run_llm_rating: bool,
+        output_options: SourceOutputOptions,
+    ) -> bool:
+        if run_download:
+            if output_options.include_raw_file and not self._row_has_artifact(row, "raw_file"):
+                return True
+            if output_options.include_rendered_html and not self._row_has_artifact(row, "rendered_file"):
+                return True
+            if output_options.include_rendered_pdf and not self._row_has_artifact(row, "rendered_pdf_file"):
+                return True
+            if output_options.include_markdown and not self._row_has_artifact(row, "markdown_file"):
+                return True
+        if run_convert and output_options.include_markdown and not self._row_has_artifact(row, "markdown_file"):
+            return True
+        if run_catalog and not self._row_has_artifact(row, "catalog_file"):
+            return True
+        if run_llm_cleanup and not self._row_has_artifact(row, "llm_cleanup_file"):
+            return True
+        if run_llm_summary and not self._row_has_artifact(row, "summary_file"):
+            return True
+        if run_llm_rating and not self._row_has_artifact(row, "rating_file"):
+            return True
+        return False
+
+    def _row_has_artifact(self, row: SourceManifestRow, field_name: str) -> bool:
+        rel_value = str(getattr(row, field_name) or "").strip()
+        if not rel_value:
+            return False
+        resolved = self._resolve_repository_artifact_path(row, field_name, rel_value)
+        return resolved is not None and resolved.is_file()
 
     def _build_export_job_bibliography(
         self,
@@ -5662,12 +7145,13 @@ class AttachedRepositoryService:
         sources: list[SourceManifestRow],
         citations: list[ExportRow],
     ) -> None:
+        column_configs = _load_column_configs(self._load_state_locked().get("column_configs", []))
         self.manifest_csv_path().write_text(
-            build_manifest_csv(sources, base_dir=self.path),
+            build_manifest_csv(sources, base_dir=self.path, column_configs=column_configs),
             encoding="utf-8-sig",
         )
         self.manifest_xlsx_path().write_bytes(
-            build_manifest_xlsx(sources, base_dir=self.path)
+            build_manifest_xlsx(sources, base_dir=self.path, column_configs=column_configs)
         )
 
         citation_artifact = ExportArtifact(
@@ -5876,7 +7360,7 @@ class AttachedRepositoryService:
             self._save_meta_locked(self._default_meta())
 
         if not self._state_path().exists():
-            self._save_state_locked(sources=[], citations=[], imports=[])
+            self._save_state_locked(sources=[], citations=[], imports=[], column_configs=[])
 
         settings_path = self._internal_dir() / REPO_SETTINGS_FILE_NAME
         if not settings_path.exists():
@@ -5955,29 +7439,39 @@ class AttachedRepositoryService:
     def _load_state_locked(self) -> dict[str, Any]:
         path = self._state_path()
         if not path.exists():
-            return {"sources": [], "citations": [], "imports": []}
+            return {"sources": [], "citations": [], "imports": [], "column_configs": []}
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
-                return {"sources": [], "citations": [], "imports": []}
+                return {"sources": [], "citations": [], "imports": [], "column_configs": []}
             return {
                 "sources": data.get("sources", []),
                 "citations": data.get("citations", []),
                 "imports": data.get("imports", []),
+                "column_configs": data.get("column_configs", []),
             }
         except Exception:
-            return {"sources": [], "citations": [], "imports": []}
+            return {"sources": [], "citations": [], "imports": [], "column_configs": []}
 
     def _save_state_locked(
         self,
         sources: list[SourceManifestRow],
         citations: list[ExportRow],
         imports: list[dict[str, Any]],
+        column_configs: list[RepositoryColumnConfig] | None = None,
     ) -> None:
+        normalized_column_configs = (
+            column_configs
+            if column_configs is not None
+            else _load_column_configs(self._load_state_locked().get("column_configs", []))
+        )
         payload = {
             "sources": [row.model_dump(mode="json") for row in sources],
             "citations": [row.model_dump(mode="json") for row in citations],
             "imports": imports,
+            "column_configs": [
+                config.model_dump(mode="json") for config in normalized_column_configs
+            ],
         }
         self._state_path().write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
@@ -6333,6 +7827,31 @@ def _normalize_source_ids(source_ids: list[str]) -> set[str]:
     return normalized
 
 
+def _publication_year_from_date_text(value: str) -> str:
+    match = re.search(r"\b(19|20)\d{2}\b", str(value or ""))
+    return match.group(0) if match else ""
+
+
+def _normalize_rating_score(value: Any) -> float | None:
+    if value in {"", None}:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    bounded = max(0.0, min(1.0, numeric))
+    return round(round(bounded / 0.05) * 0.05, 2)
+
+
+def _split_relevant_sections_text(value: Any) -> list[str]:
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    items = [
+        re.sub(r"^[\-\*\d\.\)\s]+", "", line).strip()
+        for line in text.split("\n")
+    ]
+    return [item for item in items if item]
+
+
 def _normalize_source_file_kind(value: str) -> str:
     normalized = str(value or "").strip().lower()
     if normalized not in {"pdf", "html", "rendered", "md"}:
@@ -6441,7 +7960,179 @@ def _repository_source_file_headers(path: Path) -> dict[str, str]:
     return headers
 
 
-def _manifest_column_label(value: str) -> str:
+PROCESSABLE_BUILTIN_COLUMNS = {
+    "title",
+    "author_names",
+    "publication_date",
+    "publication_year",
+    "document_type",
+    "organization_name",
+    "organization_type",
+    "tags_text",
+    "notes",
+    "summary_text",
+    "rating_rationale",
+    "relevant_sections",
+    "citation_title",
+    "citation_authors",
+    "citation_issued",
+    "citation_type",
+    "citation_url",
+    "citation_publisher",
+    "citation_container_title",
+    "citation_volume",
+    "citation_issue",
+    "citation_pages",
+    "citation_doi",
+    "citation_report_number",
+    "citation_standard_number",
+    "citation_language",
+    "citation_accessed",
+}
+
+DEFAULT_BUILTIN_COLUMN_PROMPTS: dict[str, str] = {
+    "title": (
+        "Resolve the source title using document front matter, headings, or clearly labeled metadata. "
+        "Prefer the actual document title. If no clear title exists, return a concise descriptive title "
+        "of 10 words or fewer supported by the source. Output only the title."
+    ),
+    "author_names": (
+        "Extract the source authors from bylines, front matter, citation metadata, or clearly labeled "
+        "metadata. Output a semicolon-separated list of author names. If no individual author is supported "
+        "but the producing or publishing organization is clear, output that organization name as the sole author. "
+        "If neither is supported, return blank."
+    ),
+    "publication_date": (
+        "Determine the source publication date from visible publication info, front matter, or citation metadata. "
+        "Output the most specific supported date using YYYY-MM-DD, YYYY-MM, or YYYY. If no supported date exists, return blank."
+    ),
+    "publication_year": (
+        "Determine the source publication year from visible publication info, publication date, or citation metadata. "
+        "Output only the four-digit year as an integer. If no supported year exists, return blank."
+    ),
+    "document_type": (
+        "Classify the source into one short phrase such as report, journal article, web page, standard, "
+        "white paper, memo, or presentation. Output only the document type."
+    ),
+    "organization_name": (
+        "Identify the main producing or publishing organization for the source. Output only the organization name. "
+        "If none is clearly supported, return blank."
+    ),
+    "organization_type": (
+        "Classify the producing organization into one short phrase such as government, university, nonprofit, "
+        "company, utility, standards body, media, or blog. Output only the organization type."
+    ),
+    "summary_text": (
+        "Write one concise paragraph summarizing the source for the stated research purpose. "
+        "Output a single paragraph of exactly 3 or 4 sentences with no bullets or headings."
+    ),
+    "citation_title": (
+        "Determine the citation title for this source using supported citation metadata, front matter, headings, "
+        "or publication information. Output only the citation title. If unsupported, return blank."
+    ),
+    "citation_authors": (
+        "Determine the citation authors for this source using supported citation metadata, bylines, front matter, "
+        "or publication information. Output a semicolon-separated list of author names. If unsupported, return blank."
+    ),
+    "citation_issued": (
+        "Determine the citation issued date for this source using supported publication information. "
+        "Output the most specific supported date using YYYY-MM-DD, YYYY-MM, or YYYY. If unsupported, return blank."
+    ),
+    "citation_type": (
+        "Determine the citation item type for this source. Output one short phrase such as report, article, web page, "
+        "book, standard, or presentation."
+    ),
+    "citation_url": (
+        "Determine the best supported citation URL for this source. Output only one URL. If unsupported, return blank."
+    ),
+    "citation_publisher": (
+        "Determine the citation publisher for this source. Output only the publisher name. If unsupported, return blank."
+    ),
+    "citation_container_title": (
+        "Determine the citation container title for this source if it is part of a journal, periodical, or collection. "
+        "Output only the container title. If unsupported, return blank."
+    ),
+    "citation_volume": "Determine the citation volume for this source. Output only the volume value. If unsupported, return blank.",
+    "citation_issue": "Determine the citation issue for this source. Output only the issue value. If unsupported, return blank.",
+    "citation_pages": "Determine the citation pages for this source. Output only the pages value. If unsupported, return blank.",
+    "citation_doi": "Determine the citation DOI for this source. Output only the DOI. If unsupported, return blank.",
+    "citation_report_number": (
+        "Determine the citation report number for this source. Output only the report number. If unsupported, return blank."
+    ),
+    "citation_standard_number": (
+        "Determine the citation standard number for this source. Output only the standard number. If unsupported, return blank."
+    ),
+    "citation_language": (
+        "Determine the citation language for this source. Output only one short phrase naming the language. If unsupported, return blank."
+    ),
+    "citation_accessed": (
+        "Determine the citation accessed date when it is explicitly supported by the repository metadata. "
+        "Output the most specific supported date using YYYY-MM-DD, YYYY-MM, or YYYY. If unsupported, return blank."
+    ),
+}
+
+DATE_SORT_FIELDS = {
+    "imported_at",
+    "fetched_at",
+    "publication_date",
+    "citation_verified_at",
+}
+
+
+def _column_config_lookup(
+    column_configs: list[RepositoryColumnConfig] | None,
+) -> dict[str, RepositoryColumnConfig]:
+    lookup: dict[str, RepositoryColumnConfig] = {}
+    for config in column_configs or []:
+        if config.kind == "custom":
+            lookup[config.id] = config
+            continue
+        builtin_key = str(config.builtin_key or config.id or "").strip()
+        if builtin_key:
+            lookup[builtin_key] = config
+    return lookup
+
+
+def _default_builtin_column_prompt(field_name: str) -> str:
+    return str(DEFAULT_BUILTIN_COLUMN_PROMPTS.get(str(field_name or "").strip(), "")).strip()
+
+
+def _effective_column_instruction_prompt(
+    config: RepositoryColumnConfig | None = None,
+    *,
+    field_name: str = "",
+) -> str:
+    if config is not None:
+        saved_prompt = str(config.instruction_prompt or "").strip()
+        if saved_prompt:
+            return saved_prompt
+        if config.kind == "builtin":
+            return _default_builtin_column_prompt(str(config.builtin_key or config.id or field_name).strip())
+        return ""
+    return _default_builtin_column_prompt(field_name)
+
+
+def _effective_column_output_constraint(
+    config: RepositoryColumnConfig | None = None,
+    *,
+    field_name: str = "",
+) -> RepositoryColumnOutputConstraint | None:
+    if config is not None and config.output_constraint is not None:
+        return config.output_constraint
+    prompt_text = _effective_column_instruction_prompt(config, field_name=field_name)
+    if not prompt_text:
+        return None
+    return _infer_column_output_constraint(prompt_text)
+
+
+def _manifest_column_label(
+    value: str,
+    column_configs: list[RepositoryColumnConfig] | None = None,
+) -> str:
+    config = _column_config_lookup(column_configs).get(value)
+    if config is not None and str(config.label or "").strip():
+        return str(config.label or "").strip()
+
     overrides = {
         "id": "ID",
         "source_kind": "Source Kind",
@@ -6491,11 +8182,49 @@ def _manifest_field_is_numeric(field_name: str) -> bool:
     )
 
 
+def _manifest_column_sort_type(
+    field_name: str,
+    column_configs: list[RepositoryColumnConfig] | None = None,
+) -> str:
+    config = _column_config_lookup(column_configs).get(field_name)
+    effective_constraint = _effective_column_output_constraint(config, field_name=field_name)
+    if effective_constraint is not None:
+        kind = str(effective_constraint.kind or "").strip().lower()
+        if kind in {"integer", "number"}:
+            return "number"
+        if kind == "date":
+            return "date"
+    if field_name in DATE_SORT_FIELDS:
+        return "date"
+    if _manifest_field_is_numeric(field_name):
+        return "number"
+    return "text"
+
+
+def _manifest_column_processable(
+    field_name: str,
+    column_configs: list[RepositoryColumnConfig] | None = None,
+) -> bool:
+    config = _column_config_lookup(column_configs).get(field_name)
+    if config is not None and config.kind == "custom":
+        return True
+    return field_name in PROCESSABLE_BUILTIN_COLUMNS
+
+
 def _build_manifest_column_metadata(
     records: list[dict[str, str | int | float | bool]],
-) -> list[dict[str, str | bool]]:
+    column_configs: list[RepositoryColumnConfig] | None = None,
+) -> list[dict[str, Any]]:
     ordered_fields = list(SOURCE_MANIFEST_COLUMNS) + list(MANIFEST_DERIVED_COLUMNS)
     seen = set(ordered_fields)
+    custom_field_ids: list[str] = []
+    for config in column_configs or []:
+        if config.kind != "custom":
+            continue
+        if config.id in seen:
+            continue
+        seen.add(config.id)
+        custom_field_ids.append(config.id)
     dynamic_fields: list[str] = []
     for record in records:
         for key in record.keys():
@@ -6504,13 +8233,44 @@ def _build_manifest_column_metadata(
             seen.add(key)
             dynamic_fields.append(key)
 
-    all_fields = ordered_fields + sorted(dynamic_fields)
+    config_lookup = _column_config_lookup(column_configs)
+    custom_field_id_set = set(custom_field_ids)
+    all_fields = ordered_fields + custom_field_ids + sorted(dynamic_fields)
     return [
         {
             "key": field_name,
-            "label": _manifest_column_label(field_name),
+            "label": _manifest_column_label(field_name, column_configs),
             "sortable": True,
-            "type": "number" if _manifest_field_is_numeric(field_name) else "text",
+            "type": (
+                "number"
+                if _manifest_column_sort_type(field_name, column_configs) == "number"
+                else "text"
+            ),
+            "kind": "custom" if field_name in custom_field_id_set else "builtin",
+            "renamable": field_name in custom_field_id_set,
+            "processable": _manifest_column_processable(field_name, column_configs),
+            "sort_type": _manifest_column_sort_type(field_name, column_configs),
+            "instruction_prompt": _effective_column_instruction_prompt(
+                config_lookup.get(field_name),
+                field_name=field_name,
+            ),
+            "output_constraint": (
+                effective_constraint.model_dump(mode="json")
+                if (
+                    (effective_constraint := _effective_column_output_constraint(
+                        config_lookup.get(field_name),
+                        field_name=field_name,
+                    ))
+                    is not None
+                )
+                else None
+            ),
+            "last_run_at": str(config_lookup.get(field_name).last_run_at or "")
+            if field_name in config_lookup
+            else "",
+            "last_run_status": str(config_lookup.get(field_name).last_run_status or "")
+            if field_name in config_lookup
+            else "",
         }
         for field_name in all_fields
     ]
@@ -6552,9 +8312,50 @@ def _manifest_record_has_sort_value(
     return value not in {"", None}
 
 
+def _manifest_record_date_value(value: Any) -> float | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        pass
+    full_match = re.match(r"^(\d{4})[-/](\d{2})[-/](\d{2})", raw)
+    if full_match:
+        try:
+            return datetime(
+                int(full_match.group(1)),
+                int(full_match.group(2)),
+                int(full_match.group(3)),
+                tzinfo=timezone.utc,
+            ).timestamp()
+        except Exception:
+            return None
+    year_month_match = re.match(r"^(\d{4})[-/](\d{2})$", raw)
+    if year_month_match:
+        try:
+            return datetime(
+                int(year_month_match.group(1)),
+                int(year_month_match.group(2)),
+                1,
+                tzinfo=timezone.utc,
+            ).timestamp()
+        except Exception:
+            return None
+    year_match = re.match(r"^(\d{4})$", raw)
+    if year_match:
+        try:
+            return datetime(int(year_match.group(1)), 1, 1, tzinfo=timezone.utc).timestamp()
+        except Exception:
+            return None
+    return None
+
+
 def _manifest_record_sort_value(
     record: dict[str, str | int | float | bool],
     sort_by: str,
+    *,
+    sort_type: str = "text",
 ) -> tuple[int, int | float | str]:
     if sort_by == "id":
         raw = str(record.get("id") or "").strip()
@@ -6565,7 +8366,12 @@ def _manifest_record_sort_value(
         return (0, int(value))
     if isinstance(value, (int, float)):
         return (0, value)
-    if _manifest_field_is_numeric(sort_by):
+    if sort_type == "date":
+        date_value = _manifest_record_date_value(value)
+        if date_value is not None:
+            return (0, date_value)
+        return (1, str(value or "").lower())
+    if sort_type == "number":
         numeric_value = _manifest_record_float(value)
         if numeric_value is not None:
             return (0, numeric_value)
@@ -6577,7 +8383,10 @@ def _sort_manifest_records(
     *,
     sort_by: str,
     reverse: bool,
+    sort_type: str = "text",
 ) -> list[dict[str, str | int | float | bool]]:
+    if not sort_by:
+        return records
     present: list[dict[str, str | int | float | bool]] = []
     missing: list[dict[str, str | int | float | bool]] = []
     for record in records:
@@ -6587,10 +8396,236 @@ def _sort_manifest_records(
             missing.append(record)
 
     present.sort(
-        key=lambda item: _manifest_record_sort_value(item, sort_by),
+        key=lambda item: _manifest_record_sort_value(item, sort_by, sort_type=sort_type),
         reverse=reverse,
     )
     return present + missing
+
+
+def _parse_json_object(raw_value: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(raw_value)
+    except Exception as exc:
+        raise ValueError(f"Invalid JSON response from LLM: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("LLM response must be a JSON object.")
+    return payload
+
+
+def _serialize_column_output_constraint(
+    constraint: RepositoryColumnOutputConstraint | None,
+) -> dict[str, Any]:
+    if constraint is None:
+        return {
+            "kind": "text",
+            "allowed_values": [],
+            "max_words": None,
+            "fallback_value": "",
+            "format_hint": "",
+        }
+    return constraint.model_dump(mode="json")
+
+
+def _coerce_column_output_constraint_payload(
+    payload: Any,
+) -> RepositoryColumnOutputConstraint | None:
+    if payload in {None, ""}:
+        return None
+    try:
+        return (
+            payload
+            if isinstance(payload, RepositoryColumnOutputConstraint)
+            else RepositoryColumnOutputConstraint.model_validate(payload)
+        )
+    except Exception:
+        return None
+
+
+def _infer_column_output_constraint(
+    prompt_text: str,
+    *,
+    existing: RepositoryColumnOutputConstraint | None = None,
+) -> RepositoryColumnOutputConstraint:
+    normalized_prompt = str(prompt_text or "").strip()
+    lowered = normalized_prompt.lower()
+    if existing is not None and not normalized_prompt:
+        return existing
+
+    if any(phrase in lowered for phrase in {"yes or no", "yes/no", "only yes or no"}):
+        return RepositoryColumnOutputConstraint(
+            kind="yes_no",
+            allowed_values=["yes", "no"],
+            fallback_value="",
+            format_hint="Lowercase yes or no only.",
+        )
+    if any(phrase in lowered for phrase in {"four-digit year", "year as an integer", "year only"}):
+        return RepositoryColumnOutputConstraint(kind="integer", fallback_value="")
+    if "yyyy-mm-dd" in lowered or re.search(r"\boutput (an? )?date\b", lowered):
+        return RepositoryColumnOutputConstraint(
+            kind="date",
+            fallback_value="",
+            format_hint="YYYY-MM-DD",
+        )
+    if any(phrase in lowered for phrase in {"integer", "whole number", "count only"}):
+        return RepositoryColumnOutputConstraint(kind="integer", fallback_value="")
+    if any(phrase in lowered for phrase in {"numeric", "number only", "decimal"}):
+        return RepositoryColumnOutputConstraint(kind="number", fallback_value="")
+    if any(phrase in lowered for phrase in {"one short phrase", "short phrase", "single phrase"}):
+        return RepositoryColumnOutputConstraint(kind="text", max_words=8, fallback_value="")
+    return existing or RepositoryColumnOutputConstraint(kind="text", fallback_value="")
+
+
+def _truncate_column_run_text(text: str, max_chars: int) -> str:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return ""
+    limit = int(max_chars or 0)
+    if limit <= 0:
+        limit = 12000
+    if len(normalized) <= limit:
+        return normalized
+    head = max(1000, limit // 2)
+    tail = max(500, limit - head - 32)
+    return f"{normalized[:head].rstrip()}\n\n[... truncated ...]\n\n{normalized[-tail:].lstrip()}"
+
+
+def _cell_string_value(value: Any) -> str:
+    if value in {None, ""}:
+        return ""
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    return str(value).strip()
+
+
+def _normalize_numeric_output(value: Any, *, integer_only: bool) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return ""
+    try:
+        parsed = float(normalized)
+    except Exception:
+        match = re.search(r"-?\d+(?:\.\d+)?", normalized)
+        if not match:
+            return ""
+        parsed = float(match.group(0))
+    if integer_only:
+        return str(int(round(parsed)))
+    if float(parsed).is_integer():
+        return str(int(parsed))
+    return f"{parsed:.6f}".rstrip("0").rstrip(".")
+
+
+def _normalize_date_output(value: Any) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return ""
+    iso_datetime_match = re.match(r"^(\d{4}-\d{2}-\d{2})", normalized)
+    if iso_datetime_match:
+        return iso_datetime_match.group(1)
+    full_match = re.match(r"^(\d{4})[-/](\d{2})[-/](\d{2})", normalized)
+    if full_match:
+        return f"{full_match.group(1)}-{full_match.group(2)}-{full_match.group(3)}"
+    year_month_match = re.match(r"^(\d{4})[-/](\d{2})$", normalized)
+    if year_month_match:
+        return f"{year_month_match.group(1)}-{year_month_match.group(2)}"
+    year_match = re.match(r"^(\d{4})$", normalized)
+    if year_match:
+        return year_match.group(1)
+    return ""
+
+
+def _coerce_column_output_value(
+    value: Any,
+    constraint: RepositoryColumnOutputConstraint,
+) -> str:
+    normalized = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return str(constraint.fallback_value or "")
+
+    if constraint.kind == "yes_no":
+        lowered = normalized.lower()
+        if lowered.startswith("yes"):
+            return "yes"
+        if lowered.startswith("no"):
+            return "no"
+        return str(constraint.fallback_value or "")
+
+    if constraint.kind == "integer":
+        return _normalize_numeric_output(normalized, integer_only=True)
+
+    if constraint.kind == "number":
+        return _normalize_numeric_output(normalized, integer_only=False)
+
+    if constraint.kind == "date":
+        coerced = _normalize_date_output(normalized)
+        return coerced or str(constraint.fallback_value or "")
+
+    single_line = " ".join(part.strip() for part in normalized.split("\n") if part.strip())
+    if constraint.allowed_values:
+        lowered_lookup = {item.lower(): item for item in constraint.allowed_values}
+        resolved = lowered_lookup.get(single_line.lower())
+        if resolved is not None:
+            single_line = resolved
+        else:
+            return str(constraint.fallback_value or "")
+    if constraint.max_words is not None and constraint.max_words > 0:
+        single_line = " ".join(single_line.split()[: constraint.max_words])
+    return single_line.strip()
+
+
+def _column_run_author_fallback(
+    *,
+    config: RepositoryColumnConfig,
+    value: str,
+    row: SourceManifestRow,
+    manifest_record: dict[str, str | int | float | bool],
+) -> str:
+    target_key = str(config.builtin_key or config.id).strip()
+    if target_key not in {"author_names", "citation_authors"}:
+        return value
+    normalized_value = str(value or "").strip()
+    if normalized_value:
+        return normalized_value
+    for candidate in (
+        row.organization_name,
+        manifest_record.get("organization_name"),
+        manifest_record.get("citation_publisher"),
+    ):
+        normalized_candidate = _cell_string_value(candidate)
+        if normalized_candidate:
+            return normalized_candidate
+    return ""
+
+
+def _column_value_patch_for_field(
+    config: RepositoryColumnConfig,
+    value: str,
+) -> dict[str, Any]:
+    if config.kind == "custom":
+        return {"custom_fields": {config.id: value}}
+    target_key = str(config.builtin_key or config.id).strip()
+    patch: dict[str, Any] = {target_key: value}
+    citation_override_field = ""
+    citation_patch_key = ""
+    if target_key == "title":
+        citation_override_field = "title"
+        citation_patch_key = "citation_title"
+    elif target_key == "author_names":
+        citation_override_field = "authors"
+        citation_patch_key = "citation_authors"
+    elif target_key in {"publication_date", "publication_year"}:
+        citation_override_field = "issued"
+        citation_patch_key = "citation_issued"
+    elif target_key == "document_type":
+        citation_override_field = "item_type"
+        citation_patch_key = "citation_type"
+    elif target_key == "organization_name":
+        citation_override_field = "publisher"
+        citation_patch_key = "citation_publisher"
+    if citation_patch_key:
+        patch[citation_patch_key] = value
+        patch["citation_override_fields"] = [citation_override_field]
+    return patch
 
 
 def repository_dedupe_key(url: str) -> str:
@@ -6958,6 +8993,26 @@ def _load_source_rows(payload: list[Any]) -> list[SourceManifestRow]:
     return rows
 
 
+def _load_column_configs(payload: list[Any]) -> list[RepositoryColumnConfig]:
+    configs: list[RepositoryColumnConfig] = []
+    seen: set[str] = set()
+    for item in payload:
+        try:
+            config = (
+                item
+                if isinstance(item, RepositoryColumnConfig)
+                else RepositoryColumnConfig.model_validate(item)
+            )
+        except Exception:
+            continue
+        normalized_id = str(config.id or "").strip()
+        if not normalized_id or normalized_id in seen:
+            continue
+        seen.add(normalized_id)
+        configs.append(config.model_copy(update={"id": normalized_id}))
+    return configs
+
+
 def _load_citation_rows(payload: list[Any]) -> list[ExportRow]:
     rows: list[ExportRow] = []
     for item in payload:
@@ -6990,6 +9045,15 @@ def _safe_manifest_row(payload: dict[str, Any]) -> SourceManifestRow | None:
                 "y",
             }
         payload["markdown_char_count"] = _parse_int(str(payload.get("markdown_char_count") or "0")) or 0
+        custom_fields = payload.get("custom_fields")
+        if not isinstance(custom_fields, dict):
+            payload["custom_fields"] = {}
+        else:
+            payload["custom_fields"] = {
+                str(key): "" if value in {None, ""} else str(value)
+                for key, value in custom_fields.items()
+                if str(key or "").strip()
+            }
         return SourceManifestRow.model_validate(payload)
     except Exception:
         return None

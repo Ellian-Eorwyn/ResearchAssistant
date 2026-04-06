@@ -276,6 +276,7 @@ export interface RepoSettings {
   llm_backend: LLMBackendConfig;
   use_llm: boolean;
   research_purpose: string;
+  default_project_profile_name: string;
   fetch_delay: number;
 }
 
@@ -345,6 +346,7 @@ export interface SourceItemStatus {
   status: "pending" | "running" | "completed" | "failed" | "skipped" | "cancelled";
   fetch_status: string;
   catalog_status: string;
+  citation_verification_status: string;
   title_status: string;
   llm_cleanup_status: string;
   summary_status: string;
@@ -378,6 +380,7 @@ export interface SourceDownloadStatus {
   run_download: boolean;
   run_convert?: boolean;
   run_catalog: boolean;
+  run_citation_verify: boolean;
   run_llm_cleanup: boolean;
   run_llm_title: boolean;
   run_llm_summary: boolean;
@@ -385,6 +388,7 @@ export interface SourceDownloadStatus {
   force_redownload?: boolean;
   force_convert?: boolean;
   force_catalog?: boolean;
+  force_citation_verify?: boolean;
   force_llm_cleanup?: boolean;
   force_title?: boolean;
   force_summary?: boolean;
@@ -402,6 +406,7 @@ export interface SourceDownloadRequest {
   run_download: boolean;
   run_convert?: boolean;
   run_catalog: boolean;
+  run_citation_verify: boolean;
   run_llm_cleanup: boolean;
   run_llm_title: boolean;
   run_llm_summary: boolean;
@@ -409,6 +414,7 @@ export interface SourceDownloadRequest {
   force_redownload: boolean;
   force_convert?: boolean;
   force_catalog: boolean;
+  force_citation_verify: boolean;
   force_llm_cleanup: boolean;
   force_title: boolean;
   force_summary: boolean;
@@ -421,7 +427,7 @@ export interface SourceDownloadRequest {
 }
 
 export interface RepositorySourceTaskRequest extends SourceDownloadRequest {
-  scope: "all" | "queued" | "import" | "latest_import";
+  scope: "all" | "queued" | "import" | "latest_import" | "empty_only";
   import_id: string;
   source_ids?: string[];
   selected_phases?: string[];
@@ -430,6 +436,30 @@ export interface RepositorySourceTaskRequest extends SourceDownloadRequest {
 export interface ProjectProfile {
   name: string;
   filename: string;
+}
+
+export interface ProjectProfileGenerateRequest {
+  research_purpose: string;
+  profile_name: string;
+  filename: string;
+}
+
+export interface ProjectProfileGenerateResponse {
+  status: string;
+  filename: string;
+  profile_name: string;
+  content: string;
+}
+
+export interface ProjectProfileSaveRequest {
+  content: string;
+}
+
+export interface ProjectProfileSaveResponse {
+  status: string;
+  filename: string;
+  name: string;
+  content: string;
 }
 
 export interface RepositoryDashboardJob {
@@ -485,6 +515,73 @@ export interface RepositoryDashboardResponse {
 export interface RepositoryCitationDataResponse {
   bibliography: BibliographyResult;
   citations: CitationResult;
+}
+
+export interface CitationFieldEvidence {
+  value: string;
+  source_type: string;
+  source_label: string;
+  evidence: string;
+  confidence: number;
+  manual_override: boolean;
+}
+
+export interface RepositoryColumnOutputConstraint {
+  kind: "text" | "yes_no" | "integer" | "number" | "date";
+  allowed_values: string[];
+  max_words: number | null;
+  fallback_value: string;
+  format_hint: string;
+}
+
+export interface RepositoryColumnConfig {
+  id: string;
+  label: string;
+  kind: "builtin" | "custom";
+  builtin_key: string;
+  instruction_prompt: string;
+  output_constraint: RepositoryColumnOutputConstraint | null;
+  last_run_at: string;
+  last_run_status: string;
+}
+
+export interface RepositoryColumnPromptFixResponse {
+  status: string;
+  column_id: string;
+  prompt: string;
+  output_constraint: RepositoryColumnOutputConstraint | null;
+  notes: string[];
+}
+
+export interface RepositoryColumnRunRowError {
+  source_id: string;
+  message: string;
+}
+
+export interface RepositoryColumnRunStartResponse {
+  job_id: string;
+  status: "started" | "confirmation_required";
+  column_id: string;
+  total_rows: number;
+  populated_rows: number;
+  message: string;
+}
+
+export interface RepositoryColumnRunStatus {
+  job_id: string;
+  column_id: string;
+  column_label: string;
+  state: "pending" | "running" | "completed" | "failed" | "cancelled";
+  total_rows: number;
+  processed_rows: number;
+  succeeded_rows: number;
+  failed_rows: number;
+  current_source_id: string;
+  current_source_title: string;
+  message: string;
+  started_at: string;
+  completed_at: string;
+  row_errors: RepositoryColumnRunRowError[];
 }
 
 export interface RepositoryManifestRow {
@@ -544,6 +641,29 @@ export interface RepositoryManifestRow {
   rating_dimensions_json?: string;
   flag_scores_json?: string;
   rating_raw_json?: string;
+  citation_type?: string;
+  citation_title?: string;
+  citation_authors?: string;
+  citation_issued?: string;
+  citation_url?: string;
+  citation_publisher?: string;
+  citation_container_title?: string;
+  citation_volume?: string;
+  citation_issue?: string;
+  citation_pages?: string;
+  citation_language?: string;
+  citation_accessed?: string;
+  citation_doi?: string;
+  citation_report_number?: string;
+  citation_standard_number?: string;
+  citation_verification_status?: string;
+  citation_blocked_reasons?: string;
+  citation_manual_override_fields?: string;
+  citation_field_evidence_json?: string;
+  citation_verified_at?: string;
+  citation_ready?: string | number | boolean;
+  citation_missing_fields?: string;
+  citation_confidence?: string | number | boolean;
   [key: string]: string | number | boolean | null | undefined;
 }
 
@@ -552,6 +672,14 @@ export interface RepositoryManifestColumn {
   label: string;
   sortable: boolean;
   type: "text" | "number";
+  kind: "builtin" | "custom";
+  renamable: boolean;
+  processable: boolean;
+  sort_type: "text" | "number" | "date";
+  instruction_prompt: string;
+  output_constraint: RepositoryColumnOutputConstraint | null;
+  last_run_at: string;
+  last_run_status: string;
 }
 
 export interface RepositoryManifestResponse {
@@ -560,7 +688,7 @@ export interface RepositoryManifestResponse {
   limit: number;
   offset: number;
   sort_by: string;
-  sort_dir: "asc" | "desc";
+  sort_dir: "asc" | "desc" | "";
   columns: RepositoryManifestColumn[];
   filters: {
     q: string;
@@ -583,6 +711,14 @@ export interface RepositoryManifestResponse {
     rating_depth_score_max: number | null;
     rating_relevant_detail_score_min: number | null;
     rating_relevant_detail_score_max: number | null;
+    citation_type: string;
+    citation_doi: string;
+    citation_report_number: string;
+    citation_standard_number: string;
+    citation_missing_fields: string;
+    citation_ready: boolean | null;
+    citation_confidence_min: number | null;
+    citation_confidence_max: number | null;
   };
 }
 
@@ -611,6 +747,87 @@ export interface RepositorySourceExportResponse {
   missing_files: number;
   destination_path: string;
   message: string;
+}
+
+export interface RepositorySourcePatchRequest {
+  title?: string;
+  author_names?: string;
+  publication_date?: string;
+  document_type?: string;
+  organization_name?: string;
+  organization_type?: string;
+  tags_text?: string;
+  notes?: string;
+  summary_text?: string;
+  overall_relevance?: number | null;
+  depth_score?: number | null;
+  relevant_detail_score?: number | null;
+  rating_rationale?: string;
+  relevant_sections?: string;
+  citation_title?: string;
+  citation_authors?: string;
+  citation_issued?: string;
+  citation_type?: string;
+  citation_url?: string;
+  citation_publisher?: string;
+  citation_container_title?: string;
+  citation_volume?: string;
+  citation_issue?: string;
+  citation_pages?: string;
+  citation_doi?: string;
+  citation_report_number?: string;
+  citation_standard_number?: string;
+  citation_language?: string;
+  citation_accessed?: string;
+  citation_override_fields?: string[];
+  custom_fields?: Record<string, string | null>;
+}
+
+export interface RepositoryManifestFilterPayload {
+  q: string;
+  fetch_status: string;
+  detected_type: string;
+  source_kind: string;
+  document_type: string;
+  organization_type: string;
+  organization_name: string;
+  author_names: string;
+  publication_date: string;
+  tags_text: string;
+  has_summary: boolean | null;
+  has_rating: boolean | null;
+  rating_overall_min: number | null;
+  rating_overall_max: number | null;
+  rating_overall_relevance_min: number | null;
+  rating_overall_relevance_max: number | null;
+  rating_depth_score_min: number | null;
+  rating_depth_score_max: number | null;
+  rating_relevant_detail_score_min: number | null;
+  rating_relevant_detail_score_max: number | null;
+  citation_type: string;
+  citation_doi: string;
+  citation_report_number: string;
+  citation_standard_number: string;
+  citation_missing_fields: string;
+  citation_ready: boolean | null;
+  citation_confidence_min: number | null;
+  citation_confidence_max: number | null;
+}
+
+export type RepositoryCitationRisScope = "all" | "filtered" | "selected";
+
+export interface RepositoryCitationRisExportRequest {
+  scope: RepositoryCitationRisScope;
+  source_ids: string[];
+  filters: RepositoryManifestFilterPayload;
+}
+
+export interface RepositoryCitationRisDownloadResult {
+  blob: Blob;
+  filename: string;
+  requestedCount: number;
+  exportedCount: number;
+  skippedCount: number;
 }
 
 export interface UploadResponse {

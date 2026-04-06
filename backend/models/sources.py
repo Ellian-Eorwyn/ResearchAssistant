@@ -65,6 +65,7 @@ class SourceManifestRow(BaseModel):
     sha256: str = ""
     extraction_method: str = ""  # raw_html | rendered_html
     markdown_char_count: int = 0
+    custom_fields: dict[str, str] = Field(default_factory=dict)
     phase_metadata: dict[str, SourcePhaseMetadata] = Field(default_factory=dict)
 
 
@@ -133,6 +134,7 @@ class SourceItemStatus(BaseModel):
     status: str = "pending"  # pending | running | completed | failed | skipped | cancelled
     fetch_status: str = ""
     catalog_status: str = ""
+    citation_verification_status: str = ""
     title_status: str = ""
     llm_cleanup_status: str = ""
     summary_status: str = ""
@@ -159,6 +161,7 @@ class SourceDownloadRequest(BaseModel):
     run_download: bool = True
     run_convert: bool = False
     run_catalog: bool = False
+    run_citation_verify: bool = False
     run_llm_cleanup: bool = False
     run_llm_title: bool = False
     run_llm_summary: bool = True
@@ -166,6 +169,7 @@ class SourceDownloadRequest(BaseModel):
     force_redownload: bool = False
     force_convert: bool = False
     force_catalog: bool = False
+    force_citation_verify: bool = False
     force_llm_cleanup: bool = False
     force_title: bool = False
     force_summary: bool = False
@@ -221,6 +225,7 @@ class SourceDownloadStatus(BaseModel):
     run_download: bool = True
     run_convert: bool = False
     run_catalog: bool = False
+    run_citation_verify: bool = False
     run_llm_cleanup: bool = False
     run_llm_title: bool = False
     run_llm_summary: bool = True
@@ -228,6 +233,7 @@ class SourceDownloadStatus(BaseModel):
     force_redownload: bool = False
     force_convert: bool = False
     force_catalog: bool = False
+    force_citation_verify: bool = False
     force_llm_cleanup: bool = False
     force_title: bool = False
     force_summary: bool = False

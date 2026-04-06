@@ -45,19 +45,24 @@ const DEFAULT_SETTINGS: RepoSettings = {
   },
   use_llm: false,
   research_purpose: "",
+  default_project_profile_name: "",
   fetch_delay: 2,
 };
 
 const DEFAULT_SOURCE_TASKS: RepositorySourceTaskRequest = {
   rerun_failed_only: false,
   run_download: true,
+  run_convert: false,
   run_catalog: true,
+  run_citation_verify: false,
   run_llm_cleanup: false,
   run_llm_title: false,
   run_llm_summary: false,
   run_llm_rating: false,
   force_redownload: false,
+  force_convert: false,
   force_catalog: false,
+  force_citation_verify: false,
   force_llm_cleanup: false,
   force_title: false,
   force_summary: false,
@@ -137,8 +142,9 @@ interface AppStateValue {
   startProcessing: () => Promise<void>;
   reprocessStoredDocuments: () => Promise<void>;
   runSourceTasks: (rerunFailedOnly: boolean) => Promise<void>;
+  trackSourceTaskJob: (jobId: string | null, message?: string) => void;
   cancelSourceTasks: () => Promise<void>;
-  saveRepoSettings: () => Promise<void>;
+  saveRepoSettings: (nextSettings?: RepoSettings) => Promise<void>;
   loadModels: () => Promise<void>;
   loadProfiles: () => Promise<void>;
   loadDocumentImports: () => Promise<void>;
@@ -299,8 +305,12 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       !repositoryFinalizeInFlight(processingStatus)
     );
   const sourceRunning =
-    sourceStatus?.state === "running" || sourceStatus?.state === "cancelling";
-  const sourceStopping = sourceStatus?.state === "cancelling";
+    sourceStatus?.state === "running" ||
+    sourceStatus?.state === "cancelling" ||
+    repositoryStatus?.download_state === "running" ||
+    repositoryStatus?.download_state === "cancelling";
+  const sourceStopping =
+    sourceStatus?.state === "cancelling" || repositoryStatus?.download_state === "cancelling";
 
   const resetJobScopedState = useCallback(() => {
     setProcessingJobId(null);
@@ -322,7 +332,10 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       setSourceTaskDraft((prev) => ({
         ...prev,
         run_catalog: Boolean(settings.use_llm) || prev.run_catalog,
+        run_citation_verify: Boolean(settings.use_llm) || prev.run_citation_verify,
         run_llm_summary: Boolean(settings.use_llm),
+        project_profile_name:
+          settings.default_project_profile_name.trim() || prev.project_profile_name,
       }));
     } catch (error) {
       setRepoError(String((error as Error).message || "Failed to load repository settings"));
@@ -351,25 +364,32 @@ export function AppStateProvider({ children }: PropsWithChildren) {
     try {
       const loadedProfiles = await api.getProjectProfiles();
       setProfiles(loadedProfiles);
-      setSourceTaskDraft((prev) => {
-        const hasCurrentSelection = loadedProfiles.some(
-          (profile) => profile.filename === prev.project_profile_name,
-        );
-        if (hasCurrentSelection) {
-          return prev;
-        }
-        const defaultProfile = loadedProfiles.find(
-          (profile) => profile.filename === DEFAULT_PROJECT_PROFILE_FILENAME,
-        );
-        if (!defaultProfile) {
-          return prev.project_profile_name ? { ...prev, project_profile_name: "" } : prev;
-        }
-        return { ...prev, project_profile_name: defaultProfile.filename };
-      });
     } catch {
       setProfiles([]);
     }
   }, [repoLoaded]);
+
+  useEffect(() => {
+    if (!repoLoaded) return;
+    setSourceTaskDraft((prev) => {
+      const preferred = settingsDraft.default_project_profile_name.trim();
+      if (preferred && profiles.some((profile) => profile.filename === preferred)) {
+        return prev.project_profile_name === preferred
+          ? prev
+          : { ...prev, project_profile_name: preferred };
+      }
+      if (prev.project_profile_name && profiles.some((profile) => profile.filename === prev.project_profile_name)) {
+        return prev;
+      }
+      const defaultProfile = profiles.find(
+        (profile) => profile.filename === DEFAULT_PROJECT_PROFILE_FILENAME,
+      );
+      if (!defaultProfile) {
+        return prev.project_profile_name ? { ...prev, project_profile_name: "" } : prev;
+      }
+      return { ...prev, project_profile_name: defaultProfile.filename };
+    });
+  }, [profiles, repoLoaded, settingsDraft.default_project_profile_name]);
 
   const loadDocumentImports = useCallback(async () => {
     if (!repoLoaded) {
@@ -859,8 +879,20 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       }
       const normalizedPayload = {
         ...sourceTaskDraft,
+        project_profile_name:
+          sourceTaskDraft.project_profile_name || settingsDraft.default_project_profile_name,
         run_download: Boolean(sourceTaskDraft.run_download || sourceTaskDraft.force_redownload),
-        run_catalog: Boolean(sourceTaskDraft.run_catalog || sourceTaskDraft.force_catalog || sourceTaskDraft.run_llm_title || sourceTaskDraft.force_title),
+        run_catalog: Boolean(
+          sourceTaskDraft.run_catalog ||
+            sourceTaskDraft.force_catalog ||
+            sourceTaskDraft.run_llm_title ||
+            sourceTaskDraft.force_title ||
+            sourceTaskDraft.run_citation_verify ||
+            sourceTaskDraft.force_citation_verify,
+        ),
+        run_citation_verify: Boolean(
+          sourceTaskDraft.run_citation_verify || sourceTaskDraft.force_citation_verify,
+        ),
         run_llm_cleanup: Boolean(
           sourceTaskDraft.run_llm_cleanup || sourceTaskDraft.force_llm_cleanup,
         ),
@@ -873,6 +905,7 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       if (
         !normalizedPayload.run_download &&
         !normalizedPayload.run_catalog &&
+        !normalizedPayload.run_citation_verify &&
         !normalizedPayload.run_llm_cleanup &&
         !normalizedPayload.run_llm_title &&
         !normalizedPayload.run_llm_summary &&
@@ -897,6 +930,7 @@ export function AppStateProvider({ children }: PropsWithChildren) {
         ...prev,
         run_download: normalizedPayload.run_download,
         run_catalog: normalizedPayload.run_catalog,
+        run_citation_verify: normalizedPayload.run_citation_verify,
         run_llm_cleanup: normalizedPayload.run_llm_cleanup,
         run_llm_title: normalizedPayload.run_llm_title,
         run_llm_summary: normalizedPayload.run_llm_summary,
@@ -914,7 +948,7 @@ export function AppStateProvider({ children }: PropsWithChildren) {
         setSourceError(String((error as Error).message || "Failed to start source tasks"));
       }
     },
-    [repositoryStatus?.attached, setSourceTaskDraft, sourceTaskDraft],
+    [repositoryStatus?.attached, setSourceTaskDraft, settingsDraft.default_project_profile_name, sourceTaskDraft],
   );
 
   const cancelSourceTasks = useCallback(async () => {
@@ -942,15 +976,29 @@ export function AppStateProvider({ children }: PropsWithChildren) {
     }
   }, [sourceTaskJobId]);
 
-  const saveRepoSettings = useCallback(async () => {
+  const trackSourceTaskJob = useCallback((jobId: string | null, message = "") => {
+    setSourceTaskJobId(jobId);
+    setSourceStatus(null);
+    setSourcePolling(Boolean(jobId));
+    if (message) {
+      setRepoMessage(message);
+    }
+  }, []);
+
+  const saveRepoSettings = useCallback(async (nextSettings?: RepoSettings) => {
     if (!repoLoaded) return;
     setSavingSettings(true);
     setRepoError("");
     try {
-      const payload = normalizeRepoSettingsDraft(settingsDraft);
+      const payload = normalizeRepoSettingsDraft(nextSettings ?? settingsDraft);
       const saved = await api.saveRepoSettings(payload);
       setRepoSettings(saved);
       setSettingsDraft(saved);
+      setSourceTaskDraft((prev) => ({
+        ...prev,
+        project_profile_name:
+          saved.default_project_profile_name.trim() || prev.project_profile_name,
+      }));
       setRepoMessage("Settings saved.");
       await refreshDashboard();
     } catch (error) {
@@ -987,6 +1035,10 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       try {
         const response = await api.uploadProjectProfile(file);
         await loadProfiles();
+        setSettingsDraft((prev) => ({
+          ...prev,
+          default_project_profile_name: response.filename,
+        }));
         setSourceTaskDraft((prev) => ({
           ...prev,
           project_profile_name: response.filename,
@@ -1180,6 +1232,7 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       startProcessing,
       reprocessStoredDocuments,
       runSourceTasks,
+      trackSourceTaskJob,
       cancelSourceTasks,
       saveRepoSettings,
       loadModels,
@@ -1247,6 +1300,7 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       startProcessing,
       reprocessStoredDocuments,
       runSourceTasks,
+      trackSourceTaskJob,
       cancelSourceTasks,
       saveRepoSettings,
       loadModels,
