@@ -112,11 +112,22 @@ from backend.pipeline.standardized_markdown import (
 )
 from backend.pipeline.source_downloader import (
     MANIFEST_DERIVED_COLUMNS,
+    PHASE_CATALOG,
+    PHASE_CITATION_VERIFY,
+    PHASE_CLEANUP,
+    PHASE_CONVERT,
+    PHASE_FETCH,
+    PHASE_RATING,
+    PHASE_SUMMARY,
+    PHASE_TITLE,
     _apply_citation_manual_overrides,
     _coerce_citation_metadata,
     _effective_manual_override_fields,
     _finalize_citation_metadata,
     _merge_citation_metadata,
+    _normalize_phase_name,
+    _normalize_row_phase_metadata,
+    _row_citation_verification_status,
     SourceDownloadOrchestrator,
     build_ris_records,
     build_manifest_record,
@@ -2582,9 +2593,12 @@ class AttachedRepositoryService:
             context.get("selected_phases", []),
             run_download=bool(getattr(status, "run_download", False)),
             run_convert=bool(getattr(status, "run_convert", False)),
+            run_cleanup=bool(getattr(status, "run_llm_cleanup", False)),
+            run_title=bool(getattr(status, "run_llm_title", False)),
             run_catalog=bool(getattr(status, "run_catalog", False)),
-            run_tag=bool(getattr(status, "run_llm_rating", False)),
-            run_summarize=bool(getattr(status, "run_llm_summary", False)),
+            run_citation_verify=bool(getattr(status, "run_citation_verify", False)),
+            run_rating=bool(getattr(status, "run_llm_rating", False)),
+            run_summary=bool(getattr(status, "run_llm_summary", False)),
         )
         counts = _build_agent_run_counts(
             rows=rows,
@@ -2738,8 +2752,8 @@ class AttachedRepositoryService:
         rating_digest = _file_sha256(
             self._resolve_repository_artifact_path(row, "rating_file", row.rating_file)
         )
-        summary_metadata = row.phase_metadata.get("summarize")
-        tag_metadata = row.phase_metadata.get("tag")
+        summary_metadata = row.phase_metadata.get(PHASE_SUMMARY)
+        tag_metadata = row.phase_metadata.get(PHASE_RATING)
         summary_stale = _phase_is_stale(summary_metadata, clean_markdown_digest)
         rating_stale = _phase_is_stale(tag_metadata, clean_markdown_digest)
 
@@ -2750,9 +2764,9 @@ class AttachedRepositoryService:
             title=row.title,
             detected_type=row.detected_type,
             fetch_status=_agent_fetch_status(row),
-            convert_status=_agent_phase_status(row, "convert"),
-            tag_status=_agent_phase_status(row, "tag"),
-            summarize_status=_agent_phase_status(row, "summarize"),
+            convert_status=_agent_phase_status(row, PHASE_CONVERT),
+            tag_status=_agent_phase_status(row, PHASE_RATING),
+            summarize_status=_agent_phase_status(row, PHASE_SUMMARY),
             rating_overall=rating_overall,
             rating_confidence=rating_confidence,
             summary_present=bool(summary_digest),
@@ -5182,13 +5196,7 @@ class AttachedRepositoryService:
         run_download = bool(payload.run_download or payload.force_redownload)
         run_convert = bool(payload.run_convert or payload.force_convert or (run_download and payload.include_markdown))
         run_citation_verify = bool(payload.run_citation_verify or payload.force_citation_verify)
-        run_catalog = bool(
-            payload.run_catalog
-            or payload.force_catalog
-            or payload.run_llm_title
-            or payload.force_title
-            or run_citation_verify
-        )
+        run_catalog = bool(payload.run_catalog or payload.force_catalog)
         run_llm_cleanup = bool(payload.run_llm_cleanup or payload.force_llm_cleanup)
         run_llm_title = bool(payload.run_llm_title or payload.force_title)
         run_llm_summary = bool(payload.run_llm_summary or payload.force_summary)
@@ -5222,9 +5230,12 @@ class AttachedRepositoryService:
             payload.selected_phases,
             run_download=run_download,
             run_convert=run_convert,
+            run_cleanup=run_llm_cleanup,
+            run_title=run_llm_title,
             run_catalog=run_catalog,
-            run_tag=run_llm_rating,
-            run_summarize=run_llm_summary,
+            run_citation_verify=run_citation_verify,
+            run_rating=run_llm_rating,
+            run_summary=run_llm_summary,
         )
 
         with self._writer_lock():
@@ -5244,7 +5255,9 @@ class AttachedRepositoryService:
                 run_download=run_download,
                 run_convert=run_convert,
                 run_catalog=run_catalog,
+                run_citation_verify=run_citation_verify,
                 run_llm_cleanup=run_llm_cleanup,
+                run_llm_title=run_llm_title,
                 run_llm_summary=run_llm_summary,
                 run_llm_rating=run_llm_rating,
                 output_options=SourceOutputOptions(
@@ -5299,7 +5312,7 @@ class AttachedRepositoryService:
                 run_llm_rating=run_llm_rating,
                 force_redownload=payload.force_redownload,
                 force_convert=payload.force_convert,
-                force_catalog=payload.force_catalog or payload.force_title,
+                force_catalog=payload.force_catalog,
                 force_citation_verify=payload.force_citation_verify,
                 force_llm_cleanup=payload.force_llm_cleanup,
                 force_title=payload.force_title,
@@ -5881,7 +5894,9 @@ class AttachedRepositoryService:
         run_download: bool = False,
         run_convert: bool = False,
         run_catalog: bool = False,
+        run_citation_verify: bool = False,
         run_llm_cleanup: bool = False,
+        run_llm_title: bool = False,
         run_llm_summary: bool = False,
         run_llm_rating: bool = False,
         output_options: SourceOutputOptions | None = None,
@@ -5894,7 +5909,26 @@ class AttachedRepositoryService:
             missing = sorted(normalized_source_ids.difference({row.id for row in selected_rows}))
             if missing:
                 raise ValueError(f"Unknown source_ids: {', '.join(missing[:20])}")
-            effective_scope = "source_ids"
+            if scope == "empty_only":
+                selected_rows = [
+                    row
+                    for row in selected_rows
+                    if self._row_matches_empty_only_scope(
+                        row,
+                        run_download=run_download,
+                        run_convert=run_convert,
+                        run_catalog=run_catalog,
+                        run_citation_verify=run_citation_verify,
+                        run_llm_cleanup=run_llm_cleanup,
+                        run_llm_title=run_llm_title,
+                        run_llm_summary=run_llm_summary,
+                        run_llm_rating=run_llm_rating,
+                        output_options=effective_output_options,
+                    )
+                ]
+                effective_scope = "source_ids_empty_only"
+            else:
+                effective_scope = "source_ids"
             selected_import_id = ""
         elif scope == "empty_only":
             ordered_rows = self._sort_rows(rows)
@@ -5906,7 +5940,9 @@ class AttachedRepositoryService:
                     run_download=run_download,
                     run_convert=run_convert,
                     run_catalog=run_catalog,
+                    run_citation_verify=run_citation_verify,
                     run_llm_cleanup=run_llm_cleanup,
+                    run_llm_title=run_llm_title,
                     run_llm_summary=run_llm_summary,
                     run_llm_rating=run_llm_rating,
                     output_options=effective_output_options,
@@ -5935,7 +5971,9 @@ class AttachedRepositoryService:
         run_download: bool,
         run_convert: bool,
         run_catalog: bool,
+        run_citation_verify: bool,
         run_llm_cleanup: bool,
+        run_llm_title: bool,
         run_llm_summary: bool,
         run_llm_rating: bool,
         output_options: SourceOutputOptions,
@@ -5955,6 +5993,10 @@ class AttachedRepositoryService:
             return True
         if run_llm_cleanup and not self._row_has_artifact(row, "llm_cleanup_file"):
             return True
+        if run_llm_title and not str(row.title or "").strip():
+            return True
+        if run_citation_verify and not self._row_has_verified_citation(row):
+            return True
         if run_llm_summary and not self._row_has_artifact(row, "summary_file"):
             return True
         if run_llm_rating and not self._row_has_artifact(row, "rating_file"):
@@ -5967,6 +6009,20 @@ class AttachedRepositoryService:
             return False
         resolved = self._resolve_repository_artifact_path(row, field_name, rel_value)
         return resolved is not None and resolved.is_file()
+
+    def _row_has_verified_citation(self, row: SourceManifestRow) -> bool:
+        catalog_rel = str(row.catalog_file or "").strip()
+        if not catalog_rel:
+            return False
+        catalog_path = self.path / catalog_rel
+        if not catalog_path.is_file():
+            return False
+        try:
+            payload = json.loads(catalog_path.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        citation = _coerce_citation_metadata(payload.get("citation"))
+        return bool(str(citation.verification_status or "").strip())
 
     def _build_export_job_bibliography(
         self,
@@ -9274,7 +9330,7 @@ def _safe_manifest_row(payload: dict[str, Any]) -> SourceManifestRow | None:
                 for key, value in custom_fields.items()
                 if str(key or "").strip()
             }
-        return SourceManifestRow.model_validate(payload)
+        return _normalize_row_phase_metadata(SourceManifestRow.model_validate(payload))
     except Exception:
         return None
 
@@ -9379,16 +9435,28 @@ def _normalize_agent_phase_names(
     *,
     run_download: bool = False,
     run_convert: bool = False,
+    run_cleanup: bool = False,
+    run_title: bool = False,
     run_catalog: bool = False,
-    run_tag: bool = False,
-    run_summarize: bool = False,
+    run_citation_verify: bool = False,
+    run_rating: bool = False,
+    run_summary: bool = False,
 ) -> list[str]:
-    allowed = {"fetch", "convert", "catalog", "tag", "summarize"}
+    allowed = {
+        PHASE_FETCH,
+        PHASE_CONVERT,
+        PHASE_CLEANUP,
+        PHASE_TITLE,
+        PHASE_CATALOG,
+        PHASE_CITATION_VERIFY,
+        PHASE_SUMMARY,
+        PHASE_RATING,
+    }
     normalized: list[str] = []
     seen: set[str] = set()
     if isinstance(values, (list, tuple, set)):
         for item in values:
-            phase = str(item or "").strip().lower()
+            phase = _normalize_phase_name(item)
             if phase not in allowed or phase in seen:
                 continue
             seen.add(phase)
@@ -9398,15 +9466,21 @@ def _normalize_agent_phase_names(
 
     defaults: list[str] = []
     if run_download:
-        defaults.append("fetch")
+        defaults.append(PHASE_FETCH)
     if run_convert:
-        defaults.append("convert")
+        defaults.append(PHASE_CONVERT)
+    if run_cleanup:
+        defaults.append(PHASE_CLEANUP)
+    if run_title:
+        defaults.append(PHASE_TITLE)
     if run_catalog:
-        defaults.append("catalog")
-    if run_tag:
-        defaults.append("tag")
-    if run_summarize:
-        defaults.append("summarize")
+        defaults.append(PHASE_CATALOG)
+    if run_citation_verify:
+        defaults.append(PHASE_CITATION_VERIFY)
+    if run_summary:
+        defaults.append(PHASE_SUMMARY)
+    if run_rating:
+        defaults.append(PHASE_RATING)
     return defaults
 
 
@@ -9531,11 +9605,12 @@ def _agent_fetch_status(row: SourceManifestRow) -> str:
 
 
 def _agent_phase_status(row: SourceManifestRow, phase: str) -> str:
-    metadata = row.phase_metadata.get(phase)
+    normalized_phase = _normalize_phase_name(phase)
+    metadata = row.phase_metadata.get(normalized_phase)
     if metadata is not None and metadata.status:
         return metadata.status
 
-    if phase == "convert":
+    if normalized_phase == PHASE_CONVERT:
         cleanup_status = str(row.llm_cleanup_status or "").strip().lower()
         if cleanup_status == "failed":
             return "failed"
@@ -9543,7 +9618,31 @@ def _agent_phase_status(row: SourceManifestRow, phase: str) -> str:
             return "completed"
         return "pending"
 
-    if phase == "catalog":
+    if normalized_phase == PHASE_CLEANUP:
+        status = str(row.llm_cleanup_status or "").strip().lower()
+        if status in {"cleaned", "existing", "not_needed", "completed"}:
+            return "completed"
+        if status in {"failed", "missing_markdown"}:
+            return "failed"
+        if status == "stale":
+            return "stale"
+        if status == "not_requested" or status.startswith("skipped"):
+            return "skipped"
+        return "pending"
+
+    if normalized_phase == PHASE_TITLE:
+        status = str(row.title_status or "").strip().lower()
+        if status in {"generated", "existing", "completed", "extracted"}:
+            return "completed"
+        if status in {"failed", "missing_markdown"}:
+            return "failed"
+        if status == "stale":
+            return "stale"
+        if status == "not_requested" or status.startswith("skipped"):
+            return "skipped"
+        return "pending"
+
+    if normalized_phase == PHASE_CATALOG:
         status = str(row.catalog_status or "").strip().lower()
         if status in {"generated", "existing", "completed"}:
             return "completed"
@@ -9551,11 +9650,23 @@ def _agent_phase_status(row: SourceManifestRow, phase: str) -> str:
             return "failed"
         if status == "stale":
             return "stale"
-        if status in {"skipped", "not_applicable"}:
+        if status in {"skipped", "not_applicable"} or status.startswith("skipped"):
             return "skipped"
         return "pending"
 
-    if phase == "summarize":
+    if normalized_phase == PHASE_CITATION_VERIFY:
+        status = str(_row_citation_verification_status(row) or "").strip().lower()
+        if status in {"verified", "candidate", "completed"}:
+            return "completed"
+        if status in {"failed", "missing_markdown"}:
+            return "failed"
+        if status == "stale":
+            return "stale"
+        if status in {"not_requested", "not_applicable"} or status.startswith("skipped"):
+            return "skipped"
+        return "pending"
+
+    if normalized_phase == PHASE_SUMMARY:
         status = str(row.summary_status or "").strip().lower()
         if status in {"generated", "existing", "completed"}:
             return "completed"
@@ -9563,11 +9674,11 @@ def _agent_phase_status(row: SourceManifestRow, phase: str) -> str:
             return "failed"
         if status == "stale":
             return "stale"
-        if status == "skipped":
+        if status == "skipped" or status.startswith("skipped"):
             return "skipped"
         return "pending"
 
-    if phase == "tag":
+    if normalized_phase == PHASE_RATING:
         status = str(row.rating_status or "").strip().lower()
         if status in {"generated", "existing", "completed"}:
             return "completed"
@@ -9575,7 +9686,7 @@ def _agent_phase_status(row: SourceManifestRow, phase: str) -> str:
             return "failed"
         if status == "stale":
             return "stale"
-        if status == "skipped":
+        if status == "skipped" or status.startswith("skipped"):
             return "skipped"
         return "pending"
 
@@ -9625,7 +9736,7 @@ def _normalize_phase_outcome(status: str) -> str:
         return "failed"
     if normalized in {"partial", "stale"}:
         return "partial"
-    if normalized in {"skipped", "not_requested"}:
+    if normalized in {"skipped", "not_requested"} or normalized.startswith("skipped"):
         return "skipped"
     return "pending"
 
@@ -9725,6 +9836,7 @@ def _build_pending_source_status(
         run_download=bool(getattr(orchestrator, "run_download", False)),
         run_convert=bool(getattr(orchestrator, "run_convert", False)),
         run_catalog=bool(getattr(orchestrator, "run_catalog", False)),
+        run_citation_verify=bool(getattr(orchestrator, "run_citation_verify", False)),
         run_llm_cleanup=bool(getattr(orchestrator, "run_llm_cleanup", False)),
         run_llm_title=bool(getattr(orchestrator, "run_llm_title", False)),
         run_llm_summary=bool(getattr(orchestrator, "run_llm_summary", False)),
@@ -9732,6 +9844,7 @@ def _build_pending_source_status(
         force_redownload=bool(getattr(orchestrator, "force_redownload", False)),
         force_convert=bool(getattr(orchestrator, "force_convert", False)),
         force_catalog=bool(getattr(orchestrator, "force_catalog", False)),
+        force_citation_verify=bool(getattr(orchestrator, "force_citation_verify", False)),
         force_llm_cleanup=bool(getattr(orchestrator, "force_llm_cleanup", False)),
         force_title=bool(getattr(orchestrator, "force_title", False)),
         force_summary=bool(getattr(orchestrator, "force_summary", False)),

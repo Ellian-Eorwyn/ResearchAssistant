@@ -1,17 +1,20 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  buildRepositoryBrowserSourceTaskQueue,
   REPOSITORY_BROWSER_BIBLIOGRAPHY_COLUMNS,
   buildRepositoryBrowserQuery,
   buildRepositoryBrowserStorageKey,
   clampRepositoryBrowserColumnWidth,
   defaultRepositoryBrowserColumnWidth,
   migrateRepositoryBrowserVisibleColumns,
+  moveRepositoryBrowserColumnToEnd,
   REPOSITORY_BROWSER_COLUMN_CATEGORIES,
   formatRepositoryBrowserExportFilename,
   nextRepositoryBrowserSort,
   REPOSITORY_BROWSER_DEFAULT_VISIBLE_COLUMNS,
   REPOSITORY_BROWSER_PAGE_SIZE,
+  reorderRepositoryBrowserColumns,
   resolveRepositoryBrowserColumnWidth,
   toggleRepositoryBrowserSelection,
 } from "./repositoryBrowserUtils";
@@ -142,6 +145,74 @@ describe("repositoryBrowserUtils", () => {
       sortBy: "title",
       sortDir: "asc",
     });
+  });
+
+  it("reorders visible columns deterministically for drag and drop", () => {
+    expect(
+      reorderRepositoryBrowserColumns(
+        ["title", "author_names", "publication_year", "organization_name"],
+        "publication_year",
+        "author_names",
+      ),
+    ).toEqual(["title", "publication_year", "author_names", "organization_name"]);
+
+    expect(
+      moveRepositoryBrowserColumnToEnd(
+        ["title", "author_names", "publication_year", "organization_name"],
+        "author_names",
+      ),
+    ).toEqual(["title", "publication_year", "organization_name", "author_names"]);
+  });
+
+  it("builds isolated enrichment queues in the expected order", () => {
+    const queue = buildRepositoryBrowserSourceTaskQueue({
+      draft: {
+        rerun_failed_only: false,
+        run_download: false,
+        run_convert: false,
+        run_catalog: true,
+        run_citation_verify: true,
+        run_llm_cleanup: true,
+        run_llm_title: true,
+        run_llm_summary: true,
+        run_llm_rating: true,
+        force_redownload: false,
+        force_convert: false,
+        force_catalog: false,
+        force_citation_verify: false,
+        force_llm_cleanup: false,
+        force_title: false,
+        force_summary: false,
+        force_rating: false,
+        project_profile_name: "",
+        include_raw_file: true,
+        include_rendered_html: true,
+        include_rendered_pdf: true,
+        include_markdown: true,
+        scope: "empty_only",
+        import_id: "",
+      },
+      scope: "selected",
+      selectedSourceIds: ["000001", "000002"],
+      defaultProjectProfileName: "default.yaml",
+    });
+
+    expect(queue.map((item) => item.id)).toEqual([
+      "convert",
+      "cleanup",
+      "title",
+      "catalog",
+      "citation_verify",
+      "summary",
+      "rating",
+    ]);
+    expect(queue[0].payload.scope).toBe("empty_only");
+    expect(queue[0].payload.source_ids).toEqual(["000001", "000002"]);
+    expect(queue[0].payload.selected_phases).toEqual(["convert"]);
+    expect(queue[2].payload.selected_phases).toEqual(["title"]);
+    expect(queue[4].payload.run_citation_verify).toBe(true);
+    expect(queue[5].payload.scope).toBe("all");
+    expect(queue[5].payload.project_profile_name).toBe("default.yaml");
   });
 
   it("supports shift-range selection and clear behavior", () => {

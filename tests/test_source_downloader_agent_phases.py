@@ -129,8 +129,8 @@ class SourceDownloaderAgentPhaseTests(unittest.TestCase):
         result_row = manifest["rows"][0]
         self.assertEqual(result_row["summary_status"], "stale")
         self.assertEqual(result_row["rating_status"], "stale")
-        self.assertTrue(result_row["phase_metadata"]["summarize"]["stale"])
-        self.assertTrue(result_row["phase_metadata"]["tag"]["stale"])
+        self.assertTrue(result_row["phase_metadata"]["summary"]["stale"])
+        self.assertTrue(result_row["phase_metadata"]["rating"]["stale"])
 
     def test_summary_and_tag_can_run_from_existing_markdown(self):
         job_id = self.store.create_job()
@@ -176,8 +176,120 @@ class SourceDownloaderAgentPhaseTests(unittest.TestCase):
         result_row = manifest["rows"][0]
         self.assertTrue(result_row["summary_file"])
         self.assertTrue(result_row["rating_file"])
-        self.assertEqual(result_row["phase_metadata"]["summarize"]["status"], "completed")
-        self.assertEqual(result_row["phase_metadata"]["tag"]["status"], "completed")
+        self.assertEqual(result_row["phase_metadata"]["summary"]["status"], "completed")
+        self.assertEqual(result_row["phase_metadata"]["rating"]["status"], "completed")
+
+    def test_title_only_phase_does_not_generate_catalog_artifact(self):
+        job_id = self.store.create_job()
+        output_dir = self.store.get_sources_output_dir(job_id)
+        markdown_path = output_dir / "markdown" / "000001_clean.md"
+        markdown_path.parent.mkdir(parents=True, exist_ok=True)
+        markdown_path.write_text(
+            "# Existing Source Title\n\nBody text.\n",
+            encoding="utf-8",
+        )
+
+        row = SourceManifestRow(
+            id="000001",
+            original_url="https://example.com/title-only",
+            final_url="https://example.com/title-only",
+            fetch_status="success",
+            detected_type="html",
+            markdown_file="markdown/000001_clean.md",
+        )
+
+        orchestrator = SourceDownloadOrchestrator(
+            job_id=job_id,
+            store=self.store,
+            use_llm=False,
+            run_download=False,
+            run_convert=False,
+            run_catalog=False,
+            run_citation_verify=False,
+            run_llm_cleanup=False,
+            run_llm_title=True,
+            run_llm_summary=False,
+            run_llm_rating=False,
+            target_rows=[row],
+        )
+
+        orchestrator.run()
+        manifest = self.store.load_artifact(job_id, "06_sources_manifest")
+        result_row = manifest["rows"][0]
+        self.assertEqual(result_row["title"], "Existing Source Title")
+        self.assertEqual(result_row["title_status"], "extracted")
+        self.assertEqual(result_row["catalog_status"], "")
+        self.assertEqual(result_row["phase_metadata"]["title"]["status"], "completed")
+
+    def test_citation_verify_only_preserves_existing_catalog_metadata(self):
+        job_id = self.store.create_job()
+        output_dir = self.store.get_sources_output_dir(job_id)
+        markdown_path = output_dir / "markdown" / "000001_clean.md"
+        markdown_path.parent.mkdir(parents=True, exist_ok=True)
+        markdown_path.write_text(
+            "# Alpha\n\nBody text.\n",
+            encoding="utf-8",
+        )
+        metadata_dir = output_dir / "metadata"
+        metadata_dir.mkdir(parents=True, exist_ok=True)
+        catalog_path = metadata_dir / "000001_catalog.json"
+        catalog_path.write_text(
+            json.dumps(
+                {
+                    "title": "Pinned Title",
+                    "author_names": "Pinned Author",
+                    "publication_date": "2024-01-02",
+                    "publication_year": "2024",
+                    "document_type": "report",
+                    "organization_name": "Pinned Org",
+                    "organization_type": "agency",
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        row = SourceManifestRow(
+            id="000001",
+            original_url="https://example.com/citation-only",
+            final_url="https://example.com/citation-only",
+            fetch_status="success",
+            detected_type="html",
+            markdown_file="markdown/000001_clean.md",
+            catalog_file="metadata/000001_catalog.json",
+            title="Pinned Title",
+            author_names="Pinned Author",
+            publication_date="2024-01-02",
+            publication_year="2024",
+            document_type="report",
+            organization_name="Pinned Org",
+            organization_type="agency",
+        )
+
+        with patch("backend.pipeline.source_downloader.llm_backend_ready_for_chat", return_value=False):
+            orchestrator = SourceDownloadOrchestrator(
+                job_id=job_id,
+                store=self.store,
+                use_llm=False,
+                run_download=False,
+                run_convert=False,
+                run_catalog=False,
+                run_citation_verify=True,
+                run_llm_cleanup=False,
+                run_llm_title=False,
+                run_llm_summary=False,
+                run_llm_rating=False,
+                target_rows=[row],
+            )
+            orchestrator.run()
+
+        manifest = self.store.load_artifact(job_id, "06_sources_manifest")
+        result_row = manifest["rows"][0]
+        self.assertEqual(result_row["title"], "Pinned Title")
+        self.assertEqual(result_row["author_names"], "Pinned Author")
+        self.assertEqual(result_row["catalog_status"], "")
+        self.assertEqual(result_row["phase_metadata"]["citation_verify"]["status"], "skipped")
 
     def test_catalog_phase_persists_deterministic_metadata_from_markdown(self):
         job_id = self.store.create_job()

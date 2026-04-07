@@ -68,6 +68,9 @@ export function AppShell() {
     sourceRunning,
     sourceStopping,
     sourceTaskJobId,
+    sourceTaskQueueActiveLabel,
+    sourceTaskQueueCompletedCount,
+    sourceTaskQueueTotalCount,
     processingStatus,
     sourceStatus,
     cancelSourceTasks,
@@ -89,9 +92,13 @@ export function AppShell() {
       }
       const processed = sourceStatus?.processed_urls || 0;
       const total = sourceStatus?.total_urls || 0;
+      const queuePrefix =
+        sourceTaskQueueTotalCount > 0 && sourceTaskQueueActiveLabel
+          ? `Task ${Math.min(sourceTaskQueueCompletedCount + 1, sourceTaskQueueTotalCount)}/${sourceTaskQueueTotalCount}: ${sourceTaskQueueActiveLabel} · `
+          : "";
       return sourceStopping
-        ? `Repository Processing stopping ${processed}/${total}`
-        : `Repository Processing ${processed}/${total}`;
+        ? `${queuePrefix}Repository Processing stopping ${processed}/${total}`
+        : `${queuePrefix}Repository Processing ${processed}/${total}`;
     }
     if (processingRunning) {
       const preprocessState = String(
@@ -127,6 +134,9 @@ export function AppShell() {
     sourceStatus?.processed_urls,
     sourceStatus?.total_urls,
     sourceStopping,
+    sourceTaskQueueActiveLabel,
+    sourceTaskQueueCompletedCount,
+    sourceTaskQueueTotalCount,
   ]);
 
   const repoState = repositoryStatus?.download_state || "idle";
@@ -316,7 +326,7 @@ export function AppShell() {
 
         <div className="ml-4 flex min-w-0 items-center justify-end gap-3">
           <div className="truncate text-right font-mono text-label-sm text-on-surface-variant">
-            {dashboard?.recent_jobs?.[0]?.message || "No active jobs"}
+            {sourceStatus?.message || dashboard?.recent_jobs?.[0]?.message || "No active jobs"}
           </div>
           {sourceRunning && sourceTaskJobId && (
             <Button

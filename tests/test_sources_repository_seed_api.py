@@ -90,6 +90,7 @@ class SourcesRepositorySeedApiTests(unittest.TestCase):
                     "run_download": False,
                     "run_convert": False,
                     "run_catalog": False,
+                    "run_citation_verify": False,
                     "run_llm_cleanup": False,
                     "run_llm_title": False,
                     "run_llm_summary": False,
@@ -97,6 +98,7 @@ class SourcesRepositorySeedApiTests(unittest.TestCase):
                     "force_redownload": False,
                     "force_convert": False,
                     "force_catalog": False,
+                    "force_citation_verify": False,
                     "force_llm_cleanup": False,
                     "force_title": False,
                     "force_summary": False,
@@ -330,6 +332,7 @@ class SourcesRepositorySeedApiTests(unittest.TestCase):
                 orchestrator = self.app.state.source_download_jobs.get(job_id)
             self.assertIsNotNone(orchestrator)
             self.assertTrue(orchestrator.run_llm_title)
+            self.assertFalse(orchestrator.run_catalog)
             self.assertFalse(orchestrator.run_download)
 
             release.set()
@@ -436,6 +439,28 @@ class SourcesRepositorySeedApiTests(unittest.TestCase):
 
         response, orchestrator = self._start_empty_only_job(
             run_llm_cleanup=True,
+            include_markdown=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([row.id for row in orchestrator.target_rows], ["000001"])
+
+    def test_empty_only_scope_selects_rows_missing_title_values(self):
+        self._update_source_row(title="", title_status="")
+
+        response, orchestrator = self._start_empty_only_job(
+            run_llm_title=True,
+            include_markdown=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([row.id for row in orchestrator.target_rows], ["000001"])
+
+    def test_empty_only_scope_selects_rows_missing_citation_verification(self):
+        self._update_source_row(catalog_file="", catalog_status="")
+
+        response, orchestrator = self._start_empty_only_job(
+            run_citation_verify=True,
             include_markdown=True,
         )
 

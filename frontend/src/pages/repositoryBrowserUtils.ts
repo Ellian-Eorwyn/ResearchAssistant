@@ -2,6 +2,7 @@ import type {
   RepositoryManifestColumn,
   RepositoryManifestFilterPayload,
   RepositorySourceFileKind,
+  RepositorySourceTaskRequest,
 } from "../api/types";
 
 export interface RepositoryBrowserFilters {
@@ -60,6 +61,21 @@ export interface RepositoryBrowserColumnCategory {
   id: string;
   label: string;
   columnKeys: string[];
+}
+
+export type RepositoryBrowserTaskScope = "all" | "selected" | "empty_only";
+
+export interface RepositoryBrowserQueuedSourceTask {
+  id: "convert" | "cleanup" | "title" | "catalog" | "citation_verify" | "summary" | "rating";
+  label: string;
+  payload: RepositorySourceTaskRequest;
+}
+
+export interface RepositoryBrowserSourceTaskQueueInput {
+  draft: RepositorySourceTaskRequest;
+  scope: RepositoryBrowserTaskScope;
+  selectedSourceIds: string[];
+  defaultProjectProfileName: string;
 }
 
 export const REPOSITORY_BROWSER_FILE_COLUMNS: Array<{
@@ -192,6 +208,171 @@ export function clampRepositoryBrowserColumnWidth(width: number): number {
 function sameRepositoryBrowserColumns(left: string[], right: string[]): boolean {
   if (left.length !== right.length) return false;
   return left.every((value, index) => value === right[index]);
+}
+
+export function reorderRepositoryBrowserColumns(
+  visibleColumns: string[],
+  draggedColumnId: string,
+  targetColumnId: string,
+): string[] {
+  if (draggedColumnId === targetColumnId) return visibleColumns;
+  const fromIndex = visibleColumns.indexOf(draggedColumnId);
+  const toIndex = visibleColumns.indexOf(targetColumnId);
+  if (fromIndex < 0 || toIndex < 0) return visibleColumns;
+  const next = [...visibleColumns];
+  const [dragged] = next.splice(fromIndex, 1);
+  next.splice(toIndex, 0, dragged);
+  return sameRepositoryBrowserColumns(next, visibleColumns) ? visibleColumns : next;
+}
+
+export function moveRepositoryBrowserColumnToEnd(
+  visibleColumns: string[],
+  draggedColumnId: string,
+): string[] {
+  const fromIndex = visibleColumns.indexOf(draggedColumnId);
+  if (fromIndex < 0 || fromIndex === visibleColumns.length - 1) return visibleColumns;
+  const next = [...visibleColumns];
+  const [dragged] = next.splice(fromIndex, 1);
+  next.push(dragged);
+  return sameRepositoryBrowserColumns(next, visibleColumns) ? visibleColumns : next;
+}
+
+export function buildRepositoryBrowserSourceTaskQueue({
+  draft,
+  scope,
+  selectedSourceIds,
+  defaultProjectProfileName,
+}: RepositoryBrowserSourceTaskQueueInput): RepositoryBrowserQueuedSourceTask[] {
+  const selectedRows = scope === "selected" ? selectedSourceIds.map((value) => value.trim()).filter(Boolean) : [];
+  const taskScope = scope === "selected" ? "all" : scope;
+  const sourceIds = selectedRows.length > 0 ? selectedRows : undefined;
+  const basePayload: RepositorySourceTaskRequest = {
+    ...draft,
+    scope: taskScope,
+    import_id: "",
+    source_ids: sourceIds,
+    selected_phases: [],
+    rerun_failed_only: false,
+    run_download: false,
+    run_convert: false,
+    run_catalog: false,
+    run_citation_verify: false,
+    run_llm_cleanup: false,
+    run_llm_title: false,
+    run_llm_summary: false,
+    run_llm_rating: false,
+    force_redownload: false,
+    force_convert: false,
+    force_catalog: false,
+    force_citation_verify: false,
+    force_llm_cleanup: false,
+    force_title: false,
+    force_summary: false,
+    force_rating: false,
+    include_raw_file: true,
+    include_rendered_html: true,
+    include_rendered_pdf: true,
+    include_markdown: true,
+    project_profile_name: draft.project_profile_name || defaultProjectProfileName,
+  };
+
+  const tasks: RepositoryBrowserQueuedSourceTask[] = [];
+  const selectedTaskIds: Array<RepositoryBrowserQueuedSourceTask["id"]> = [];
+  if (draft.run_llm_cleanup) selectedTaskIds.push("cleanup");
+  if (draft.run_llm_title) selectedTaskIds.push("title");
+  if (draft.run_catalog) selectedTaskIds.push("catalog");
+  if (draft.run_citation_verify) selectedTaskIds.push("citation_verify");
+  if (draft.run_llm_summary) selectedTaskIds.push("summary");
+  if (draft.run_llm_rating) selectedTaskIds.push("rating");
+
+  if (selectedTaskIds.length === 0) {
+    return tasks;
+  }
+
+  tasks.push({
+    id: "convert",
+    label: "Convert Markdown",
+    payload: {
+      ...basePayload,
+      scope: "empty_only",
+      selected_phases: ["convert"],
+      run_convert: true,
+    },
+  });
+
+  selectedTaskIds.forEach((taskId) => {
+    if (taskId === "cleanup") {
+      tasks.push({
+        id: taskId,
+        label: "LLM Markdown Cleanup",
+        payload: {
+          ...basePayload,
+          selected_phases: ["cleanup"],
+          run_llm_cleanup: true,
+        },
+      });
+      return;
+    }
+    if (taskId === "title") {
+      tasks.push({
+        id: taskId,
+        label: "Title Resolution",
+        payload: {
+          ...basePayload,
+          selected_phases: ["title"],
+          run_llm_title: true,
+        },
+      });
+      return;
+    }
+    if (taskId === "catalog") {
+      tasks.push({
+        id: taskId,
+        label: "Catalog Metadata",
+        payload: {
+          ...basePayload,
+          selected_phases: ["catalog"],
+          run_catalog: true,
+        },
+      });
+      return;
+    }
+    if (taskId === "citation_verify") {
+      tasks.push({
+        id: taskId,
+        label: "Citation Verification",
+        payload: {
+          ...basePayload,
+          selected_phases: ["citation_verify"],
+          run_citation_verify: true,
+        },
+      });
+      return;
+    }
+    if (taskId === "summary") {
+      tasks.push({
+        id: taskId,
+        label: "LLM Summaries",
+        payload: {
+          ...basePayload,
+          selected_phases: ["summary"],
+          run_llm_summary: true,
+        },
+      });
+      return;
+    }
+    tasks.push({
+      id: taskId,
+      label: "Rating Sources",
+      payload: {
+        ...basePayload,
+        selected_phases: ["rating"],
+        run_llm_rating: true,
+      },
+    });
+  });
+
+  return tasks;
 }
 
 export function defaultRepositoryBrowserColumnWidth(columnKey: string): number {

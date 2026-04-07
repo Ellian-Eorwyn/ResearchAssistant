@@ -5,6 +5,7 @@ import {
   useState,
   type ChangeEvent,
   type CSSProperties,
+  type DragEvent as ReactDragEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
 } from "react";
@@ -32,6 +33,7 @@ import {
 } from "../components/primitives";
 import { useAppState } from "../state/AppState";
 import {
+  buildRepositoryBrowserSourceTaskQueue,
   buildRepositoryManifestFilterPayload,
   buildRepositoryBrowserQuery,
   buildRepositoryBrowserStorageKey,
@@ -40,6 +42,8 @@ import {
   migrateRepositoryBrowserVisibleColumns,
   mergeRepositoryBrowserColumns,
   nextRepositoryBrowserSort,
+  moveRepositoryBrowserColumnToEnd,
+  reorderRepositoryBrowserColumns,
   resolveRepositoryBrowserColumnWidth,
   REPOSITORY_BROWSER_COLUMN_CATEGORIES,
   REPOSITORY_BROWSER_DEFAULT_VISIBLE_COLUMNS,
@@ -47,11 +51,12 @@ import {
   REPOSITORY_BROWSER_PAGE_SIZE,
   toggleRepositoryBrowserSelection,
   type RepositoryBrowserFilters,
+  type RepositoryBrowserTaskScope,
   type RepositoryBrowserStoredState,
 } from "./repositoryBrowserUtils";
 
 const REPOSITORY_BROWSER_SELECTION_COLUMN_WIDTH = 52;
-const REPOSITORY_BROWSER_ACTION_ROW_HEIGHT = 76;
+const REPOSITORY_BROWSER_ACTION_ROW_HEIGHT = 84;
 const REPOSITORY_BROWSER_ACTION_RAIL_WIDTH = 60;
 const REPOSITORY_BROWSER_DETAILS_PANE_MIN_WIDTH = 320;
 const REPOSITORY_BROWSER_DETAILS_PANE_DEFAULT_WIDTH = 384;
@@ -89,8 +94,6 @@ const DEFAULT_FILTERS: RepositoryBrowserFilters = {
   limit: REPOSITORY_BROWSER_PAGE_SIZE,
   offset: 0,
 };
-
-type BrowserTaskScope = "all" | "selected" | "empty_only";
 
 interface SourceDetailsDraft {
   title: string;
@@ -499,7 +502,7 @@ function SourceDetailsDrawer({
 
   return (
     <aside className="min-h-0 h-full">
-      <SurfaceCard className="flex h-full min-h-0 flex-col p-0">
+      <SurfaceCard className="repository-browser-details-surface flex h-full min-h-0 flex-col p-0">
         <div className="thin-scrollbar flex-1 overflow-y-auto p-4">
           <div className="space-y-4">
         <div className="flex flex-wrap items-start justify-between gap-3">
@@ -1401,6 +1404,7 @@ export function RepositoryBrowserPage() {
     sourceRunning,
     sourceTaskDraft,
     setSourceTaskDraft,
+    startSourceTaskQueue,
     trackSourceTaskJob,
     profiles,
   } = useAppState();
@@ -1433,7 +1437,7 @@ export function RepositoryBrowserPage() {
   const [lastAnchorId, setLastAnchorId] = useState<string | null>(null);
   const [showColumnChooser, setShowColumnChooser] = useState(false);
   const [showFilters, setShowFilters] = useState(false);
-  const [browserTaskScope, setBrowserTaskScope] = useState<BrowserTaskScope>("empty_only");
+  const [browserTaskScope, setBrowserTaskScope] = useState<RepositoryBrowserTaskScope>("empty_only");
   const [actionMessage, setActionMessage] = useState("");
   const [actionError, setActionError] = useState("");
   const [linksPending, setLinksPending] = useState(false);
@@ -1457,6 +1461,8 @@ export function RepositoryBrowserPage() {
   const [columnPromptError, setColumnPromptError] = useState("");
   const [renamingColumnId, setRenamingColumnId] = useState<string | null>(null);
   const [renamingColumnLabel, setRenamingColumnLabel] = useState("");
+  const [draggingColumnId, setDraggingColumnId] = useState<string | null>(null);
+  const [dragOverColumnId, setDragOverColumnId] = useState<string | null>(null);
   const [columnCreatePending, setColumnCreatePending] = useState(false);
   const [columnRenamePending, setColumnRenamePending] = useState(false);
   const [columnRunScopeDraft, setColumnRunScopeDraft] = useState<ColumnRunScopeDraftState | null>(null);
@@ -1944,6 +1950,56 @@ export function RepositoryBrowserPage() {
     patchFilters(nextRepositoryBrowserSort(filters.sortBy, filters.sortDir, column.key), true);
   };
 
+  const handleColumnDragStart = (
+    event: ReactDragEvent<HTMLDivElement>,
+    columnId: string,
+  ) => {
+    setDraggingColumnId(columnId);
+    setDragOverColumnId(columnId);
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", columnId);
+  };
+
+  const handleColumnDragOver = (
+    event: ReactDragEvent<HTMLElement>,
+    targetColumnId: string,
+  ) => {
+    if (!draggingColumnId) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    setDragOverColumnId(draggingColumnId === targetColumnId ? null : targetColumnId);
+  };
+
+  const handleColumnDrop = (
+    event: ReactDragEvent<HTMLElement>,
+    targetColumnId: string,
+  ) => {
+    event.preventDefault();
+    if (!draggingColumnId || draggingColumnId === targetColumnId) {
+      setDragOverColumnId(null);
+      return;
+    }
+    setVisibleColumns((prev) =>
+      reorderRepositoryBrowserColumns(prev, draggingColumnId, targetColumnId),
+    );
+    setDragOverColumnId(null);
+  };
+
+  const handleColumnRailDrop = (event: ReactDragEvent<HTMLElement>) => {
+    event.preventDefault();
+    if (!draggingColumnId) {
+      setDragOverColumnId(null);
+      return;
+    }
+    setVisibleColumns((prev) => moveRepositoryBrowserColumnToEnd(prev, draggingColumnId));
+    setDragOverColumnId(null);
+  };
+
+  const handleColumnDragEnd = () => {
+    setDraggingColumnId(null);
+    setDragOverColumnId(null);
+  };
+
   const openColumnPromptModal = (column: RepositoryManifestColumn) => {
     setColumnPromptDraft({
       columnId: column.key,
@@ -2120,7 +2176,7 @@ export function RepositoryBrowserPage() {
   ) => {
     event.preventDefault();
     event.stopPropagation();
-    const headerCell = event.currentTarget.parentElement;
+    const headerCell = event.currentTarget.closest("[data-column-header-cell='true']");
     const fallbackWidth = headerCell?.getBoundingClientRect().width || 180;
     resizeRef.current = {
       columnKey,
@@ -2413,15 +2469,6 @@ export function RepositoryBrowserPage() {
 
   const handleRunTasks = async () => {
     const selectedTaskIds = Array.from(selectedIds);
-    const scope = browserTaskScope === "selected" ? "all" : browserTaskScope;
-    const sourceIds = browserTaskScope === "selected" ? selectedTaskIds : [];
-    const shouldConvertBeforeEnrichment =
-      Boolean(sourceTaskDraft.run_llm_cleanup) ||
-      Boolean(sourceTaskDraft.run_catalog) ||
-      Boolean(sourceTaskDraft.run_citation_verify) ||
-      Boolean(sourceTaskDraft.run_llm_title) ||
-      Boolean(sourceTaskDraft.run_llm_summary) ||
-      Boolean(sourceTaskDraft.run_llm_rating);
     if (
       !sourceTaskDraft.run_llm_cleanup &&
       !sourceTaskDraft.run_catalog &&
@@ -2433,7 +2480,7 @@ export function RepositoryBrowserPage() {
       setActionError("Select at least one AI enrichment task.");
       return;
     }
-    if (browserTaskScope === "selected" && sourceIds.length === 0) {
+    if (browserTaskScope === "selected" && selectedTaskIds.length === 0) {
       setActionError("Select one or more rows before running enrichment on manually selected rows.");
       return;
     }
@@ -2442,36 +2489,23 @@ export function RepositoryBrowserPage() {
     setActionMessage("");
     setActionError("");
     try {
-      const response = await api.startRepositorySourceTasks({
-        ...sourceTaskDraft,
-        scope,
-        import_id: "",
-        source_ids: sourceIds,
-        rerun_failed_only: false,
-        run_download: false,
-        run_convert: shouldConvertBeforeEnrichment,
-        run_catalog: Boolean(sourceTaskDraft.run_catalog),
-        run_citation_verify: Boolean(sourceTaskDraft.run_citation_verify),
-        run_llm_cleanup: Boolean(sourceTaskDraft.run_llm_cleanup),
-        run_llm_title: Boolean(sourceTaskDraft.run_llm_title),
-        run_llm_summary: Boolean(sourceTaskDraft.run_llm_summary),
-        run_llm_rating: Boolean(sourceTaskDraft.run_llm_rating),
-        force_redownload: false,
-        force_convert: false,
-        force_catalog: false,
-        force_citation_verify: false,
-        force_llm_cleanup: false,
-        force_title: false,
-        force_summary: false,
-        force_rating: false,
-        include_raw_file: true,
-        include_rendered_html: true,
-        include_rendered_pdf: true,
-        include_markdown: true,
-        project_profile_name: settingsDraft.default_project_profile_name,
+      const queuedTasks = buildRepositoryBrowserSourceTaskQueue({
+        draft: sourceTaskDraft,
+        scope: browserTaskScope,
+        selectedSourceIds: selectedTaskIds,
+        defaultProjectProfileName: settingsDraft.default_project_profile_name,
       });
-      setActionMessage(response.message || "Repository enrichment started.");
-      trackSourceTaskJob(response.job_id || null, response.message || "");
+      await startSourceTaskQueue(
+        queuedTasks,
+        queuedTasks.length > 1
+          ? `Queued ${queuedTasks.length} isolated enrichment tasks.`
+          : "Repository enrichment started.",
+      );
+      setActionMessage(
+        queuedTasks.length > 1
+          ? `Queued ${queuedTasks.length} isolated enrichment tasks.`
+          : "Repository enrichment started.",
+      );
       void refreshDashboard();
       void manifestQuery.refetch();
     } catch (error) {
@@ -2832,7 +2866,7 @@ export function RepositoryBrowserPage() {
             <SelectField
               label="Scope"
               value={browserTaskScope}
-              onChange={(event) => setBrowserTaskScope(event.target.value as BrowserTaskScope)}
+              onChange={(event) => setBrowserTaskScope(event.target.value as RepositoryBrowserTaskScope)}
             >
               <option value="all">Entire repository</option>
               <option value="selected">Manually selected rows</option>
@@ -2876,7 +2910,7 @@ export function RepositoryBrowserPage() {
               </Button>
             </div>
             <div className="text-body-md text-on-surface-variant">
-              Column visibility changes are stored per repository path. Column widths can be dragged from the table header.
+              Column visibility changes are stored per repository path. Column widths can be resized and visible columns can be reordered directly from the Browser header row.
             </div>
           </div>
         </div>
@@ -3153,13 +3187,20 @@ export function RepositoryBrowserPage() {
                     }}
                   >
                     <div
-                      aria-hidden="true"
-                      className="repository-browser-action-cell border-r border-outline-variant/20"
+                      className="repository-browser-action-cell repository-browser-selection-action-cell border-r border-outline-variant/20"
+                      title="Select all visible rows"
                       style={{
                         width: `${REPOSITORY_BROWSER_SELECTION_COLUMN_WIDTH}px`,
                         minWidth: `${REPOSITORY_BROWSER_SELECTION_COLUMN_WIDTH}px`,
                       }}
-                    />
+                    >
+                      <input
+                        ref={headerCheckboxRef}
+                        checked={allVisibleSelected}
+                        onChange={(event) => toggleSelectAllVisible(event.target.checked)}
+                        type="checkbox"
+                      />
+                    </div>
                     {renderedColumns.map((column) => {
                       const style = columnWidthStyle(columnWidths, column.key);
                       const label = labelRepositoryBrowserColumn(column.key, column.label);
@@ -3170,25 +3211,113 @@ export function RepositoryBrowserPage() {
                         !llmReady ||
                         !column.instruction_prompt.trim() ||
                         Boolean(activeColumnRun);
+                      const activeSort = filters.sortBy === column.key;
+                      const directionLabel =
+                        activeSort ? (filters.sortDir === "asc" ? "↑" : "↓") : "";
+                      const isDragOverTarget =
+                        dragOverColumnId === column.key && draggingColumnId !== column.key;
                       return (
                         <div
                           key={`action-${column.key}`}
-                          className="repository-browser-action-cell"
+                          className={[
+                            "repository-browser-action-cell",
+                            "repository-browser-column-header-cell",
+                            draggingColumnId === column.key
+                              ? "repository-browser-column-dragging"
+                              : "",
+                            isDragOverTarget ? "repository-browser-column-drag-over" : "",
+                          ]
+                            .filter(Boolean)
+                            .join(" ")}
                           id={`repository-column-control-${column.key}`}
+                          data-column-header-cell="true"
+                          onDragOver={(event) => handleColumnDragOver(event, column.key)}
+                          onDrop={(event) => handleColumnDrop(event, column.key)}
                           style={style}
                         >
-                          <div className="flex items-start justify-between gap-2">
-                            <div className="min-w-0">
-                              <div className="truncate text-[11px] font-semibold uppercase tracking-[0.08em] text-on-surface">
-                                {label}
-                              </div>
-                              <div className="mt-1 truncate text-[11px] text-on-surface-variant">
-                                {formatColumnActionStatus(column, activeColumnRun)}
-                              </div>
+                          <div className="flex items-start gap-2">
+                            <div
+                              className={[
+                                "repository-browser-column-drag-handle",
+                                renamingColumnId === column.key ? "cursor-default" : "",
+                              ]
+                                .filter(Boolean)
+                                .join(" ")}
+                              draggable={renamingColumnId !== column.key}
+                              onDragEnd={handleColumnDragEnd}
+                              onDragStart={(event) => handleColumnDragStart(event, column.key)}
+                              title={renamingColumnId === column.key ? undefined : "Drag to reorder"}
+                            >
+                              {renamingColumnId === column.key ? (
+                                <div className="min-w-0">
+                                  <input
+                                    ref={renameInputRef}
+                                    className="min-w-0 w-full rounded-sm border border-primary/60 bg-surface px-2 py-1 text-body-md text-on-surface focus:border-primary focus:outline-none"
+                                    disabled={columnRenamePending}
+                                    value={renamingColumnLabel}
+                                    onChange={(event) => setRenamingColumnLabel(event.target.value)}
+                                    onKeyDown={handleRenameKeyDown}
+                                  />
+                                  <div className="mt-2 flex flex-wrap gap-2">
+                                    <button
+                                      className="text-label-sm text-primary hover:underline"
+                                      disabled={columnRenamePending}
+                                      onClick={() => void commitColumnRename()}
+                                      type="button"
+                                    >
+                                      Save
+                                    </button>
+                                    <button
+                                      className="text-label-sm text-on-surface-variant hover:text-on-surface"
+                                      disabled={columnRenamePending}
+                                      onClick={cancelColumnRename}
+                                      type="button"
+                                    >
+                                      Cancel
+                                    </button>
+                                  </div>
+                                </div>
+                              ) : column.sortable ? (
+                                <>
+                                  <button
+                                    className={[
+                                      "repository-browser-column-label-button",
+                                      activeSort ? "text-on-surface" : "text-on-surface-variant",
+                                    ]
+                                      .filter(Boolean)
+                                      .join(" ")}
+                                    onClick={() => handleSort(column)}
+                                    type="button"
+                                  >
+                                    <span className="truncate">{label}</span>
+                                    <span className="shrink-0 text-on-surface">{directionLabel || " "}</span>
+                                  </button>
+                                  <div className="mt-1 truncate text-[11px] text-on-surface-variant">
+                                    {formatColumnActionStatus(column, activeColumnRun)}
+                                  </div>
+                                </>
+                              ) : (
+                                <>
+                                  <div className="truncate text-[11px] font-semibold uppercase tracking-[0.08em] text-on-surface">
+                                    {label}
+                                  </div>
+                                  <div className="mt-1 truncate text-[11px] text-on-surface-variant">
+                                    {formatColumnActionStatus(column, activeColumnRun)}
+                                  </div>
+                                </>
+                              )}
                             </div>
-                            {runningThisColumn && (
-                              <StatusBadge text="Running" tone="active" />
-                            )}
+                            <div className="flex shrink-0 items-start gap-1">
+                              {runningThisColumn && (
+                                <StatusBadge text="Running" tone="active" />
+                              )}
+                              <button
+                                aria-label={`Resize ${label} column`}
+                                className="repository-browser-column-resize-handle"
+                                onMouseDown={(event) => beginColumnResize(event, column.key)}
+                                type="button"
+                              />
+                            </div>
                           </div>
 
                           <div className="mt-2 flex flex-wrap gap-1">
@@ -3229,7 +3358,19 @@ export function RepositoryBrowserPage() {
                       );
                     })}
                     <div
-                      className="repository-browser-action-rail"
+                      className={[
+                        "repository-browser-action-rail",
+                        dragOverColumnId === "__end__" ? "repository-browser-column-drag-over" : "",
+                      ]
+                        .filter(Boolean)
+                        .join(" ")}
+                      onDragOver={(event) => {
+                        if (!draggingColumnId) return;
+                        event.preventDefault();
+                        event.dataTransfer.dropEffect = "move";
+                        setDragOverColumnId("__end__");
+                      }}
+                      onDrop={handleColumnRailDrop}
                       style={{
                         width: `${REPOSITORY_BROWSER_ACTION_RAIL_WIDTH}px`,
                         minWidth: `${REPOSITORY_BROWSER_ACTION_RAIL_WIDTH}px`,
@@ -3262,87 +3403,6 @@ export function RepositoryBrowserPage() {
                         );
                       })}
                     </colgroup>
-                    <thead>
-                      <tr>
-                        <th
-                          className="w-12"
-                          style={{ top: `${REPOSITORY_BROWSER_ACTION_ROW_HEIGHT}px`, zIndex: 2 }}
-                        >
-                          <input
-                            ref={headerCheckboxRef}
-                            checked={allVisibleSelected}
-                            onChange={(event) => toggleSelectAllVisible(event.target.checked)}
-                            type="checkbox"
-                          />
-                        </th>
-                        {renderedColumns.map((column) => {
-                          const active = filters.sortBy === column.key;
-                          const directionLabel = active ? (filters.sortDir === "asc" ? "↑" : "↓") : "";
-                          return (
-                            <th
-                              key={column.key}
-                              style={{
-                                ...columnWidthStyle(columnWidths, column.key),
-                                top: `${REPOSITORY_BROWSER_ACTION_ROW_HEIGHT}px`,
-                                zIndex: 2,
-                              }}
-                            >
-                              <div className="group flex items-center justify-between gap-2">
-                                {renamingColumnId === column.key ? (
-                                  <div className="flex min-w-0 flex-1 items-center gap-2">
-                                    <input
-                                      ref={renameInputRef}
-                                      className="min-w-0 flex-1 rounded-sm border border-primary/60 bg-surface px-2 py-1 text-body-md text-on-surface focus:border-primary focus:outline-none"
-                                      disabled={columnRenamePending}
-                                      value={renamingColumnLabel}
-                                      onChange={(event) => setRenamingColumnLabel(event.target.value)}
-                                      onKeyDown={handleRenameKeyDown}
-                                    />
-                                    <button
-                                      className="text-label-sm text-primary hover:underline"
-                                      disabled={columnRenamePending}
-                                      onClick={() => void commitColumnRename()}
-                                      type="button"
-                                    >
-                                      Save
-                                    </button>
-                                    <button
-                                      className="text-label-sm text-on-surface-variant hover:text-on-surface"
-                                      disabled={columnRenamePending}
-                                      onClick={cancelColumnRename}
-                                      type="button"
-                                    >
-                                      Cancel
-                                    </button>
-                                  </div>
-                                ) : column.sortable ? (
-                                  <button
-                                    className="flex min-w-0 items-center gap-2 text-left text-label-sm uppercase tracking-[0.08em] text-on-surface-variant hover:text-on-surface"
-                                    onClick={() => handleSort(column)}
-                                    type="button"
-                                  >
-                                    <span className="truncate">
-                                      {labelRepositoryBrowserColumn(column.key, column.label)}
-                                    </span>
-                                    <span>{directionLabel}</span>
-                                  </button>
-                                ) : (
-                                  <span className="truncate">
-                                    {labelRepositoryBrowserColumn(column.key, column.label)}
-                                  </span>
-                                )}
-                                <button
-                                  aria-label={`Resize ${labelRepositoryBrowserColumn(column.key, column.label)} column`}
-                                  className="h-7 w-3 shrink-0 cursor-col-resize rounded-sm bg-outline-variant/40 opacity-60 hover:bg-primary hover:opacity-100 group-hover:opacity-100"
-                                  onMouseDown={(event) => beginColumnResize(event, column.key)}
-                                  type="button"
-                                />
-                              </div>
-                            </th>
-                          );
-                        })}
-                      </tr>
-                    </thead>
                     <tbody>
                       {rows.map((row) => {
                         const isSelected = selectedIds.has(row.id);
@@ -3350,7 +3410,12 @@ export function RepositoryBrowserPage() {
                         return (
                           <tr
                             key={`${row.id}-${row.original_url}`}
-                            className={isActive ? "bg-surface-container-highest" : isSelected ? "bg-surface-container-high" : ""}
+                            className={[
+                              isSelected ? "repository-browser-row-selected" : "",
+                              isActive ? "repository-browser-row-active" : "",
+                            ]
+                              .filter(Boolean)
+                              .join(" ")}
                             onClick={() => setActiveRowId(row.id)}
                           >
                             <td onClick={(event) => event.stopPropagation()}>

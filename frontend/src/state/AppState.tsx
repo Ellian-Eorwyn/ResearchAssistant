@@ -3,6 +3,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type Dispatch,
   type PropsWithChildren,
@@ -88,6 +89,11 @@ export const STAGE_NAMES: Record<string, string> = {
   exporting: "Exporting CSV",
 };
 
+interface QueuedSourceTask {
+  label: string;
+  payload: RepositorySourceTaskRequest;
+}
+
 interface AppStateValue {
   repoLoaded: boolean;
   repositoryStatus: RepositoryStatusResponse | null;
@@ -125,6 +131,9 @@ interface AppStateValue {
   processingRunning: boolean;
   sourceRunning: boolean;
   sourceStopping: boolean;
+  sourceTaskQueueActiveLabel: string;
+  sourceTaskQueueCompletedCount: number;
+  sourceTaskQueueTotalCount: number;
   pickRepositoryDirectory: (mode: "open" | "create" | "export", initialPath?: string) => Promise<string>;
   openRepository: (path: string) => Promise<boolean>;
   createRepository: (path: string) => Promise<boolean>;
@@ -142,6 +151,10 @@ interface AppStateValue {
   startProcessing: () => Promise<void>;
   reprocessStoredDocuments: () => Promise<void>;
   runSourceTasks: (rerunFailedOnly: boolean) => Promise<void>;
+  startSourceTaskQueue: (
+    tasks: Array<{ label: string; payload: RepositorySourceTaskRequest }>,
+    message?: string,
+  ) => Promise<void>;
   trackSourceTaskJob: (jobId: string | null, message?: string) => void;
   cancelSourceTasks: () => Promise<void>;
   saveRepoSettings: (nextSettings?: RepoSettings) => Promise<void>;
@@ -295,6 +308,11 @@ export function AppStateProvider({ children }: PropsWithChildren) {
   const [loadingModels, setLoadingModels] = useState(false);
   const [processingPolling, setProcessingPolling] = useState(false);
   const [sourcePolling, setSourcePolling] = useState(false);
+  const [sourceTaskQueue, setSourceTaskQueue] = useState<QueuedSourceTask[]>([]);
+  const [sourceTaskQueueActiveLabel, setSourceTaskQueueActiveLabel] = useState("");
+  const [sourceTaskQueueCompletedCount, setSourceTaskQueueCompletedCount] = useState(0);
+  const [sourceTaskQueueTotalCount, setSourceTaskQueueTotalCount] = useState(0);
+  const handledTerminalSourceJobsRef = useRef<Set<string>>(new Set());
 
   const processingRunning =
     processingStatus?.current_stage !== undefined &&
@@ -312,6 +330,44 @@ export function AppStateProvider({ children }: PropsWithChildren) {
   const sourceStopping =
     sourceStatus?.state === "cancelling" || repositoryStatus?.download_state === "cancelling";
 
+  const clearSourceTaskQueue = useCallback(() => {
+    setSourceTaskQueue([]);
+    setSourceTaskQueueActiveLabel("");
+    setSourceTaskQueueCompletedCount(0);
+    setSourceTaskQueueTotalCount(0);
+  }, []);
+
+  const clearPendingSourceTaskQueue = useCallback(() => {
+    setSourceTaskQueue([]);
+    setSourceTaskQueueTotalCount((prev) =>
+      prev > 0
+        ? Math.max(prev, sourceTaskQueueCompletedCount + (sourceTaskQueueActiveLabel ? 1 : 0))
+        : 0,
+    );
+  }, [sourceTaskQueueActiveLabel, sourceTaskQueueCompletedCount]);
+
+  const startSingleSourceTaskJob = useCallback(
+    async (
+      payload: RepositorySourceTaskRequest,
+      options?: {
+        label?: string;
+        message?: string;
+      },
+    ) => {
+      const response = await api.startRepositorySourceTasks(payload);
+      handledTerminalSourceJobsRef.current.delete(response.job_id);
+      setSourceTaskJobId(response.job_id || null);
+      setSourceStatus(null);
+      setSourcePolling(true);
+      if (options?.label !== undefined) {
+        setSourceTaskQueueActiveLabel(options.label);
+      }
+      setRepoMessage(response.message || options?.message || "Repository source tasks started.");
+      return response;
+    },
+    [],
+  );
+
   const resetJobScopedState = useCallback(() => {
     setProcessingJobId(null);
     setSourceTaskJobId(null);
@@ -322,7 +378,8 @@ export function AppStateProvider({ children }: PropsWithChildren) {
     setSourcePolling(false);
     setProcessingError("");
     setSourceError("");
-  }, []);
+    clearSourceTaskQueue();
+  }, [clearSourceTaskQueue]);
 
   const loadRepoSettings = useCallback(async () => {
     try {
@@ -962,14 +1019,7 @@ export function AppStateProvider({ children }: PropsWithChildren) {
         project_profile_name:
           sourceTaskDraft.project_profile_name || settingsDraft.default_project_profile_name,
         run_download: Boolean(sourceTaskDraft.run_download || sourceTaskDraft.force_redownload),
-        run_catalog: Boolean(
-          sourceTaskDraft.run_catalog ||
-            sourceTaskDraft.force_catalog ||
-            sourceTaskDraft.run_llm_title ||
-            sourceTaskDraft.force_title ||
-            sourceTaskDraft.run_citation_verify ||
-            sourceTaskDraft.force_citation_verify,
-        ),
+        run_catalog: Boolean(sourceTaskDraft.run_catalog || sourceTaskDraft.force_catalog),
         run_citation_verify: Boolean(
           sourceTaskDraft.run_citation_verify || sourceTaskDraft.force_citation_verify,
         ),
@@ -1017,24 +1067,59 @@ export function AppStateProvider({ children }: PropsWithChildren) {
         run_llm_rating: normalizedPayload.run_llm_rating,
       }));
       try {
-        const response = await api.startRepositorySourceTasks({
+        clearSourceTaskQueue();
+        const response = await startSingleSourceTaskJob(
+          {
           ...normalizedPayload,
           rerun_failed_only: rerunFailedOnly,
-        });
-        setSourceTaskJobId(response.job_id || null);
-        setSourcePolling(true);
+          },
+          {
+            message: "Repository source tasks started.",
+          },
+        );
         setRepoMessage(response.message || "Repository source tasks started.");
       } catch (error) {
         setSourceError(String((error as Error).message || "Failed to start source tasks"));
       }
     },
-    [repositoryStatus?.attached, setSourceTaskDraft, settingsDraft.default_project_profile_name, sourceTaskDraft],
+    [
+      clearSourceTaskQueue,
+      repositoryStatus?.attached,
+      setSourceTaskDraft,
+      settingsDraft.default_project_profile_name,
+      sourceTaskDraft,
+      startSingleSourceTaskJob,
+    ],
+  );
+
+  const startSourceTaskQueue = useCallback(
+    async (
+      tasks: Array<{ label: string; payload: RepositorySourceTaskRequest }>,
+      message = "",
+    ) => {
+      if (tasks.length === 0) {
+        return;
+      }
+      clearSourceTaskQueue();
+      setSourceError("");
+      setSourceStatus(null);
+      setSourceTaskQueue(tasks.slice(1));
+      setSourceTaskQueueActiveLabel(tasks[0].label);
+      setSourceTaskQueueCompletedCount(0);
+      setSourceTaskQueueTotalCount(tasks.length);
+      await startSingleSourceTaskJob(tasks[0].payload, {
+        label: tasks[0].label,
+        message,
+      });
+    },
+    [clearSourceTaskQueue, startSingleSourceTaskJob],
   );
 
   const cancelSourceTasks = useCallback(async () => {
     if (!sourceTaskJobId) return;
     setSourceError("");
     try {
+      clearPendingSourceTaskQueue();
       const response = await api.cancelSourceDownload(sourceTaskJobId);
       if (response.status === "cancelling") {
         setSourceStatus((prev) =>
@@ -1054,16 +1139,17 @@ export function AppStateProvider({ children }: PropsWithChildren) {
     } catch (error) {
       setSourceError(String((error as Error).message || "Failed to cancel source tasks"));
     }
-  }, [sourceTaskJobId]);
+  }, [clearPendingSourceTaskQueue, sourceTaskJobId]);
 
   const trackSourceTaskJob = useCallback((jobId: string | null, message = "") => {
+    clearSourceTaskQueue();
     setSourceTaskJobId(jobId);
     setSourceStatus(null);
     setSourcePolling(Boolean(jobId));
     if (message) {
       setRepoMessage(message);
     }
-  }, []);
+  }, [clearSourceTaskQueue]);
 
   const saveRepoSettings = useCallback(async (nextSettings?: RepoSettings) => {
     if (!repoLoaded) return;
@@ -1207,20 +1293,71 @@ export function AppStateProvider({ children }: PropsWithChildren) {
   useEffect(() => {
     if (!sourceQuery.data) return;
     setSourceStatus(sourceQuery.data);
-    if (
+    const isTerminal =
       sourceQuery.data.state === "completed" ||
       sourceQuery.data.state === "failed" ||
-      sourceQuery.data.state === "cancelled"
-    ) {
-      setSourcePolling(false);
+      sourceQuery.data.state === "cancelled";
+    if (!isTerminal) {
+      return;
+    }
+    if (handledTerminalSourceJobsRef.current.has(sourceQuery.data.job_id)) {
+      return;
+    }
+    handledTerminalSourceJobsRef.current.add(sourceQuery.data.job_id);
+    setSourcePolling(false);
+
+    const hadQueue =
+      sourceTaskQueueTotalCount > 0 || Boolean(sourceTaskQueueActiveLabel);
+    const nextCompletedCount = hadQueue
+      ? Math.min(
+          sourceTaskQueueCompletedCount + 1,
+          Math.max(sourceTaskQueueTotalCount, sourceTaskQueueCompletedCount + 1),
+        )
+      : 0;
+
+    if (hadQueue) {
+      setSourceTaskQueueCompletedCount(nextCompletedCount);
+    }
+
+    const finalize = async () => {
+      await refreshDashboard().catch(() => {
+        // ignored
+      });
+
+      if (sourceQuery.data.state !== "cancelled" && sourceTaskQueue.length > 0) {
+        const [nextTask, ...remaining] = sourceTaskQueue;
+        setSourceTaskQueue(remaining);
+        try {
+          await startSingleSourceTaskJob(nextTask.payload, {
+            label: nextTask.label,
+            message: `Running ${nextTask.label}.`,
+          });
+        } catch (error) {
+          clearSourceTaskQueue();
+          setSourceError(String((error as Error).message || "Failed to start queued source tasks"));
+        }
+        return;
+      }
+
       if (sourceQuery.data.state === "cancelled" && sourceQuery.data.message) {
         setRepoMessage(sourceQuery.data.message);
       }
-      refreshDashboard().catch(() => {
-        // ignored
-      });
-    }
-  }, [sourceQuery.data, refreshDashboard]);
+      if (hadQueue) {
+        clearSourceTaskQueue();
+      }
+    };
+
+    void finalize();
+  }, [
+    clearSourceTaskQueue,
+    refreshDashboard,
+    sourceQuery.data,
+    sourceTaskQueue,
+    sourceTaskQueueActiveLabel,
+    sourceTaskQueueCompletedCount,
+    sourceTaskQueueTotalCount,
+    startSingleSourceTaskJob,
+  ]);
 
   useEffect(() => {
     const loadLastRepoPath = async () => {
@@ -1295,6 +1432,9 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       processingRunning,
       sourceRunning,
       sourceStopping,
+      sourceTaskQueueActiveLabel,
+      sourceTaskQueueCompletedCount,
+      sourceTaskQueueTotalCount,
       pickRepositoryDirectory,
       openRepository,
       createRepository,
@@ -1312,6 +1452,7 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       startProcessing,
       reprocessStoredDocuments,
       runSourceTasks,
+      startSourceTaskQueue,
       trackSourceTaskJob,
       cancelSourceTasks,
       saveRepoSettings,
@@ -1363,6 +1504,9 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       processingRunning,
       sourceRunning,
       sourceStopping,
+      sourceTaskQueueActiveLabel,
+      sourceTaskQueueCompletedCount,
+      sourceTaskQueueTotalCount,
       pickRepositoryDirectory,
       openRepository,
       createRepository,
@@ -1380,6 +1524,7 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       startProcessing,
       reprocessStoredDocuments,
       runSourceTasks,
+      startSourceTaskQueue,
       trackSourceTaskJob,
       cancelSourceTasks,
       saveRepoSettings,

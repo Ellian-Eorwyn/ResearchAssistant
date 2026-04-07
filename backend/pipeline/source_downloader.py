@@ -100,9 +100,21 @@ NOTE_VISUAL_CAPTURE_FAILED = "visual_capture_failed"
 NOTE_VISUAL_CAPTURE_SEGMENTED = "visual_capture_segmented"
 PHASE_FETCH = "fetch"
 PHASE_CONVERT = "convert"
+PHASE_CLEANUP = "cleanup"
+PHASE_TITLE = "title"
 PHASE_CATALOG = "catalog"
-PHASE_TAG = "tag"
-PHASE_SUMMARIZE = "summarize"
+PHASE_CITATION_VERIFY = "citation_verify"
+PHASE_SUMMARY = "summary"
+PHASE_RATING = "rating"
+
+LEGACY_PHASE_ALIASES = {
+    "summarize": PHASE_SUMMARY,
+    "tag": PHASE_RATING,
+}
+PHASE_METADATA_ALIASES = {
+    PHASE_SUMMARY: ("summarize",),
+    PHASE_RATING: ("tag",),
+}
 
 PROMPT_VERSION_CLEANUP = "source_markdown_cleanup.v1"
 PROMPT_VERSION_CATALOG = "source_catalog.v1"
@@ -404,6 +416,67 @@ def run_async_in_sync(
     return result["value"]
 
 
+def _normalize_phase_name(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return ""
+    return LEGACY_PHASE_ALIASES.get(normalized, normalized)
+
+
+def _get_phase_metadata(
+    row: SourceManifestRow,
+    phase: str,
+) -> SourcePhaseMetadata | None:
+    canonical = _normalize_phase_name(phase)
+    metadata = row.phase_metadata.get(canonical)
+    if metadata is not None:
+        if metadata.phase != canonical:
+            metadata.phase = canonical
+            row.phase_metadata[canonical] = metadata
+        return metadata
+    for alias in PHASE_METADATA_ALIASES.get(canonical, ()):
+        metadata = row.phase_metadata.get(alias)
+        if metadata is None:
+            continue
+        metadata.phase = canonical
+        row.phase_metadata[canonical] = metadata
+        return metadata
+    return None
+
+
+def _set_phase_metadata(
+    row: SourceManifestRow,
+    phase: str,
+    metadata: SourcePhaseMetadata,
+) -> None:
+    canonical = _normalize_phase_name(phase)
+    metadata.phase = canonical
+    row.phase_metadata[canonical] = metadata
+
+
+def _normalize_row_phase_metadata(row: SourceManifestRow) -> SourceManifestRow:
+    if not row.phase_metadata:
+        return row
+    updates: dict[str, SourcePhaseMetadata] = {}
+    removals: list[str] = []
+    for key, metadata in row.phase_metadata.items():
+        canonical = _normalize_phase_name(key)
+        if canonical == key:
+            if metadata.phase != canonical:
+                metadata.phase = canonical
+            continue
+        if canonical in row.phase_metadata or canonical in updates:
+            removals.append(key)
+            continue
+        metadata.phase = canonical
+        updates[canonical] = metadata
+        removals.append(key)
+    for key in removals:
+        row.phase_metadata.pop(key, None)
+    row.phase_metadata.update(updates)
+    return row
+
+
 class PlaywrightRenderer:
     """Lazily initialized Playwright HTML renderer."""
 
@@ -581,7 +654,7 @@ class SourceDownloadOrchestrator:
         self.fetch_delay = max(1.0, min(10.0, fetch_delay))
         self.force_redownload = bool(force_redownload)
         self.force_convert = bool(force_convert)
-        self.force_catalog = bool(force_catalog or force_title)
+        self.force_catalog = bool(force_catalog)
         self.force_citation_verify = bool(force_citation_verify)
         self.force_llm_cleanup = bool(force_llm_cleanup)
         self.force_title = bool(force_title)
@@ -591,16 +664,17 @@ class SourceDownloadOrchestrator:
         self.run_download = bool(run_download or self.force_redownload)
         self.run_convert = bool(run_convert or (self.run_download and self.output_options.include_markdown))
         self.run_citation_verify = bool(run_citation_verify or self.force_citation_verify)
-        self.run_catalog = bool(
-            run_catalog or self.force_catalog or run_llm_title or self.run_citation_verify
-        )
+        self.run_catalog = bool(run_catalog or self.force_catalog)
         self.run_llm_cleanup = bool(run_llm_cleanup or self.force_llm_cleanup)
         self.run_llm_title = bool(run_llm_title or self.force_title)
         self.run_llm_summary = bool(run_llm_summary or self.force_summary)
         self.run_llm_rating = bool(run_llm_rating or self.force_rating)
         self.project_profile_name = (project_profile_name or "").strip()
         self.project_profile_yaml = (project_profile_yaml or "").strip()
-        self.target_rows = [row.model_copy(deep=True) for row in (target_rows or [])]
+        self.target_rows = [
+            _normalize_row_phase_metadata(row.model_copy(deep=True))
+            for row in (target_rows or [])
+        ]
         self.execution_output_dir = self.store.get_sources_output_dir(job_id)
         self.output_dir = output_dir or self.execution_output_dir
         self.writes_to_repository = bool(writes_to_repository)
@@ -608,9 +682,19 @@ class SourceDownloadOrchestrator:
         self.selected_scope = (selected_scope or "").strip()
         self.selected_import_id = (selected_import_id or "").strip()
         self.selected_phases = [
-            phase
+            normalized_phase
             for phase in (selected_phases or [])
-            if phase in {PHASE_FETCH, PHASE_CONVERT, PHASE_CATALOG, PHASE_TAG, PHASE_SUMMARIZE}
+            if (normalized_phase := _normalize_phase_name(phase))
+            in {
+                PHASE_FETCH,
+                PHASE_CONVERT,
+                PHASE_CLEANUP,
+                PHASE_TITLE,
+                PHASE_CATALOG,
+                PHASE_CITATION_VERIFY,
+                PHASE_SUMMARY,
+                PHASE_RATING,
+            }
         ]
         self.row_persist_callback = row_persist_callback
         self.logs_dir = self.execution_output_dir / "logs"
@@ -662,12 +746,18 @@ class SourceDownloadOrchestrator:
             phases.append(PHASE_FETCH)
         if self.run_convert:
             phases.append(PHASE_CONVERT)
+        if self.run_llm_cleanup:
+            phases.append(PHASE_CLEANUP)
+        if self.run_llm_title:
+            phases.append(PHASE_TITLE)
         if self.run_catalog:
             phases.append(PHASE_CATALOG)
-        if self.run_llm_rating:
-            phases.append(PHASE_TAG)
+        if self.run_citation_verify:
+            phases.append(PHASE_CITATION_VERIFY)
         if self.run_llm_summary:
-            phases.append(PHASE_SUMMARIZE)
+            phases.append(PHASE_SUMMARY)
+        if self.run_llm_rating:
+            phases.append(PHASE_RATING)
         return phases
 
     def _initial_phase_states(self) -> dict[str, SourcePhaseMetadata]:
@@ -1044,7 +1134,7 @@ class SourceDownloadOrchestrator:
         rows: list[SourceManifestRow] = []
         for raw in previous.get("rows", []):
             try:
-                rows.append(SourceManifestRow.model_validate(raw))
+                rows.append(_normalize_row_phase_metadata(SourceManifestRow.model_validate(raw)))
             except Exception:
                 continue
         return rows
@@ -1074,14 +1164,14 @@ class SourceDownloadOrchestrator:
             phase_bits.append("download")
         if self.run_convert:
             phase_bits.append("convert")
+        if self.run_llm_cleanup:
+            phase_bits.append("cleanup")
+        if self.run_llm_title:
+            phase_bits.append("title")
         if self.run_catalog:
             phase_bits.append("catalog")
         if self.run_citation_verify:
             phase_bits.append("citation verify")
-        if self.run_llm_cleanup:
-            phase_bits.append("llm cleanup")
-        if self.run_llm_title:
-            phase_bits.append("title alias")
         if self.run_llm_summary:
             phase_bits.append("summary")
         if self.run_llm_rating:
@@ -1199,8 +1289,9 @@ class SourceDownloadOrchestrator:
         profile_name: str = "",
         prompt_version: str = "",
     ) -> None:
-        metadata = row.phase_metadata.get(phase) or SourcePhaseMetadata(phase=phase)
-        metadata.phase = phase
+        canonical = _normalize_phase_name(phase)
+        metadata = _get_phase_metadata(row, canonical) or SourcePhaseMetadata(phase=canonical)
+        metadata.phase = canonical
         metadata.status = "running"
         metadata.error = ""
         metadata.error_code = ""
@@ -1212,7 +1303,7 @@ class SourceDownloadOrchestrator:
             metadata.profile_name = profile_name
         if prompt_version:
             metadata.prompt_version = prompt_version
-        row.phase_metadata[phase] = metadata
+        _set_phase_metadata(row, canonical, metadata)
 
     def _complete_row_phase(
         self,
@@ -1228,8 +1319,9 @@ class SourceDownloadOrchestrator:
         profile_name: str = "",
         prompt_version: str = "",
     ) -> None:
-        metadata = row.phase_metadata.get(phase) or SourcePhaseMetadata(phase=phase)
-        metadata.phase = phase
+        canonical = _normalize_phase_name(phase)
+        metadata = _get_phase_metadata(row, canonical) or SourcePhaseMetadata(phase=canonical)
+        metadata.phase = canonical
         metadata.status = status
         metadata.error = error
         metadata.error_code = error_code
@@ -1245,29 +1337,42 @@ class SourceDownloadOrchestrator:
             metadata.profile_name = profile_name
         if prompt_version:
             metadata.prompt_version = prompt_version
-        row.phase_metadata[phase] = metadata
+        _set_phase_metadata(row, canonical, metadata)
 
     def _mark_downstream_stale(self, row: SourceManifestRow, markdown_digest: str) -> None:
         for phase, status_field in (
+            (PHASE_CLEANUP, "llm_cleanup_status"),
+            (PHASE_TITLE, "title_status"),
             (PHASE_CATALOG, "catalog_status"),
-            (PHASE_SUMMARIZE, "summary_status"),
-            (PHASE_TAG, "rating_status"),
+            (PHASE_CITATION_VERIFY, ""),
+            (PHASE_SUMMARY, "summary_status"),
+            (PHASE_RATING, "rating_status"),
         ):
-            metadata = row.phase_metadata.get(phase)
+            metadata = _get_phase_metadata(row, phase)
             if metadata is None:
                 continue
             if not metadata.content_digest or metadata.content_digest == markdown_digest:
                 metadata.stale = False
-                row.phase_metadata[phase] = metadata
+                _set_phase_metadata(row, phase, metadata)
                 continue
             metadata.status = "stale"
             metadata.stale = True
             metadata.completed_at = _utc_now_iso()
-            row.phase_metadata[phase] = metadata
-            setattr(row, status_field, "stale")
+            _set_phase_metadata(row, phase, metadata)
+            if status_field:
+                setattr(row, status_field, "stale")
 
     def _effective_markdown_rel_path(self, row: SourceManifestRow) -> str:
-        if row.llm_cleanup_file and _has_output_file(self.output_dir, row.llm_cleanup_file):
+        cleanup_metadata = _get_phase_metadata(row, PHASE_CLEANUP)
+        cleanup_is_current = not (
+            cleanup_metadata is not None
+            and (cleanup_metadata.stale or str(cleanup_metadata.status or "").strip().lower() == "stale")
+        )
+        if (
+            cleanup_is_current
+            and row.llm_cleanup_file
+            and _has_output_file(self.output_dir, row.llm_cleanup_file)
+        ):
             return row.llm_cleanup_file
         return row.markdown_file
 
@@ -1379,12 +1484,18 @@ class SourceDownloadOrchestrator:
         }
         if self.run_convert:
             self._set_phase_state(PHASE_CONVERT, "running")
+        if self.run_llm_cleanup:
+            self._set_phase_state(PHASE_CLEANUP, "running")
+        if self.run_llm_title:
+            self._set_phase_state(PHASE_TITLE, "running")
         if self.run_catalog:
             self._set_phase_state(PHASE_CATALOG, "running")
+        if self.run_citation_verify:
+            self._set_phase_state(PHASE_CITATION_VERIFY, "running")
         if self.run_llm_summary:
-            self._set_phase_state(PHASE_SUMMARIZE, "running")
+            self._set_phase_state(PHASE_SUMMARY, "running")
         if self.run_llm_rating:
-            self._set_phase_state(PHASE_TAG, "running")
+            self._set_phase_state(PHASE_RATING, "running")
         return self._finalize_row(
             row=row,
             notes=notes,
@@ -1643,12 +1754,18 @@ class SourceDownloadOrchestrator:
             )
             if self.run_convert:
                 self._set_phase_state(PHASE_CONVERT, "running")
+            if self.run_llm_cleanup:
+                self._set_phase_state(PHASE_CLEANUP, "running")
+            if self.run_llm_title:
+                self._set_phase_state(PHASE_TITLE, "running")
             if self.run_catalog:
                 self._set_phase_state(PHASE_CATALOG, "running")
+            if self.run_citation_verify:
+                self._set_phase_state(PHASE_CITATION_VERIFY, "running")
             if self.run_llm_summary:
-                self._set_phase_state(PHASE_SUMMARIZE, "running")
+                self._set_phase_state(PHASE_SUMMARY, "running")
             if self.run_llm_rating:
-                self._set_phase_state(PHASE_TAG, "running")
+                self._set_phase_state(PHASE_RATING, "running")
             return self._finalize_row(row, notes, event, update_fetched_at=False)
 
         normalized_url, url_error = normalize_url(target.original_url)
@@ -1739,12 +1856,18 @@ class SourceDownloadOrchestrator:
         )
         if self.run_convert:
             self._set_phase_state(PHASE_CONVERT, "running")
+        if self.run_llm_cleanup:
+            self._set_phase_state(PHASE_CLEANUP, "running")
+        if self.run_llm_title:
+            self._set_phase_state(PHASE_TITLE, "running")
         if self.run_catalog:
             self._set_phase_state(PHASE_CATALOG, "running")
+        if self.run_citation_verify:
+            self._set_phase_state(PHASE_CITATION_VERIFY, "running")
         if self.run_llm_summary:
-            self._set_phase_state(PHASE_SUMMARIZE, "running")
+            self._set_phase_state(PHASE_SUMMARY, "running")
         if self.run_llm_rating:
-            self._set_phase_state(PHASE_TAG, "running")
+            self._set_phase_state(PHASE_RATING, "running")
 
         return self._finalize_row(row, notes, event)
 
@@ -2109,14 +2232,20 @@ class SourceDownloadOrchestrator:
             row.fetched_at = _utc_now_iso()
 
         previous_convert_digest = ""
-        if row.phase_metadata.get(PHASE_CONVERT) is not None:
-            previous_convert_digest = row.phase_metadata[PHASE_CONVERT].content_digest
+        convert_metadata = _get_phase_metadata(row, PHASE_CONVERT)
+        if convert_metadata is not None:
+            previous_convert_digest = convert_metadata.content_digest
 
         if self.run_convert:
             self._begin_row_phase(row, PHASE_CONVERT, prompt_version="convert.pipeline.v1")
             self._generate_markdown_from_existing_artifacts(row, notes)
-            self._generate_markdown_cleanup(row, notes)
-            current_markdown_digest = self._effective_markdown_digest(row)
+            current_markdown_digest = ""
+            if row.markdown_file:
+                markdown_text = self._read_text(Path(row.markdown_file))
+                if markdown_text.strip():
+                    current_markdown_digest = hashlib.sha256(
+                        markdown_text.encode("utf-8")
+                    ).hexdigest()
             convert_error = ""
             convert_error_code = ""
             convert_status = "completed"
@@ -2124,10 +2253,6 @@ class SourceDownloadOrchestrator:
                 convert_status = "failed"
                 convert_error = row.error_message or "convert_missing_prerequisite: no markdown available"
                 convert_error_code = _phase_error_code(convert_error) or "convert_missing_prerequisite"
-            elif self.run_llm_cleanup and row.llm_cleanup_status == "failed":
-                convert_status = "failed"
-                convert_error = "llm_cleanup_failed: cleanup did not produce usable markdown"
-                convert_error_code = "llm_cleanup_failed"
             self._complete_row_phase(
                 row,
                 PHASE_CONVERT,
@@ -2140,9 +2265,82 @@ class SourceDownloadOrchestrator:
             if current_markdown_digest:
                 self._mark_downstream_stale(row, current_markdown_digest)
             if previous_convert_digest and current_markdown_digest and previous_convert_digest == current_markdown_digest:
-                row.phase_metadata[PHASE_CONVERT].stale = False
+                current_metadata = _get_phase_metadata(row, PHASE_CONVERT)
+                if current_metadata is not None:
+                    current_metadata.stale = False
+                    _set_phase_metadata(row, PHASE_CONVERT, current_metadata)
+
+        if self.run_llm_cleanup:
+            self._begin_row_phase(
+                row,
+                PHASE_CLEANUP,
+                model=self.llm_backend.model,
+                prompt_version=PROMPT_VERSION_CLEANUP,
+            )
+        self._generate_markdown_cleanup(row, notes)
+        if self.run_llm_cleanup:
+            cleanup_digest = self._effective_markdown_digest(row)
+            cleanup_status = _phase_completion_status(
+                row.llm_cleanup_status,
+                success={"cleaned", "not_needed", "existing"},
+                failed={"failed", "missing_markdown"},
+                skipped={"not_requested"},
+            )
+            cleanup_error = ""
+            cleanup_error_code = ""
+            if cleanup_status == "failed":
+                cleanup_error = (
+                    row.error_message
+                    or f"{row.llm_cleanup_status or 'llm_cleanup_failed'}: cleanup failed"
+                )
+                cleanup_error_code = _phase_error_code(cleanup_error)
+            elif cleanup_status == "skipped":
+                cleanup_digest = cleanup_digest or self._effective_markdown_digest(row)
+            self._complete_row_phase(
+                row,
+                PHASE_CLEANUP,
+                status=cleanup_status,
+                content_digest=cleanup_digest,
+                error=cleanup_error,
+                error_code=cleanup_error_code,
+                model=self.llm_backend.model if cleanup_status == "completed" else "",
+                prompt_version=PROMPT_VERSION_CLEANUP,
+            )
+
+        if self.run_llm_title:
+            self._begin_row_phase(
+                row,
+                PHASE_TITLE,
+                model=self.llm_backend.model,
+                prompt_version=PROMPT_VERSION_TITLE,
+            )
+        self._generate_source_title(row, notes)
+        if self.run_llm_title:
+            title_digest = self._effective_markdown_digest(row)
+            title_phase_status = _phase_completion_status(
+                row.title_status,
+                success={"existing", "extracted", "generated"},
+                failed={"failed", "missing_markdown"},
+                skipped={"not_requested"},
+            )
+            title_error = ""
+            title_error_code = ""
+            if title_phase_status == "failed":
+                title_error = row.error_message or f"{row.title_status or 'title_generation_failed'}: title generation failed"
+                title_error_code = _phase_error_code(title_error)
+            self._complete_row_phase(
+                row,
+                PHASE_TITLE,
+                status=title_phase_status,
+                content_digest=title_digest,
+                error=title_error,
+                error_code=title_error_code,
+                model=self.llm_backend.model if row.title_status == "generated" else "",
+                prompt_version=PROMPT_VERSION_TITLE,
+            )
 
         self._generate_source_catalog(row, notes)
+        self._generate_source_citation_verification(row, notes)
         self._generate_source_summary(row, notes)
         self._generate_source_rating(row, notes)
         row.notes = "; ".join(dict.fromkeys(n for n in notes if n))
@@ -2285,40 +2483,59 @@ class SourceDownloadOrchestrator:
             notes.append(NOTE_LLM_CLEANUP_FAILED)
             logger.warning("Markdown cleanup failed for %s: %s", row.id, exc)
 
+    def _base_catalog_payload(
+        self,
+        row: SourceManifestRow,
+        existing_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = dict(existing_payload or {})
+        payload.update(
+            {
+                "title": row.title,
+                "title_status": row.title_status,
+                "author_names": row.author_names,
+                "publication_date": row.publication_date,
+                "publication_year": row.publication_year,
+                "document_type": row.document_type,
+                "organization_name": row.organization_name,
+                "organization_type": row.organization_type,
+                "source_kind": row.source_kind,
+            }
+        )
+        return payload
+
+    def _write_catalog_payload(
+        self,
+        row: SourceManifestRow,
+        payload: dict[str, Any],
+    ) -> None:
+        catalog_rel = self._catalog_rel(row)
+        self._write_text(
+            catalog_rel,
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        )
+        row.catalog_file = catalog_rel.as_posix()
+
     def _generate_source_catalog(
         self,
         row: SourceManifestRow,
         notes: list[str],
     ) -> None:
-        should_run_catalog = bool(self.run_catalog or self.run_llm_title or self.force_catalog or self.force_title)
-        should_run_catalog = bool(
-            should_run_catalog or self.run_citation_verify or self.force_citation_verify
-        )
-        if not should_run_catalog:
-            if row.catalog_file and _has_output_file(self.output_dir, row.catalog_file):
-                row.catalog_status = row.catalog_status or "existing"
-            elif not row.catalog_status:
+        if not self.run_catalog:
+            if not row.catalog_status and not str(row.catalog_file or "").strip():
                 row.catalog_status = "not_requested"
-            if row.title:
-                row.title_status = row.title_status or "existing"
-            elif not row.title_status:
-                row.title_status = "not_requested"
             return
 
         source_digest = self._effective_markdown_digest(row)
         existing_catalog_payload = _load_manifest_json(self.output_dir, row.catalog_file)
-        existing_citation = _coerce_citation_metadata(existing_catalog_payload.get("citation"))
         self._begin_row_phase(
             row,
             PHASE_CATALOG,
-            model=self.llm_backend.model,
             prompt_version=PROMPT_VERSION_CATALOG,
         )
         catalog_source_path = self._effective_markdown_rel_path(row)
         if not catalog_source_path or not source_digest:
             row.catalog_status = "missing_markdown"
-            if not row.title_status:
-                row.title_status = "missing_markdown"
             self._complete_row_phase(
                 row,
                 PHASE_CATALOG,
@@ -2329,34 +2546,21 @@ class SourceDownloadOrchestrator:
             )
             return
 
-        citation_verification_requested = bool(
-            self.run_citation_verify or self.force_citation_verify
-        )
-
         if (
             row.catalog_file
             and not self.force_catalog
-            and not self.force_title
-            and not self.force_citation_verify
             and _has_output_file(self.output_dir, row.catalog_file)
-            and row.phase_metadata.get(PHASE_CATALOG) is not None
-            and row.phase_metadata[PHASE_CATALOG].content_digest == source_digest
-            and (
-                not citation_verification_requested
-                or _citation_verification_is_current(existing_citation, source_digest)
-            )
+            and (catalog_metadata := _get_phase_metadata(row, PHASE_CATALOG)) is not None
+            and catalog_metadata.content_digest == source_digest
         ):
             if isinstance(existing_catalog_payload, dict):
                 _merge_catalog_payload_into_row(row, existing_catalog_payload, overwrite_existing=False)
             row.catalog_status = "existing"
-            if row.title:
-                row.title_status = row.title_status or "existing"
             self._complete_row_phase(
                 row,
                 PHASE_CATALOG,
                 status="completed",
                 content_digest=source_digest,
-                model=self.llm_backend.model,
                 prompt_version=PROMPT_VERSION_CATALOG,
             )
             return
@@ -2364,8 +2568,6 @@ class SourceDownloadOrchestrator:
         markdown_text = self._read_text(Path(catalog_source_path))
         if not markdown_text.strip():
             row.catalog_status = "missing_markdown"
-            if not row.title_status:
-                row.title_status = "missing_markdown"
             self._complete_row_phase(
                 row,
                 PHASE_CATALOG,
@@ -2382,13 +2584,27 @@ class SourceDownloadOrchestrator:
             markdown_text=markdown_text,
             html_text=catalog_html_text,
         )
+        catalog_updates = {
+            key: deterministic.get(key)
+            for key in (
+                "author_names",
+                "publication_date",
+                "publication_year",
+                "document_type",
+                "organization_name",
+                "organization_type",
+            )
+        }
+        _merge_catalog_payload_into_row(
+            row,
+            catalog_updates,
+            overwrite_existing=bool(self.force_catalog),
+        )
         current_citation = _coerce_citation_metadata(deterministic.get("citation"))
         doi_citation = CitationMetadata()
         if current_citation.doi:
             doi_citation = _resolve_doi_citation_metadata(current_citation.doi)
             current_citation = _merge_citation_metadata(current_citation, doi_citation)
-        _merge_catalog_payload_into_row(row, deterministic, overwrite_existing=bool(self.force_catalog))
-        self._generate_source_title(row, notes)
         current_citation = _merge_citation_metadata(
             current_citation,
             {
@@ -2402,7 +2618,7 @@ class SourceDownloadOrchestrator:
                 "item_type": row.document_type,
                 "url": row.original_url or row.final_url,
             },
-            overwrite_existing=bool(self.force_catalog or self.force_title),
+            overwrite_existing=bool(self.force_catalog),
         )
         current_citation.verification_status = "candidate"
         current_citation.verification_content_digest = source_digest
@@ -2418,22 +2634,126 @@ class SourceDownloadOrchestrator:
             deterministic_citation=current_citation,
             doi_registry_citation=doi_citation,
         )
-        llm_used = False
-        llm_error = ""
-        if citation_verification_requested:
-            verified_citation, llm_used, llm_error = self._verify_citation_with_llm(
-                row=row,
-                markdown_text=markdown_text,
-                source_digest=source_digest,
-                candidate_payload=candidate_payload,
-                base_citation=current_citation,
+        catalog_payload = self._base_catalog_payload(row, existing_catalog_payload)
+        catalog_payload["evidence_snippets"] = deterministic.get("evidence_snippets", [])
+        catalog_payload["citation_candidates"] = candidate_payload
+        existing_citation = existing_catalog_payload.get("citation")
+        if existing_citation:
+            catalog_payload["citation"] = existing_citation
+        self._write_catalog_payload(row, catalog_payload)
+        row.catalog_status = "generated"
+        self._complete_row_phase(
+            row,
+            PHASE_CATALOG,
+            status="completed",
+            content_digest=source_digest,
+            prompt_version=PROMPT_VERSION_CATALOG,
+        )
+
+    def _generate_source_citation_verification(
+        self,
+        row: SourceManifestRow,
+        notes: list[str],
+    ) -> None:
+        if not self.run_citation_verify:
+            return
+
+        source_digest = self._effective_markdown_digest(row)
+        existing_catalog_payload = _load_manifest_json(self.output_dir, row.catalog_file)
+        existing_citation = _coerce_citation_metadata(existing_catalog_payload.get("citation"))
+        self._begin_row_phase(
+            row,
+            PHASE_CITATION_VERIFY,
+            model=self.llm_backend.model,
+            prompt_version=PROMPT_VERSION_CITATION_VERIFY,
+        )
+        citation_source_path = self._effective_markdown_rel_path(row)
+        if not citation_source_path or not source_digest:
+            self._complete_row_phase(
+                row,
+                PHASE_CITATION_VERIFY,
+                status="failed",
+                error="missing_markdown: no markdown available for citation verification",
+                error_code="missing_markdown",
+                prompt_version=PROMPT_VERSION_CITATION_VERIFY,
             )
-        elif _citation_verification_is_current(existing_citation, source_digest):
-            verified_citation = existing_citation.model_copy(deep=True)
-        else:
-            verified_citation = current_citation.model_copy(deep=True)
-            verified_citation.verification_status = "candidate"
-            verified_citation.verification_content_digest = source_digest
+            return
+
+        if (
+            row.catalog_file
+            and not self.force_citation_verify
+            and _has_output_file(self.output_dir, row.catalog_file)
+            and _citation_verification_is_current(existing_citation, source_digest)
+        ):
+            self._complete_row_phase(
+                row,
+                PHASE_CITATION_VERIFY,
+                status="completed",
+                content_digest=source_digest,
+                model=self.llm_backend.model if existing_citation.verification_model else "",
+                prompt_version=PROMPT_VERSION_CITATION_VERIFY,
+            )
+            return
+
+        markdown_text = self._read_text(Path(citation_source_path))
+        if not markdown_text.strip():
+            self._complete_row_phase(
+                row,
+                PHASE_CITATION_VERIFY,
+                status="failed",
+                error="missing_markdown: empty markdown input",
+                error_code="missing_markdown",
+                prompt_version=PROMPT_VERSION_CITATION_VERIFY,
+            )
+            return
+
+        catalog_html_text = _read_catalog_html_input(row, read_text=self._read_text)
+        deterministic = _build_deterministic_catalog_metadata(
+            row=row,
+            markdown_text=markdown_text,
+            html_text=catalog_html_text,
+        )
+        current_citation = _coerce_citation_metadata(deterministic.get("citation"))
+        doi_citation = CitationMetadata()
+        if current_citation.doi:
+            doi_citation = _resolve_doi_citation_metadata(current_citation.doi)
+            current_citation = _merge_citation_metadata(current_citation, doi_citation)
+        current_citation = _merge_citation_metadata(
+            current_citation,
+            {
+                "title": row.title,
+                "authors": [
+                    author.model_dump(mode="json")
+                    for author in normalize_citation_authors(row.author_names)
+                ],
+                "issued": row.publication_date,
+                "publisher": row.organization_name,
+                "item_type": row.document_type,
+                "url": row.original_url or row.final_url,
+            },
+            overwrite_existing=False,
+        )
+        current_citation.verification_status = "candidate"
+        current_citation.verification_content_digest = source_digest
+        current_citation = _finalize_citation_metadata(current_citation)
+
+        candidate_payload = self._build_citation_candidate_payload(
+            row=row,
+            deterministic_metadata=deterministic,
+            html_metadata=extract_html_citation_metadata(
+                catalog_html_text,
+                base_url=row.original_url or row.final_url,
+            ),
+            deterministic_citation=current_citation,
+            doi_registry_citation=doi_citation,
+        )
+        verified_citation, llm_used, llm_error = self._verify_citation_with_llm(
+            row=row,
+            markdown_text=markdown_text,
+            source_digest=source_digest,
+            candidate_payload=candidate_payload,
+            base_citation=current_citation,
+        )
         verified_citation = _apply_citation_manual_overrides(verified_citation, existing_citation)
         if verified_citation.ready_for_ris and not verified_citation.verified_at:
             verified_citation.verified_at = _utc_now_iso()
@@ -2441,59 +2761,31 @@ class SourceDownloadOrchestrator:
             verified_citation.verification_content_digest = source_digest
         verified_citation = _finalize_citation_metadata(verified_citation)
 
-        _merge_catalog_payload_into_row(
-            row,
-            {"citation": verified_citation.model_dump(mode="json")},
-            overwrite_existing=False,
-        )
+        catalog_payload = self._base_catalog_payload(row, existing_catalog_payload)
+        if "evidence_snippets" not in catalog_payload:
+            catalog_payload["evidence_snippets"] = deterministic.get("evidence_snippets", [])
+        if "citation_candidates" not in catalog_payload:
+            catalog_payload["citation_candidates"] = candidate_payload
+        catalog_payload["citation"] = verified_citation.model_dump(mode="json")
+        self._write_catalog_payload(row, catalog_payload)
 
-        catalog_payload: dict[str, Any] = {
-            "title": row.title,
-            "title_status": row.title_status,
-            "author_names": row.author_names,
-            "publication_date": row.publication_date,
-            "publication_year": row.publication_year,
-            "document_type": row.document_type,
-            "organization_name": row.organization_name,
-            "organization_type": row.organization_type,
-            "source_kind": row.source_kind,
-            "evidence_snippets": deterministic.get("evidence_snippets", []),
-            "citation_candidates": candidate_payload,
-            "citation": verified_citation.model_dump(mode="json"),
-        }
-
-        catalog_payload.update(
-            {
-                "title": row.title,
-                "title_status": row.title_status,
-                "author_names": row.author_names,
-                "publication_date": row.publication_date,
-                "publication_year": row.publication_year,
-                "document_type": row.document_type,
-                "organization_name": row.organization_name,
-                "organization_type": row.organization_type,
-                "source_kind": row.source_kind,
-                "citation": verified_citation.model_dump(mode="json"),
-            }
-        )
-        catalog_rel = self._catalog_rel(row)
-        self._write_text(
-            catalog_rel,
-            json.dumps(catalog_payload, ensure_ascii=False, indent=2) + "\n",
-        )
-        row.catalog_file = catalog_rel.as_posix()
-        row.catalog_status = "generated"
         if llm_error:
             notes.append("citation_verification_failed")
+        citation_phase_status = "completed"
+        verification_status = str(verified_citation.verification_status or "").strip().lower()
+        if verification_status == "failed" or llm_error:
+            citation_phase_status = "failed"
+        elif verification_status.startswith("skipped"):
+            citation_phase_status = "skipped"
         self._complete_row_phase(
             row,
-            PHASE_CATALOG,
-            status="completed",
+            PHASE_CITATION_VERIFY,
+            status=citation_phase_status,
             content_digest=source_digest,
             error=llm_error,
             error_code=_phase_error_code(llm_error),
             model=self.llm_backend.model if llm_used else "",
-            prompt_version=PROMPT_VERSION_CITATION_VERIFY if llm_used else PROMPT_VERSION_CATALOG,
+            prompt_version=PROMPT_VERSION_CITATION_VERIFY,
         )
 
     def _build_citation_candidate_payload(
@@ -2627,9 +2919,12 @@ class SourceDownloadOrchestrator:
         row: SourceManifestRow,
         notes: list[str],
     ) -> None:
-        should_resolve_title = bool(
-            self.run_llm_title or self.run_catalog or self.force_catalog or self.force_title
-        )
+        def sync_catalog_title() -> None:
+            existing_catalog_payload = _load_manifest_json(self.output_dir, row.catalog_file)
+            catalog_payload = self._base_catalog_payload(row, existing_catalog_payload)
+            self._write_catalog_payload(row, catalog_payload)
+
+        should_resolve_title = bool(self.run_llm_title or self.force_title)
         if not should_resolve_title:
             if row.title:
                 row.title_status = row.title_status or "existing"
@@ -2637,8 +2932,9 @@ class SourceDownloadOrchestrator:
                 row.title_status = "not_requested"
             return
 
-        if row.title and not (self.force_title or self.force_catalog):
+        if row.title and not self.force_title:
             row.title_status = row.title_status or "existing"
+            sync_catalog_title()
             return
 
         title_source_path = ""
@@ -2660,6 +2956,7 @@ class SourceDownloadOrchestrator:
         if candidate_title:
             row.title = candidate_title
             row.title_status = "extracted"
+            sync_catalog_title()
             return
 
         if not self.use_llm:
@@ -2708,6 +3005,7 @@ class SourceDownloadOrchestrator:
                 generated_title = limit_title_words(generated_title, 10)
             row.title = generated_title
             row.title_status = "generated"
+            sync_catalog_title()
         except Exception as exc:
             notes.append(NOTE_TITLE_GENERATION_FAILED)
             row.title_status = "failed"
@@ -2728,7 +3026,7 @@ class SourceDownloadOrchestrator:
         source_digest = self._effective_markdown_digest(row)
         self._begin_row_phase(
             row,
-            PHASE_SUMMARIZE,
+            PHASE_SUMMARY,
             model=self.llm_backend.model,
             prompt_version=PROMPT_VERSION_SUMMARY,
         )
@@ -2737,7 +3035,7 @@ class SourceDownloadOrchestrator:
             row.summary_status = "missing_markdown"
             self._complete_row_phase(
                 row,
-                PHASE_SUMMARIZE,
+                PHASE_SUMMARY,
                 status="failed",
                 error="missing_markdown: no markdown available for summarization",
                 error_code="missing_markdown",
@@ -2748,7 +3046,7 @@ class SourceDownloadOrchestrator:
             row.summary_status = "failed"
             self._complete_row_phase(
                 row,
-                PHASE_SUMMARIZE,
+                PHASE_SUMMARY,
                 status="failed",
                 content_digest=source_digest,
                 error="llm_disabled: summarization requires an enabled LLM backend",
@@ -2761,7 +3059,7 @@ class SourceDownloadOrchestrator:
             notes.append(NOTE_SUMMARY_SKIPPED_LLM_NOT_CONFIGURED)
             self._complete_row_phase(
                 row,
-                PHASE_SUMMARIZE,
+                PHASE_SUMMARY,
                 status="failed",
                 content_digest=source_digest,
                 error="llm_not_configured: summarization requires a chat-capable model",
@@ -2773,13 +3071,13 @@ class SourceDownloadOrchestrator:
             row.summary_file
             and not self.force_summary
             and _has_output_file(self.output_dir, row.summary_file)
-            and row.phase_metadata.get(PHASE_SUMMARIZE) is not None
-            and row.phase_metadata[PHASE_SUMMARIZE].content_digest == source_digest
+            and (summary_metadata := _get_phase_metadata(row, PHASE_SUMMARY)) is not None
+            and summary_metadata.content_digest == source_digest
         ):
             row.summary_status = "existing"
             self._complete_row_phase(
                 row,
-                PHASE_SUMMARIZE,
+                PHASE_SUMMARY,
                 status="completed",
                 content_digest=source_digest,
                 model=self.llm_backend.model,
@@ -2792,7 +3090,7 @@ class SourceDownloadOrchestrator:
             row.summary_status = "missing_markdown"
             self._complete_row_phase(
                 row,
-                PHASE_SUMMARIZE,
+                PHASE_SUMMARY,
                 status="failed",
                 error="missing_markdown: empty markdown input",
                 error_code="missing_markdown",
@@ -2831,7 +3129,7 @@ class SourceDownloadOrchestrator:
             row.summary_status = "generated"
             self._complete_row_phase(
                 row,
-                PHASE_SUMMARIZE,
+                PHASE_SUMMARY,
                 status="completed",
                 content_digest=source_digest,
                 model=self.llm_backend.model,
@@ -2842,7 +3140,7 @@ class SourceDownloadOrchestrator:
             row.summary_status = "failed"
             self._complete_row_phase(
                 row,
-                PHASE_SUMMARIZE,
+                PHASE_SUMMARY,
                 status="failed",
                 content_digest=source_digest,
                 error=f"summary_generation_failed: {type(exc).__name__}: {exc}",
@@ -2868,7 +3166,7 @@ class SourceDownloadOrchestrator:
         source_digest = self._effective_markdown_digest(row)
         self._begin_row_phase(
             row,
-            PHASE_TAG,
+            PHASE_RATING,
             model=self.llm_backend.model,
             profile_name=self.project_profile_name,
             prompt_version=PROMPT_VERSION_RATING,
@@ -2877,7 +3175,7 @@ class SourceDownloadOrchestrator:
             row.rating_status = "failed"
             self._complete_row_phase(
                 row,
-                PHASE_TAG,
+                PHASE_RATING,
                 status="failed",
                 content_digest=source_digest,
                 error="missing_project_profile: rating requires a project profile",
@@ -2893,7 +3191,7 @@ class SourceDownloadOrchestrator:
             row.rating_status = "missing_markdown"
             self._complete_row_phase(
                 row,
-                PHASE_TAG,
+                PHASE_RATING,
                 status="failed",
                 error="missing_markdown: no markdown available for relevance tagging",
                 error_code="missing_markdown",
@@ -2906,7 +3204,7 @@ class SourceDownloadOrchestrator:
             row.rating_status = "failed"
             self._complete_row_phase(
                 row,
-                PHASE_TAG,
+                PHASE_RATING,
                 status="failed",
                 content_digest=source_digest,
                 error="llm_disabled: relevance tagging requires an enabled LLM backend",
@@ -2921,7 +3219,7 @@ class SourceDownloadOrchestrator:
             notes.append(NOTE_RATING_SKIPPED_LLM_NOT_CONFIGURED)
             self._complete_row_phase(
                 row,
-                PHASE_TAG,
+                PHASE_RATING,
                 status="failed",
                 content_digest=source_digest,
                 error="llm_not_configured: relevance tagging requires a chat-capable model",
@@ -2935,13 +3233,13 @@ class SourceDownloadOrchestrator:
             row.rating_file
             and not self.force_rating
             and _has_output_file(self.output_dir, row.rating_file)
-            and row.phase_metadata.get(PHASE_TAG) is not None
-            and row.phase_metadata[PHASE_TAG].content_digest == source_digest
+            and (rating_metadata := _get_phase_metadata(row, PHASE_RATING)) is not None
+            and rating_metadata.content_digest == source_digest
         ):
             row.rating_status = "existing"
             self._complete_row_phase(
                 row,
-                PHASE_TAG,
+                PHASE_RATING,
                 status="completed",
                 content_digest=source_digest,
                 model=self.llm_backend.model,
@@ -2955,7 +3253,7 @@ class SourceDownloadOrchestrator:
             row.rating_status = "missing_markdown"
             self._complete_row_phase(
                 row,
-                PHASE_TAG,
+                PHASE_RATING,
                 status="failed",
                 error="missing_markdown: empty markdown input",
                 error_code="missing_markdown",
@@ -3013,7 +3311,7 @@ class SourceDownloadOrchestrator:
             row.rating_status = "generated"
             self._complete_row_phase(
                 row,
-                PHASE_TAG,
+                PHASE_RATING,
                 status="completed",
                 content_digest=source_digest,
                 model=self.llm_backend.model,
@@ -3025,7 +3323,7 @@ class SourceDownloadOrchestrator:
             row.rating_status = "failed"
             self._complete_row_phase(
                 row,
-                PHASE_TAG,
+                PHASE_RATING,
                 status="failed",
                 content_digest=source_digest,
                 error=f"rating_generation_failed: {type(exc).__name__}: {exc}",
@@ -3350,12 +3648,12 @@ def _derive_manifest_fields(
     )
 
     base: dict[str, str | int | float | bool] = {
-        "title": row.title or _stringify_manifest_value(catalog_payload.get("title")) or citation.title,
-        "author_names": row.author_names or _stringify_manifest_value(catalog_payload.get("author_names")) or _citation_author_names(citation),
-        "publication_date": row.publication_date or _stringify_manifest_value(catalog_payload.get("publication_date")) or citation.issued,
-        "publication_year": row.publication_year or _stringify_manifest_value(catalog_payload.get("publication_year")) or _citation_publication_year(citation),
-        "document_type": row.document_type or _stringify_manifest_value(catalog_payload.get("document_type")) or citation.item_type,
-        "organization_name": row.organization_name or _stringify_manifest_value(catalog_payload.get("organization_name")) or citation.publisher,
+        "title": row.title or _stringify_manifest_value(catalog_payload.get("title")),
+        "author_names": row.author_names or _stringify_manifest_value(catalog_payload.get("author_names")),
+        "publication_date": row.publication_date or _stringify_manifest_value(catalog_payload.get("publication_date")),
+        "publication_year": row.publication_year or _stringify_manifest_value(catalog_payload.get("publication_year")),
+        "document_type": row.document_type or _stringify_manifest_value(catalog_payload.get("document_type")),
+        "organization_name": row.organization_name or _stringify_manifest_value(catalog_payload.get("organization_name")),
         "organization_type": row.organization_type or _stringify_manifest_value(catalog_payload.get("organization_type")),
         "tags_text": tags_text,
         "summary_text": summary_text,
@@ -4918,6 +5216,24 @@ def _phase_error_code(value: str) -> str:
     return code.strip("_")
 
 
+def _phase_completion_status(
+    value: str,
+    *,
+    success: set[str],
+    failed: set[str],
+    skipped: set[str] | None = None,
+) -> str:
+    normalized = str(value or "").strip().lower()
+    skipped_values = skipped or set()
+    if normalized in success:
+        return "completed"
+    if normalized in failed:
+        return "failed"
+    if normalized in skipped_values or normalized.startswith("skipped"):
+        return "skipped"
+    return "pending"
+
+
 def _dedupe_strings(values: list[str]) -> list[str]:
     deduped: list[str] = []
     seen: set[str] = set()
@@ -4939,7 +5255,7 @@ def _phase_status_outcome(value: str) -> str:
         return "success"
     if normalized in {"partial", "stale"}:
         return "partial"
-    if normalized in {"not_applicable", "skipped", "not_requested"}:
+    if normalized in {"not_applicable", "skipped", "not_requested"} or normalized.startswith("skipped"):
         return "skipped"
     if normalized in {
         "failed",
@@ -4964,27 +5280,45 @@ def _row_task_outcome(
         if phase == PHASE_FETCH:
             outcomes.append(_phase_status_outcome(row.fetch_status))
         elif phase == PHASE_CONVERT:
-            metadata = row.phase_metadata.get(PHASE_CONVERT)
+            metadata = _get_phase_metadata(row, PHASE_CONVERT)
             if metadata is not None:
                 outcomes.append(_phase_status_outcome(metadata.status))
             elif row.llm_cleanup_file or row.markdown_file:
                 outcomes.append("success")
             else:
                 outcomes.append("pending")
+        elif phase == PHASE_CLEANUP:
+            metadata = _get_phase_metadata(row, PHASE_CLEANUP)
+            if metadata is not None:
+                outcomes.append(_phase_status_outcome(metadata.status))
+            else:
+                outcomes.append(_phase_status_outcome(row.llm_cleanup_status))
+        elif phase == PHASE_TITLE:
+            metadata = _get_phase_metadata(row, PHASE_TITLE)
+            if metadata is not None:
+                outcomes.append(_phase_status_outcome(metadata.status))
+            else:
+                outcomes.append(_phase_status_outcome(row.title_status))
         elif phase == PHASE_CATALOG:
-            metadata = row.phase_metadata.get(PHASE_CATALOG)
+            metadata = _get_phase_metadata(row, PHASE_CATALOG)
             if metadata is not None:
                 outcomes.append(_phase_status_outcome(metadata.status))
             else:
                 outcomes.append(_phase_status_outcome(row.catalog_status))
-        elif phase == PHASE_SUMMARIZE:
-            metadata = row.phase_metadata.get(PHASE_SUMMARIZE)
+        elif phase == PHASE_CITATION_VERIFY:
+            metadata = _get_phase_metadata(row, PHASE_CITATION_VERIFY)
+            if metadata is not None:
+                outcomes.append(_phase_status_outcome(metadata.status))
+            else:
+                outcomes.append(_phase_status_outcome(_row_citation_verification_status(row)))
+        elif phase == PHASE_SUMMARY:
+            metadata = _get_phase_metadata(row, PHASE_SUMMARY)
             if metadata is not None:
                 outcomes.append(_phase_status_outcome(metadata.status))
             else:
                 outcomes.append(_phase_status_outcome(row.summary_status))
-        elif phase == PHASE_TAG:
-            metadata = row.phase_metadata.get(PHASE_TAG)
+        elif phase == PHASE_RATING:
+            metadata = _get_phase_metadata(row, PHASE_RATING)
             if metadata is not None:
                 outcomes.append(_phase_status_outcome(metadata.status))
             else:
@@ -5065,22 +5399,6 @@ def _merge_catalog_payload_into_row(
     organization_type = _stringify_manifest_value(payload.get("organization_type"))
     if organization_type and should_set(row.organization_type):
         row.organization_type = organization_type
-
-    citation = _normalize_citation_payload(payload.get("citation"))
-    citation_fields = _citation_payload_to_catalog_fields(citation)
-    if citation_fields["title"] and should_set(row.title):
-        row.title = citation_fields["title"]
-    if citation_fields["author_names"] and should_set(row.author_names):
-        row.author_names = citation_fields["author_names"]
-    if citation_fields["publication_date"] and should_set(row.publication_date):
-        row.publication_date = citation_fields["publication_date"]
-    if citation_fields["publication_year"] and should_set(row.publication_year):
-        row.publication_year = citation_fields["publication_year"]
-    if citation_fields["document_type"] and should_set(row.document_type):
-        row.document_type = citation_fields["document_type"]
-    if citation_fields["organization_name"] and should_set(row.organization_name):
-        row.organization_name = citation_fields["organization_name"]
-
 
 def _build_deterministic_catalog_metadata(
     *,
