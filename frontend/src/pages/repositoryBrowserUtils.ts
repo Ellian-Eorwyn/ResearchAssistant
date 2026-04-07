@@ -480,6 +480,8 @@ export function mergeRepositoryBrowserColumns(
     sort_type: "text" as const,
     instruction_prompt: "",
     output_constraint: null,
+    include_row_context: false,
+    include_source_text: false,
     last_run_at: "",
     last_run_status: "",
   }));

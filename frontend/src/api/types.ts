@@ -541,6 +541,8 @@ export interface RepositoryColumnConfig {
   builtin_key: string;
   instruction_prompt: string;
   output_constraint: RepositoryColumnOutputConstraint | null;
+  include_row_context: boolean;
+  include_source_text: boolean;
   last_run_at: string;
   last_run_status: string;
 }
@@ -678,6 +680,8 @@ export interface RepositoryManifestColumn {
   sort_type: "text" | "number" | "date";
   instruction_prompt: string;
   output_constraint: RepositoryColumnOutputConstraint | null;
+  include_row_context: boolean;
+  include_source_text: boolean;
   last_run_at: string;
   last_run_status: string;
 }
@@ -822,13 +826,28 @@ export interface RepositoryCitationRisExportRequest {
   filters: RepositoryManifestFilterPayload;
 }
 
-export interface RepositoryCitationRisDownloadResult {
+export type RepositoryManifestExportScope = "all" | "filtered" | "selected";
+export type RepositoryManifestExportFormat = "csv" | "xlsx";
+export type RepositoryManifestExportColumnScope = "all" | "visible";
+
+export interface RepositoryManifestExportRequest {
+  scope: RepositoryManifestExportScope;
+  format: RepositoryManifestExportFormat;
+  column_scope: RepositoryManifestExportColumnScope;
+  column_keys: string[];
+  source_ids: string[];
+  filters: RepositoryManifestFilterPayload;
+}
+
+export interface RepositoryFileDownloadResult {
   blob: Blob;
   filename: string;
   requestedCount: number;
   exportedCount: number;
   skippedCount: number;
 }
+
+export type RepositoryCitationRisDownloadResult = RepositoryFileDownloadResult;
 
 export interface UploadResponse {
   job_id: string;

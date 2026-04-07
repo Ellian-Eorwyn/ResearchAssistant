@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 from backend.models.export import EXPORT_COLUMNS, ExportRow
 from backend.models.ingestion_profiles import DocumentNormalizationResult, IngestionProfile
 from backend.models.repository import (
     RepositoryCitationRisExportRequest,
     RepositoryColumnRunRequest,
+    RepositoryManifestExportRequest,
     RepositoryManifestFilterRequest,
 )
 from backend.models.settings import RepoSettings
@@ -752,6 +754,94 @@ class RepositoryServiceTests(unittest.TestCase):
         self.assertEqual(reloaded_columns[custom.id]["label"], "POC")
         self.assertEqual(reloaded_columns["title"]["instruction_prompt"], builtin.instruction_prompt)
         self.assertTrue(reloaded_columns["publication_year"]["instruction_prompt"])
+
+    def test_column_context_flags_persist_in_manifest_metadata(self):
+        self._attach_repo("repo_column_context_flags")
+        custom = self.service.create_column("POC")
+
+        updated = self.service.update_column(
+            custom.id,
+            patch={
+                "instruction_prompt": "Answer yes or no only.",
+                "include_source_text": False,
+                "include_row_context": True,
+            },
+        )
+
+        manifest = self.service.list_manifest(limit=10, offset=0, sort_by="id", sort_dir="asc")
+        columns = {column["key"]: column for column in manifest["columns"]}
+
+        self.assertFalse(updated.include_source_text)
+        self.assertTrue(updated.include_row_context)
+        self.assertEqual(columns[custom.id]["include_source_text"], False)
+        self.assertEqual(columns[custom.id]["include_row_context"], True)
+        self.assertEqual(columns["title"]["include_source_text"], True)
+        self.assertEqual(columns["title"]["include_row_context"], False)
+
+    def test_export_manifest_supports_selected_csv_and_xlsx(self):
+        self._attach_repo("repo_manifest_export")
+        self.service.import_source_list(
+            filename="sources.csv",
+            content=(
+                "URL,Title\n"
+                "https://example.com/a,Alpha Source\n"
+                "https://example.com/b,Beta Source\n"
+            ).encode("utf-8"),
+        )
+
+        csv_bytes, csv_headers, csv_media_type = self.service.export_manifest(
+            RepositoryManifestExportRequest(
+                scope="selected",
+                format="csv",
+                source_ids=["000002", "000001"],
+            )
+        )
+        csv_rows = list(csv.DictReader(io.StringIO(csv_bytes.decode("utf-8-sig"))))
+        self.assertEqual(csv_media_type, "text/csv; charset=utf-8")
+        self.assertEqual(csv_headers["Content-Disposition"], 'attachment; filename="selected-manifest.csv"')
+        self.assertEqual([row["id"] for row in csv_rows], ["000002", "000001"])
+
+        xlsx_bytes, xlsx_headers, xlsx_media_type = self.service.export_manifest(
+            RepositoryManifestExportRequest(
+                scope="selected",
+                format="xlsx",
+                source_ids=["000002", "000001"],
+            )
+        )
+        workbook = load_workbook(io.BytesIO(xlsx_bytes))
+        worksheet = workbook.active
+        exported_ids = [worksheet.cell(row=row_index, column=1).value for row_index in range(2, 4)]
+        self.assertEqual(
+            xlsx_media_type,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        self.assertEqual(xlsx_headers["Content-Disposition"], 'attachment; filename="selected-manifest.xlsx"')
+        self.assertEqual(exported_ids, ["000002", "000001"])
+
+    def test_export_manifest_can_limit_to_visible_columns(self):
+        self._attach_repo("repo_manifest_export_visible_columns")
+        self.service.import_source_list(
+            filename="sources.csv",
+            content=(
+                "URL,Title\n"
+                "https://example.com/a,Alpha Source\n"
+                "https://example.com/b,Beta Source\n"
+            ).encode("utf-8"),
+        )
+
+        csv_bytes, _headers, _media_type = self.service.export_manifest(
+            RepositoryManifestExportRequest(
+                scope="selected",
+                format="csv",
+                column_scope="visible",
+                column_keys=["title", "author_names", "file_md"],
+                source_ids=["000001"],
+            )
+        )
+        csv_rows = list(csv.DictReader(io.StringIO(csv_bytes.decode("utf-8-sig"))))
+
+        self.assertEqual(list(csv_rows[0].keys()), ["title", "author_names", "file_md"])
+        self.assertEqual(csv_rows[0]["title"], "Alpha Source")
 
     def test_column_run_uses_all_filtered_rows_across_pages(self):
         self._attach_repo("repo_column_scope")

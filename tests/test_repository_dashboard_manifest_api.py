@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import io
 import tempfile
 import unittest
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from openpyxl import load_workbook
 
 from backend.routers import repository
 from backend.storage.attached_repository import AttachedRepositoryService
@@ -266,6 +268,61 @@ class RepositoryDashboardManifestApiTests(unittest.TestCase):
         self.assertTrue(column_map["author_names"]["instruction_prompt"])
         self.assertTrue(column_map["publication_year"]["instruction_prompt"])
         self.assertEqual(column_map["publication_year"]["sort_type"], "number")
+        self.assertEqual(column_map["title"]["include_source_text"], True)
+        self.assertEqual(column_map["title"]["include_row_context"], False)
+
+    def test_repository_manifest_export_endpoint_supports_csv_and_xlsx(self):
+        csv_resp = self.client.post(
+            "/api/repository/manifest/export",
+            json={
+                "scope": "selected",
+                "format": "csv",
+                "source_ids": ["000002", "000001"],
+                "filters": {},
+            },
+        )
+        self.assertEqual(csv_resp.status_code, 200)
+        self.assertEqual(csv_resp.headers["content-type"], "text/csv; charset=utf-8")
+        csv_lines = csv_resp.content.decode("utf-8-sig").splitlines()
+        self.assertTrue(csv_lines[0].startswith("id,repository_source_id"))
+        self.assertTrue(csv_lines[1].startswith("000002,"))
+        self.assertTrue(csv_lines[2].startswith("000001,"))
+
+        xlsx_resp = self.client.post(
+            "/api/repository/manifest/export",
+            json={
+                "scope": "selected",
+                "format": "xlsx",
+                "source_ids": ["000002", "000001"],
+                "filters": {},
+            },
+        )
+        self.assertEqual(xlsx_resp.status_code, 200)
+        self.assertEqual(
+            xlsx_resp.headers["content-type"],
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        workbook = load_workbook(io.BytesIO(xlsx_resp.content))
+        worksheet = workbook.active
+        self.assertEqual(worksheet.cell(row=2, column=1).value, "000002")
+        self.assertEqual(worksheet.cell(row=3, column=1).value, "000001")
+
+    def test_repository_manifest_export_endpoint_can_limit_visible_columns(self):
+        resp = self.client.post(
+            "/api/repository/manifest/export",
+            json={
+                "scope": "selected",
+                "format": "csv",
+                "column_scope": "visible",
+                "column_keys": ["title", "author_names"],
+                "source_ids": ["000001"],
+                "filters": {},
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        lines = resp.content.decode("utf-8-sig").splitlines()
+        self.assertEqual(lines[0], "title,author_names")
+        self.assertTrue(lines[1].startswith("Alpha Source,"))
 
     def test_repository_manifest_filters_by_catalog_fields(self):
         resp = self.client.get(

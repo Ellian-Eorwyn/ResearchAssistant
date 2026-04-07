@@ -241,6 +241,8 @@ class RepositoryColumnConfig(BaseModel):
     builtin_key: str = ""
     instruction_prompt: str = ""
     output_constraint: RepositoryColumnOutputConstraint | None = None
+    include_row_context: bool = False
+    include_source_text: bool = True
     last_run_at: str = ""
     last_run_status: str = ""
 
@@ -253,6 +255,8 @@ class RepositoryColumnUpdateRequest(BaseModel):
     label: str | None = None
     instruction_prompt: str | None = None
     output_constraint: RepositoryColumnOutputConstraint | None = None
+    include_row_context: bool | None = None
+    include_source_text: bool | None = None
 
 
 class RepositoryColumnPromptFixRequest(BaseModel):
@@ -338,6 +342,15 @@ class RepositoryManifestFilterRequest(BaseModel):
 
 class RepositoryCitationRisExportRequest(BaseModel):
     scope: str = "all"  # all | filtered | selected
+    source_ids: list[str] = Field(default_factory=list)
+    filters: RepositoryManifestFilterRequest = Field(default_factory=RepositoryManifestFilterRequest)
+
+
+class RepositoryManifestExportRequest(BaseModel):
+    scope: Literal["all", "filtered", "selected"] = "all"
+    format: Literal["csv", "xlsx"] = "csv"
+    column_scope: Literal["all", "visible"] = "all"
+    column_keys: list[str] = Field(default_factory=list)
     source_ids: list[str] = Field(default_factory=list)
     filters: RepositoryManifestFilterRequest = Field(default_factory=RepositoryManifestFilterRequest)
 

@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
 
 from backend.models.bibliography import BibliographyArtifact, BibliographyEntry, ReferencesSection
 from backend.models.agent import (
@@ -66,6 +68,8 @@ from backend.models.repository import (
     RepositoryHealth,
     RepositoryImportResponse,
     RepositoryMergeResponse,
+    RepositoryManifestFilterRequest,
+    RepositoryManifestExportRequest,
     RepositoryProcessDocumentsResponse,
     RepositoryReprocessDocumentsResponse,
     RepositoryScanSummary,
@@ -516,6 +520,12 @@ class AttachedRepositoryService:
                 else:
                     config.output_constraint = None
 
+            if "include_row_context" in patch and patch.get("include_row_context") is not None:
+                config.include_row_context = bool(patch.get("include_row_context"))
+
+            if "include_source_text" in patch and patch.get("include_source_text") is not None:
+                config.include_source_text = bool(patch.get("include_source_text"))
+
             if index is None:
                 column_configs.append(config)
             else:
@@ -921,32 +931,38 @@ class AttachedRepositoryService:
         current_value = _cell_string_value(
             manifest_record.get(str(config.builtin_key or config.id))
         )
-        source_text = self._load_repository_text_artifact(row, "llm_cleanup_file")
-        if not source_text:
-            source_text = self._load_repository_text_artifact(row, "markdown_file")
-        source_text = _truncate_column_run_text(
-            source_text,
-            int(repo_settings.llm_backend.max_source_chars or 0),
-        )
+        include_source_text = _effective_column_include_source_text(config)
+        include_row_context = _effective_column_include_row_context(config)
+        source_text = ""
+        if include_source_text:
+            source_text = self._load_repository_text_artifact(row, "llm_cleanup_file")
+            if not source_text:
+                source_text = self._load_repository_text_artifact(row, "markdown_file")
+            source_text = _truncate_column_run_text(
+                source_text,
+                int(repo_settings.llm_backend.max_source_chars or 0),
+            )
 
-        row_metadata = {
-            key: value
-            for key, value in manifest_record.items()
-            if key
-            not in {
-                "raw_file",
-                "rendered_file",
-                "rendered_pdf_file",
-                "markdown_file",
-                "llm_cleanup_file",
-                "catalog_file",
-                "summary_file",
-                "rating_file",
-                "metadata_file",
-                "rating_raw_json",
-                "citation_field_evidence_json",
+        row_metadata: dict[str, str | int | float | bool] = {}
+        if include_row_context:
+            row_metadata = {
+                key: value
+                for key, value in manifest_record.items()
+                if key
+                not in {
+                    "raw_file",
+                    "rendered_file",
+                    "rendered_pdf_file",
+                    "markdown_file",
+                    "llm_cleanup_file",
+                    "catalog_file",
+                    "summary_file",
+                    "rating_file",
+                    "metadata_file",
+                    "rating_raw_json",
+                    "citation_field_evidence_json",
+                }
             }
-        }
         hard_rules = "\n".join(
             [
                 "- Output only the target cell value.",
@@ -2966,18 +2982,17 @@ class AttachedRepositoryService:
             message=message,
         )
 
-    def export_citations_ris(
+    def _resolve_manifest_export_rows(
         self,
-        payload: RepositoryCitationRisExportRequest,
-    ) -> tuple[bytes, dict[str, str]]:
-        if not self.is_attached:
-            raise ValueError("Attach a repository before exporting RIS citations")
-
-        normalized_scope = str(payload.scope or "all").strip().lower() or "all"
+        *,
+        scope: str,
+        source_ids: list[str],
+        filters: RepositoryManifestFilterRequest,
+    ) -> tuple[str, list[SourceManifestRow]]:
+        normalized_scope = str(scope or "all").strip().lower() or "all"
         if normalized_scope not in {"all", "filtered", "selected"}:
             raise ValueError("Invalid scope. Use `all`, `filtered`, or `selected`.")
 
-        filters = payload.filters
         records, columns = self._manifest_records()
         filtered_records, _, _ = self._filter_manifest_records(
             records,
@@ -3021,22 +3036,33 @@ class AttachedRepositoryService:
         row_by_id = {row.id: row for row in rows}
         if normalized_scope == "all":
             target_records = _sort_manifest_records(records, sort_by="id", reverse=False)
+            ordered_ids = [str(record.get("id") or "") for record in target_records]
         elif normalized_scope == "filtered":
-            target_records = filtered_records
+            ordered_ids = [str(record.get("id") or "") for record in filtered_records]
         else:
-            normalized_ids = _normalize_source_ids(payload.source_ids)
+            normalized_ids = [str(source_id or "").strip() for source_id in source_ids if str(source_id or "").strip()]
             if not normalized_ids:
-                raise ValueError("At least one source id is required for selected RIS export")
-            target_records = [record for record in records if str(record.get("id") or "") in normalized_ids]
-            missing = sorted(normalized_ids.difference({str(record.get("id") or "") for record in target_records}))
+                raise ValueError("At least one source id is required for selected export")
+            missing = sorted(source_id for source_id in normalized_ids if source_id not in row_by_id)
             if missing:
                 raise ValueError(f"Unknown source_ids: {', '.join(missing[:20])}")
+            ordered_ids = normalized_ids
 
-        target_rows = [
-            row_by_id[source_id]
-            for source_id in [str(record.get("id") or "") for record in target_records]
-            if source_id in row_by_id
-        ]
+        target_rows = [row_by_id[source_id] for source_id in ordered_ids if source_id in row_by_id]
+        return normalized_scope, target_rows
+
+    def export_citations_ris(
+        self,
+        payload: RepositoryCitationRisExportRequest,
+    ) -> tuple[bytes, dict[str, str]]:
+        if not self.is_attached:
+            raise ValueError("Attach a repository before exporting RIS citations")
+
+        normalized_scope, target_rows = self._resolve_manifest_export_rows(
+            scope=payload.scope,
+            source_ids=payload.source_ids,
+            filters=payload.filters,
+        )
         ris_text, exported_count, skipped_count = build_ris_records(target_rows, base_dir=self.path)
         requested_count = len(target_rows)
         filename = {
@@ -3051,6 +3077,57 @@ class AttachedRepositoryService:
             "X-ResearchAssistant-Skipped-Count": str(skipped_count),
         }
         return ris_text.encode("utf-8"), headers
+
+    def export_manifest(
+        self,
+        payload: RepositoryManifestExportRequest,
+    ) -> tuple[bytes, dict[str, str], str]:
+        if not self.is_attached:
+            raise ValueError("Attach a repository before exporting spreadsheet data")
+
+        normalized_scope, target_rows = self._resolve_manifest_export_rows(
+            scope=payload.scope,
+            source_ids=payload.source_ids,
+            filters=payload.filters,
+        )
+        normalized_format = str(payload.format or "csv").strip().lower() or "csv"
+        if normalized_format not in {"csv", "xlsx"}:
+            raise ValueError("Invalid format. Use `csv` or `xlsx`.")
+
+        with self._writer_lock():
+            column_configs = _load_column_configs(self._load_state_locked().get("column_configs", []))
+        fieldnames, records = _build_manifest_export_rows(
+            target_rows,
+            base_dir=self.path,
+            column_configs=column_configs,
+            column_scope=payload.column_scope,
+            column_keys=payload.column_keys,
+        )
+
+        if normalized_format == "xlsx":
+            content = _build_manifest_export_xlsx(fieldnames, records)
+            media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            filename = {
+                "all": "repository-manifest.xlsx",
+                "filtered": "filtered-manifest.xlsx",
+                "selected": "selected-manifest.xlsx",
+            }[normalized_scope]
+        else:
+            content = _build_manifest_export_csv(fieldnames, records).encode("utf-8-sig")
+            media_type = "text/csv; charset=utf-8"
+            filename = {
+                "all": "repository-manifest.csv",
+                "filtered": "filtered-manifest.csv",
+                "selected": "selected-manifest.csv",
+            }[normalized_scope]
+
+        headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-ResearchAssistant-Requested-Count": str(len(target_rows)),
+            "X-ResearchAssistant-Exported-Count": str(len(target_rows)),
+            "X-ResearchAssistant-Skipped-Count": "0",
+        }
+        return content, headers, media_type
 
     def get_citation_data(self) -> dict[str, Any]:
         if not self.is_attached:
@@ -8125,6 +8202,22 @@ def _effective_column_output_constraint(
     return _infer_column_output_constraint(prompt_text)
 
 
+def _effective_column_include_row_context(
+    config: RepositoryColumnConfig | None = None,
+) -> bool:
+    if config is None:
+        return False
+    return bool(config.include_row_context)
+
+
+def _effective_column_include_source_text(
+    config: RepositoryColumnConfig | None = None,
+) -> bool:
+    if config is None:
+        return True
+    return bool(config.include_source_text)
+
+
 def _manifest_column_label(
     value: str,
     column_configs: list[RepositoryColumnConfig] | None = None,
@@ -8265,6 +8358,12 @@ def _build_manifest_column_metadata(
                 )
                 else None
             ),
+            "include_row_context": _effective_column_include_row_context(
+                config_lookup.get(field_name)
+            ),
+            "include_source_text": _effective_column_include_source_text(
+                config_lookup.get(field_name)
+            ),
             "last_run_at": str(config_lookup.get(field_name).last_run_at or "")
             if field_name in config_lookup
             else "",
@@ -8400,6 +8499,127 @@ def _sort_manifest_records(
         reverse=reverse,
     )
     return present + missing
+
+
+MANIFEST_EXPORT_SYNTHETIC_FILE_COLUMNS: dict[str, str] = {
+    "file_pdf": "pdf",
+    "file_html": "html",
+    "file_rendered": "rendered",
+    "file_md": "md",
+}
+
+
+def _manifest_export_file_value(row: SourceManifestRow, synthetic_key: str) -> str:
+    normalized_key = str(synthetic_key or "").strip().lower()
+    if normalized_key == "file_pdf":
+        raw_file = str(row.raw_file or "").strip()
+        return raw_file if raw_file.lower().endswith(".pdf") else ""
+    if normalized_key == "file_html":
+        raw_file = str(row.raw_file or "").strip()
+        return raw_file if raw_file.lower().endswith((".html", ".htm")) else ""
+    if normalized_key == "file_rendered":
+        return str(row.rendered_file or row.rendered_pdf_file or "").strip()
+    if normalized_key == "file_md":
+        return str(row.llm_cleanup_file or row.markdown_file or "").strip()
+    return ""
+
+
+def _build_manifest_export_rows(
+    rows: list[SourceManifestRow],
+    *,
+    base_dir: Path | None = None,
+    column_configs: list[RepositoryColumnConfig] | None = None,
+    column_scope: str = "all",
+    column_keys: list[str] | None = None,
+) -> tuple[list[str], list[dict[str, str | int | float | bool]]]:
+    records: list[dict[str, str | int | float | bool]] = []
+    for row in rows:
+        record = build_manifest_record(row, base_dir=base_dir, column_configs=column_configs)
+        for synthetic_key in MANIFEST_EXPORT_SYNTHETIC_FILE_COLUMNS:
+            record[synthetic_key] = _manifest_export_file_value(row, synthetic_key)
+        records.append(record)
+
+    manifest_columns = _build_manifest_column_metadata(records, column_configs)
+    all_fieldnames = [str(column.get("key") or "") for column in manifest_columns if str(column.get("key") or "").strip()]
+    all_fieldnames.extend(
+        field_name
+        for field_name in MANIFEST_EXPORT_SYNTHETIC_FILE_COLUMNS
+        if field_name not in all_fieldnames
+    )
+
+    normalized_column_scope = str(column_scope or "all").strip().lower() or "all"
+    if normalized_column_scope == "visible":
+        requested: list[str] = []
+        seen: set[str] = set()
+        available = set(all_fieldnames)
+        for key in column_keys or []:
+            normalized_key = str(key or "").strip()
+            if not normalized_key or normalized_key in seen or normalized_key not in available:
+                continue
+            seen.add(normalized_key)
+            requested.append(normalized_key)
+        if not requested:
+            raise ValueError("Select at least one visible column for spreadsheet export.")
+        fieldnames = requested
+    else:
+        fieldnames = all_fieldnames
+
+    filtered_records = [
+        {field_name: record.get(field_name, "") for field_name in fieldnames}
+        for record in records
+    ]
+    return fieldnames, filtered_records
+
+
+def _build_manifest_export_csv(
+    fieldnames: list[str],
+    records: list[dict[str, str | int | float | bool]],
+) -> str:
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    for record in records:
+        writer.writerow(record)
+    return output.getvalue()
+
+
+def _build_manifest_export_xlsx(
+    fieldnames: list[str],
+    records: list[dict[str, str | int | float | bool]],
+) -> bytes:
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "manifest"
+    worksheet.append(fieldnames)
+    worksheet.freeze_panes = "A2"
+
+    hyperlink_columns = {name for name in fieldnames if name.endswith("_url") or name.startswith("file_")}
+    column_index_by_name = {name: index + 1 for index, name in enumerate(fieldnames)}
+
+    for record in records:
+        worksheet.append([record.get(column_name, "") for column_name in fieldnames])
+        row_index = worksheet.max_row
+        for hyperlink_column in hyperlink_columns:
+            cell_value = record.get(hyperlink_column, "")
+            if not cell_value:
+                continue
+            cell = worksheet.cell(row=row_index, column=column_index_by_name[hyperlink_column])
+            cell.value = cell_value
+            cell.hyperlink = str(cell_value)
+            cell.style = "Hyperlink"
+
+    for index, column_name in enumerate(fieldnames, start=1):
+        if column_name.endswith("_url") or column_name.startswith("file_"):
+            width = 40
+        elif column_name in {"summary_text", "rating_rationale", "relevant_sections", "rating_raw_json"}:
+            width = 56
+        else:
+            width = 24
+        worksheet.column_dimensions[get_column_letter(index)].width = width
+
+    stream = io.BytesIO()
+    workbook.save(stream)
+    return stream.getvalue()
 
 
 def _parse_json_object(raw_value: str) -> dict[str, Any]:

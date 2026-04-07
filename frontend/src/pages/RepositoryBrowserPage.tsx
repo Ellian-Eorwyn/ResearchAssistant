@@ -4,6 +4,7 @@ import {
   useRef,
   useState,
   type ChangeEvent,
+  type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
 } from "react";
@@ -52,6 +53,9 @@ import {
 const REPOSITORY_BROWSER_SELECTION_COLUMN_WIDTH = 52;
 const REPOSITORY_BROWSER_ACTION_ROW_HEIGHT = 76;
 const REPOSITORY_BROWSER_ACTION_RAIL_WIDTH = 60;
+const REPOSITORY_BROWSER_DETAILS_PANE_MIN_WIDTH = 320;
+const REPOSITORY_BROWSER_DETAILS_PANE_DEFAULT_WIDTH = 384;
+const REPOSITORY_BROWSER_DETAILS_PANE_MAX_WIDTH = 720;
 
 const DEFAULT_FILTERS: RepositoryBrowserFilters = {
   q: "",
@@ -939,16 +943,31 @@ function SourceDetailsDrawer({
 interface ColumnPromptDraftState {
   columnId: string;
   label: string;
+  kind: "builtin" | "custom";
   prompt: string;
   outputConstraint: RepositoryColumnOutputConstraint | null;
+  includeRowContext: boolean;
+  includeSourceText: boolean;
 }
 
 type ColumnRunScope = "all" | "empty_only" | "selected";
+
+type ExportKind = "spreadsheet" | "ris";
+type ExportScope = "all" | "displayed" | "selected";
+type SpreadsheetExportFormat = "csv" | "xlsx";
+type SpreadsheetExportColumnScope = "all" | "visible";
 
 interface ColumnRunScopeDraftState {
   columnId: string;
   label: string;
   scope: ColumnRunScope;
+}
+
+interface ExportModalDraftState {
+  kind: ExportKind;
+  scope: ExportScope;
+  format: SpreadsheetExportFormat;
+  columnScope: SpreadsheetExportColumnScope;
 }
 
 function repositoryColumnActionButtonClass(disabled = false): string {
@@ -1037,7 +1056,7 @@ function ColumnPromptModal({
   llmReady: boolean;
   savePending: boolean;
   error: string;
-  onChange: (nextValue: string) => void;
+  onChange: (patch: Partial<ColumnPromptDraftState>) => void;
   onCancel: () => void;
   onFixPrompt: () => void;
   onSave: () => void;
@@ -1067,8 +1086,45 @@ function ColumnPromptModal({
           label="Prompt"
           rows={12}
           value={draft.prompt}
-          onChange={(event) => onChange(event.target.value)}
+          onChange={(event) => onChange({ prompt: event.target.value })}
         />
+
+        <div className="mt-4 grid gap-3 rounded-lg border border-outline-variant/30 bg-surface-container-low p-4">
+          <div>
+            <div className="text-title-sm font-semibold">LLM Context</div>
+            <div className="mt-1 text-body-md text-on-surface-variant">
+              Choose what context this column run can use. Primary source text defaults on. Row
+              metadata defaults off.
+            </div>
+          </div>
+          <label className="flex items-start gap-3 text-body-md text-on-surface">
+            <input
+              checked={draft.includeSourceText}
+              type="checkbox"
+              onChange={(event) => onChange({ includeSourceText: event.target.checked })}
+            />
+            <span>
+              Include primary source text
+              <span className="block text-on-surface-variant">
+                Uses cleaned markdown first, then extracted markdown, when available.
+              </span>
+            </span>
+          </label>
+          <label className="flex items-start gap-3 text-body-md text-on-surface">
+            <input
+              checked={draft.includeRowContext}
+              type="checkbox"
+              onChange={(event) => onChange({ includeRowContext: event.target.checked })}
+            />
+            <span>
+              Include row metadata from other relevant columns
+              <span className="block text-on-surface-variant">
+                Includes values like title, authors, dates, organization, citation fields, summary,
+                and related structured metadata.
+              </span>
+            </span>
+          </label>
+        </div>
 
         <div className="mt-3 text-body-md text-on-surface-variant">
           Fix Up Prompt and Run require an enabled LLM backend with a selected model.
@@ -1093,7 +1149,7 @@ function ColumnPromptModal({
             {fixingPrompt ? "Fixing..." : "Fix Up Prompt"}
           </Button>
           <Button
-            disabled={!draft.prompt.trim() || savePending || fixingPrompt}
+            disabled={savePending || fixingPrompt}
             variant="primary"
             onClick={onSave}
           >
@@ -1190,6 +1246,147 @@ function ColumnRunScopeModal({
   );
 }
 
+function ExportModal({
+  draft,
+  selectedCount,
+  displayedCount,
+  totalCount,
+  pendingKind,
+  onCancel,
+  onChange,
+  onConfirm,
+}: {
+  draft: ExportModalDraftState;
+  selectedCount: number;
+  displayedCount: number;
+  totalCount: number;
+  pendingKind: ExportKind | null;
+  onCancel: () => void;
+  onChange: (patch: Partial<ExportModalDraftState>) => void;
+  onConfirm: () => void;
+}) {
+  const selectedDisabled = selectedCount === 0;
+  const displayedDisabled = displayedCount === 0;
+  const pending = pendingKind === draft.kind;
+  const title = draft.kind === "spreadsheet" ? "Export Spreadsheet" : "Export RIS";
+
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-surface/80 p-4 backdrop-blur-sm">
+      <div className="w-full max-w-xl rounded-xl border border-outline-variant/40 bg-surface-container p-5 shadow-2xl">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <div className="text-title-sm font-semibold">{title}</div>
+            <div className="mt-1 text-body-md text-on-surface-variant">
+              {draft.kind === "spreadsheet"
+                ? "Export the repository spreadsheet data."
+                : "Export RIS citation records for the chosen rows."}
+            </div>
+          </div>
+          <button
+            className="rounded-sm px-2 py-1 text-label-sm text-on-surface-variant hover:text-on-surface"
+            disabled={Boolean(pendingKind)}
+            onClick={onCancel}
+            type="button"
+          >
+            Close
+          </button>
+        </div>
+
+        <div className="mt-4 grid gap-2">
+          <button
+            className={columnRunScopeOptionClass(draft.scope === "all", false)}
+            disabled={Boolean(pendingKind)}
+            onClick={() => onChange({ scope: "all" })}
+            type="button"
+          >
+            <div className="font-semibold text-on-surface">Whole Database</div>
+            <div className="mt-1 text-body-md text-on-surface-variant">
+              Export all {totalCount} repository row{totalCount === 1 ? "" : "s"}.
+            </div>
+          </button>
+          <button
+            className={columnRunScopeOptionClass(draft.scope === "displayed", displayedDisabled)}
+            disabled={Boolean(pendingKind) || displayedDisabled}
+            onClick={() => onChange({ scope: "displayed" })}
+            type="button"
+          >
+            <div className="font-semibold text-on-surface">Currently Displayed Rows</div>
+            <div className="mt-1 text-body-md text-on-surface-variant">
+              {displayedDisabled
+                ? "No rows are currently displayed."
+                : `Export the ${displayedCount} row${displayedCount === 1 ? "" : "s"} on this page.`}
+            </div>
+          </button>
+          <button
+            className={columnRunScopeOptionClass(draft.scope === "selected", selectedDisabled)}
+            disabled={Boolean(pendingKind) || selectedDisabled}
+            onClick={() => onChange({ scope: "selected" })}
+            type="button"
+          >
+            <div className="font-semibold text-on-surface">Selected Rows</div>
+            <div className="mt-1 text-body-md text-on-surface-variant">
+              {selectedDisabled
+                ? "Select one or more rows in the table to use this scope."
+                : `Export the ${selectedCount} selected row${selectedCount === 1 ? "" : "s"}.`}
+            </div>
+          </button>
+        </div>
+
+        {draft.kind === "spreadsheet" && (
+          <div className="mt-4 grid gap-4">
+            <SelectField
+              label="Format"
+              value={draft.format}
+              onChange={(event) =>
+                onChange({ format: event.target.value as SpreadsheetExportFormat })
+              }
+            >
+              <option value="csv">.csv</option>
+              <option value="xlsx">.xlsx</option>
+            </SelectField>
+            <div className="grid gap-2">
+              <div className="text-label-sm uppercase tracking-[0.08em] text-on-surface-variant">
+                Columns
+              </div>
+              <button
+                className={columnRunScopeOptionClass(draft.columnScope === "all", false)}
+                disabled={Boolean(pendingKind)}
+                onClick={() => onChange({ columnScope: "all" })}
+                type="button"
+              >
+                <div className="font-semibold text-on-surface">Export All Columns</div>
+                <div className="mt-1 text-body-md text-on-surface-variant">
+                  Include the full repository spreadsheet schema.
+                </div>
+              </button>
+              <button
+                className={columnRunScopeOptionClass(draft.columnScope === "visible", false)}
+                disabled={Boolean(pendingKind)}
+                onClick={() => onChange({ columnScope: "visible" })}
+                type="button"
+              >
+                <div className="font-semibold text-on-surface">Export Currently Visible Columns</div>
+                <div className="mt-1 text-body-md text-on-surface-variant">
+                  Export only the columns currently shown in the spreadsheet, in the same order.
+                </div>
+              </button>
+            </div>
+          </div>
+        )}
+
+        <div className="mt-5 flex justify-end gap-2">
+          <Button disabled={Boolean(pendingKind)} onClick={onCancel}>
+            Cancel
+          </Button>
+          <Button disabled={Boolean(pendingKind)} variant="primary" onClick={onConfirm}>
+            {pending ? "Exporting..." : title}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function RepositoryBrowserPage() {
   const queryClient = useQueryClient();
   const {
@@ -1212,9 +1409,20 @@ export function RepositoryBrowserPage() {
   const addFilesRef = useRef<HTMLInputElement | null>(null);
   const headerCheckboxRef = useRef<HTMLInputElement | null>(null);
   const renameInputRef = useRef<HTMLInputElement | null>(null);
+  const tableScrollRef = useRef<HTMLDivElement | null>(null);
+  const scrollbarTrackRef = useRef<HTMLDivElement | null>(null);
+  const browserPanelsRef = useRef<HTMLDivElement | null>(null);
   const resizeRef = useRef<{
     columnKey: string;
     startWidth: number;
+    startX: number;
+  } | null>(null);
+  const paneResizeRef = useRef<{
+    startWidth: number;
+    startX: number;
+  } | null>(null);
+  const horizontalThumbDragRef = useRef<{
+    startScrollLeft: number;
     startX: number;
   } | null>(null);
 
@@ -1235,10 +1443,12 @@ export function RepositoryBrowserPage() {
   const [runPending, setRunPending] = useState(false);
   const [deletePending, setDeletePending] = useState(false);
   const [risExportPending, setRisExportPending] = useState(false);
+  const [spreadsheetExportPending, setSpreadsheetExportPending] = useState(false);
   const [activeRowId, setActiveRowId] = useState<string | null>(null);
   const [detailDraft, setDetailDraft] = useState<SourceDetailsDraft | null>(null);
   const [detailSaveState, setDetailSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [detailSaveError, setDetailSaveError] = useState("");
+  const [detailPaneWidth, setDetailPaneWidth] = useState(REPOSITORY_BROWSER_DETAILS_PANE_DEFAULT_WIDTH);
   const [storageLoaded, setStorageLoaded] = useState(false);
   const [columnPromptDraft, setColumnPromptDraft] = useState<ColumnPromptDraftState | null>(null);
   const [columnPromptFixing, setColumnPromptFixing] = useState(false);
@@ -1251,6 +1461,12 @@ export function RepositoryBrowserPage() {
   const [columnRunScopeDraft, setColumnRunScopeDraft] = useState<ColumnRunScopeDraftState | null>(null);
   const [columnRunStarting, setColumnRunStarting] = useState(false);
   const [columnRunJobId, setColumnRunJobId] = useState("");
+  const [exportModalDraft, setExportModalDraft] = useState<ExportModalDraftState | null>(null);
+  const [horizontalScrollMetrics, setHorizontalScrollMetrics] = useState({
+    viewportWidth: 0,
+    scrollWidth: 0,
+    scrollLeft: 0,
+  });
 
   const storageKey = useMemo(
     () => buildRepositoryBrowserStorageKey(repositoryStatus?.path || ""),
@@ -1396,6 +1612,34 @@ export function RepositoryBrowserPage() {
   }, [allColumns]);
 
   useEffect(() => {
+    const tableScroller = tableScrollRef.current;
+    if (!tableScroller) return;
+
+    const updateMetrics = () => {
+      setHorizontalScrollMetrics({
+        viewportWidth: tableScroller.clientWidth,
+        scrollWidth: tableScroller.scrollWidth,
+        scrollLeft: tableScroller.scrollLeft,
+      });
+    };
+
+    updateMetrics();
+    tableScroller.addEventListener("scroll", updateMetrics);
+    const resizeObserver =
+      typeof ResizeObserver !== "undefined" ? new ResizeObserver(updateMetrics) : null;
+    resizeObserver?.observe(tableScroller);
+    if (tableScroller.firstElementChild instanceof HTMLElement) {
+      resizeObserver?.observe(tableScroller.firstElementChild);
+    }
+    window.addEventListener("resize", updateMetrics);
+    return () => {
+      tableScroller.removeEventListener("scroll", updateMetrics);
+      resizeObserver?.disconnect();
+      window.removeEventListener("resize", updateMetrics);
+    };
+  }, [actionRowWidth, renderedColumns.length, rows.length]);
+
+  useEffect(() => {
     if (!manifestQuery.data?.columns?.length) return;
     const available = new Set(allColumns.map((column) => column.key));
     setVisibleColumns((prev) => {
@@ -1404,6 +1648,20 @@ export function RepositoryBrowserPage() {
       return REPOSITORY_BROWSER_DEFAULT_VISIBLE_COLUMNS.filter((column) => available.has(column));
     });
   }, [allColumns, manifestQuery.data?.columns]);
+
+  const horizontalScrollViewport = horizontalScrollMetrics.viewportWidth;
+  const horizontalScrollWidth = Math.max(horizontalScrollMetrics.scrollWidth, actionRowWidth);
+  const horizontalCanScroll = horizontalScrollWidth > horizontalScrollViewport + 1;
+  const horizontalThumbWidth =
+    horizontalCanScroll && horizontalScrollViewport > 0
+      ? Math.max(56, (horizontalScrollViewport * horizontalScrollViewport) / horizontalScrollWidth)
+      : Math.max(horizontalScrollViewport, 0);
+  const horizontalScrollRange = Math.max(0, horizontalScrollWidth - horizontalScrollViewport);
+  const horizontalThumbTravel = Math.max(0, horizontalScrollViewport - horizontalThumbWidth);
+  const horizontalThumbOffset =
+    horizontalScrollRange > 0
+      ? (horizontalScrollMetrics.scrollLeft / horizontalScrollRange) * horizontalThumbTravel
+      : 0;
 
   useEffect(() => {
     setSelectedIds(new Set());
@@ -1419,6 +1677,7 @@ export function RepositoryBrowserPage() {
     setColumnRunScopeDraft(null);
     setColumnRunStarting(false);
     setColumnRunJobId("");
+    setExportModalDraft(null);
   }, [repositoryStatus?.path]);
 
   useEffect(() => {
@@ -1538,17 +1797,55 @@ export function RepositoryBrowserPage() {
   useEffect(() => {
     const handleMouseMove = (event: MouseEvent) => {
       const activeResize = resizeRef.current;
-      if (!activeResize) return;
-      const delta = event.clientX - activeResize.startX;
-      setColumnWidths((prev) => ({
-        ...prev,
-        [activeResize.columnKey]: clampRepositoryBrowserColumnWidth(activeResize.startWidth + delta),
-      }));
+      if (activeResize) {
+        const delta = event.clientX - activeResize.startX;
+        setColumnWidths((prev) => ({
+          ...prev,
+          [activeResize.columnKey]: clampRepositoryBrowserColumnWidth(activeResize.startWidth + delta),
+        }));
+        return;
+      }
+
+      const activePaneResize = paneResizeRef.current;
+      if (activePaneResize) {
+        const containerWidth =
+          browserPanelsRef.current?.getBoundingClientRect().width || window.innerWidth;
+        const maxWidth = Math.min(
+          REPOSITORY_BROWSER_DETAILS_PANE_MAX_WIDTH,
+          Math.max(REPOSITORY_BROWSER_DETAILS_PANE_MIN_WIDTH, containerWidth - 360),
+        );
+        const delta = event.clientX - activePaneResize.startX;
+        const nextWidth = Math.max(
+          REPOSITORY_BROWSER_DETAILS_PANE_MIN_WIDTH,
+          Math.min(maxWidth, activePaneResize.startWidth - delta),
+        );
+        setDetailPaneWidth(nextWidth);
+        return;
+      }
+
+      const activeThumbDrag = horizontalThumbDragRef.current;
+      const tableScroller = tableScrollRef.current;
+      const track = scrollbarTrackRef.current;
+      if (!activeThumbDrag || !tableScroller || !track) return;
+      const scrollWidth = tableScroller.scrollWidth;
+      const viewportWidth = tableScroller.clientWidth;
+      const maxScrollLeft = Math.max(0, scrollWidth - viewportWidth);
+      if (maxScrollLeft <= 0) return;
+      const thumbWidth = Math.max(56, (viewportWidth * viewportWidth) / scrollWidth);
+      const thumbTravel = Math.max(1, track.clientWidth - thumbWidth);
+      const deltaX = event.clientX - activeThumbDrag.startX;
+      const nextScrollLeft = Math.max(
+        0,
+        Math.min(maxScrollLeft, activeThumbDrag.startScrollLeft + (deltaX / thumbTravel) * maxScrollLeft),
+      );
+      tableScroller.scrollLeft = nextScrollLeft;
     };
 
     const handleMouseUp = () => {
-      if (!resizeRef.current) return;
+      if (!resizeRef.current && !paneResizeRef.current && !horizontalThumbDragRef.current) return;
       resizeRef.current = null;
+      paneResizeRef.current = null;
+      horizontalThumbDragRef.current = null;
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
     };
@@ -1650,8 +1947,11 @@ export function RepositoryBrowserPage() {
     setColumnPromptDraft({
       columnId: column.key,
       label: labelRepositoryBrowserColumn(column.key, column.label),
+      kind: column.kind,
       prompt: column.instruction_prompt || "",
       outputConstraint: column.output_constraint,
+      includeRowContext: Boolean(column.include_row_context),
+      includeSourceText: column.include_source_text !== false,
     });
     setColumnPromptError("");
   };
@@ -1664,6 +1964,8 @@ export function RepositoryBrowserPage() {
       await api.updateRepositoryColumn(columnPromptDraft.columnId, {
         instruction_prompt: columnPromptDraft.prompt,
         output_constraint: columnPromptDraft.outputConstraint,
+        include_row_context: columnPromptDraft.includeRowContext,
+        include_source_text: columnPromptDraft.includeSourceText,
       });
       setColumnPromptDraft(null);
       setActionMessage(`Saved instructions for ${columnPromptDraft.label}.`);
@@ -1826,6 +2128,42 @@ export function RepositoryBrowserPage() {
     };
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
+  };
+
+  const beginPaneResize = (event: ReactMouseEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    paneResizeRef.current = {
+      startWidth: detailPaneWidth,
+      startX: event.clientX,
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  };
+
+  const beginHorizontalThumbDrag = (event: ReactMouseEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    horizontalThumbDragRef.current = {
+      startScrollLeft: tableScrollRef.current?.scrollLeft || 0,
+      startX: event.clientX,
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  };
+
+  const handleHorizontalTrackMouseDown = (event: ReactMouseEvent<HTMLDivElement>) => {
+    if (event.target !== event.currentTarget) return;
+    const tableScroller = tableScrollRef.current;
+    const track = scrollbarTrackRef.current;
+    if (!tableScroller || !track || horizontalScrollRange <= 0) return;
+    const rect = track.getBoundingClientRect();
+    const clickOffset = event.clientX - rect.left;
+    const thumbCenter = Math.max(
+      0,
+      Math.min(horizontalThumbTravel, clickOffset - horizontalThumbWidth / 2),
+    );
+    tableScroller.scrollLeft = (thumbCenter / horizontalThumbTravel) * horizontalScrollRange;
   };
 
   const saveActiveProfile = async (filename: string) => {
@@ -2082,54 +2420,78 @@ export function RepositoryBrowserPage() {
     }
   };
 
-  const handleExportRis = async (sourceIds: string[], label: string) => {
-    if (risExportPending) return;
-    if (sourceIds.length === 0) {
-      setActionError(`No ${label.toLowerCase()} available for RIS export.`);
+  const openExportModal = (kind: ExportKind) => {
+    setExportModalDraft({
+      kind,
+      scope: selectedIds.size > 0 ? "selected" : rows.length > 0 ? "displayed" : "all",
+      format: "csv",
+      columnScope: "all",
+    });
+    setActionError("");
+  };
+
+  const handleExport = async () => {
+    if (!exportModalDraft) return;
+    const sourceIds =
+      exportModalDraft.scope === "selected"
+        ? Array.from(selectedIds)
+        : exportModalDraft.scope === "displayed"
+          ? rows.map((row) => row.id)
+          : [];
+    const backendScope = exportModalDraft.scope === "all" ? "all" : "selected";
+    const scopeLabel =
+      exportModalDraft.scope === "all"
+        ? "whole database"
+        : exportModalDraft.scope === "displayed"
+          ? "currently displayed rows"
+          : "selected rows";
+    const filterPayload = buildRepositoryManifestFilterPayload(filters);
+
+    if (exportModalDraft.scope !== "all" && sourceIds.length === 0) {
+      setActionError(`No ${scopeLabel} are available for export.`);
+      return;
+    }
+
+    setActionMessage("");
+    setActionError("");
+    if (exportModalDraft.kind === "spreadsheet") {
+      setSpreadsheetExportPending(true);
+      try {
+        const result = await api.exportRepositoryManifest({
+          scope: backendScope,
+          format: exportModalDraft.format,
+          column_scope: exportModalDraft.columnScope,
+          column_keys:
+            exportModalDraft.columnScope === "visible"
+              ? renderedColumns.map((column) => column.key)
+              : [],
+          source_ids: sourceIds,
+          filters: filterPayload,
+        });
+        downloadBlob(result.blob, result.filename);
+        setExportModalDraft(null);
+        setActionMessage(
+          `Downloaded ${result.exportedCount} spreadsheet row${result.exportedCount === 1 ? "" : "s"} for ${scopeLabel}.`,
+        );
+      } catch (error) {
+        setActionError(String((error as Error).message || "Failed to export spreadsheet data"));
+      } finally {
+        setSpreadsheetExportPending(false);
+      }
       return;
     }
 
     setRisExportPending(true);
-    setActionMessage("");
-    setActionError("");
     try {
       const result = await api.exportRepositoryCitationRis({
-        scope: "selected",
+        scope: backendScope,
         source_ids: sourceIds,
-        filters: {
-          q: "",
-          fetch_status: "",
-          detected_type: "",
-          source_kind: "",
-          document_type: "",
-          organization_type: "",
-          organization_name: "",
-          author_names: "",
-          publication_date: "",
-          tags_text: "",
-          has_summary: null,
-          has_rating: null,
-          rating_overall_min: null,
-          rating_overall_max: null,
-          rating_overall_relevance_min: null,
-          rating_overall_relevance_max: null,
-          rating_depth_score_min: null,
-          rating_depth_score_max: null,
-          rating_relevant_detail_score_min: null,
-          rating_relevant_detail_score_max: null,
-          citation_type: "",
-          citation_doi: "",
-          citation_report_number: "",
-          citation_standard_number: "",
-          citation_missing_fields: "",
-          citation_ready: null,
-          citation_confidence_min: null,
-          citation_confidence_max: null,
-        },
+        filters: filterPayload,
       });
       downloadBlob(result.blob, result.filename);
+      setExportModalDraft(null);
       setActionMessage(
-        `Downloaded ${result.exportedCount} RIS citation record(s) for ${label.toLowerCase()}` +
+        `Downloaded ${result.exportedCount} RIS citation record(s) for ${scopeLabel}` +
           (result.skippedCount ? ` (${result.skippedCount} incomplete source(s) skipped).` : "."),
       );
     } catch (error) {
@@ -2211,6 +2573,9 @@ export function RepositoryBrowserPage() {
                 </option>
               ))}
             </SelectField>
+            <div className="flex flex-wrap gap-2">
+              <Button onClick={() => void loadProfiles()}>Refresh Profiles</Button>
+            </div>
             <div className="text-body-md text-on-surface-variant">
               `Add Links` imports seed/link files, then starts deterministic fetch and conversion only.
               `Add Files` imports local documents into the repository without triggering AI enrichment.
@@ -2345,7 +2710,6 @@ export function RepositoryBrowserPage() {
               <Button variant="primary" disabled={runPending} onClick={() => void handleRunTasks()}>
                 {runPending ? "Starting..." : "Run Selected Tasks"}
               </Button>
-              <Button onClick={() => void loadProfiles()}>Refresh Profiles</Button>
             </div>
           </div>
 
@@ -2588,8 +2952,11 @@ export function RepositoryBrowserPage() {
         )}
       </SurfaceCard>
 
-      <div className="grid min-h-0 flex-1 gap-4 xl:grid-cols-[minmax(0,1fr)_24rem]">
-        <div className="flex min-h-0 flex-col gap-4">
+      <div
+        ref={browserPanelsRef}
+        className="flex min-h-0 flex-1 flex-col gap-4 xl:flex-row xl:gap-0"
+      >
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-4">
           <SurfaceCard>
             <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto_auto]">
               <InputField
@@ -2629,7 +2996,7 @@ export function RepositoryBrowserPage() {
               </div>
             ) : (
               <div className="flex min-h-0 flex-1 flex-col">
-                <div className="thin-scrollbar min-h-0 flex-1 overflow-auto">
+                <div ref={tableScrollRef} className="thin-scrollbar min-h-0 flex-1 overflow-auto">
                   <div
                     className="repository-browser-action-row sticky top-0 z-10"
                     style={{
@@ -2893,6 +3260,24 @@ export function RepositoryBrowserPage() {
                   </table>
                 </div>
 
+                <div className="shrink-0 border-t border-outline-variant/20 bg-surface-bright/70 px-0 py-2">
+                  <div
+                    ref={scrollbarTrackRef}
+                    className="repository-browser-horizontal-scrollbar relative h-3 rounded-full bg-outline-variant/25"
+                    onMouseDown={handleHorizontalTrackMouseDown}
+                  >
+                    <div
+                      aria-hidden="true"
+                      className="absolute top-0 h-3 rounded-full bg-primary/80 shadow-sm transition-colors hover:bg-primary"
+                      style={{
+                        width: `${horizontalCanScroll ? horizontalThumbWidth : Math.max(horizontalScrollViewport, 0)}px`,
+                        transform: `translateX(${horizontalThumbOffset}px)`,
+                      }}
+                      onMouseDown={beginHorizontalThumbDrag}
+                    />
+                  </div>
+                </div>
+
                 <div className="flex items-center justify-between border-t border-outline-variant/30 bg-surface-container px-4 py-3">
                   <div className="text-body-md text-on-surface-variant">
                     Showing {rows.length} rows on this page out of {totalRows} total
@@ -2929,50 +3314,79 @@ export function RepositoryBrowserPage() {
           <SurfaceCard className="shrink-0">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
-                <div className="text-title-sm font-semibold">Export RIS</div>
+                <div className="text-title-sm font-semibold">Export</div>
                 <div className="mt-1 text-body-md text-on-surface-variant">
-                  Export citations from the selected rows or from the currently displayed page.
+                  Choose whole database, selected rows, or the currently displayed rows in the export dialog.
+                  Spreadsheet exports support `.csv` and `.xlsx`. RIS exports citation records only.
                 </div>
               </div>
               <div className="flex flex-wrap gap-2">
                 <Button
                   variant="primary"
-                  disabled={selectedIds.size === 0 || risExportPending}
-                  onClick={() => void handleExportRis(Array.from(selectedIds), "Selected Rows")}
+                  disabled={
+                    spreadsheetExportPending ||
+                    risExportPending ||
+                    !(Number(repositoryStatus?.total_sources || 0) > 0)
+                  }
+                  onClick={() => openExportModal("spreadsheet")}
                 >
-                  {risExportPending ? "Exporting..." : "Export RIS For Selected Rows"}
+                  {spreadsheetExportPending ? "Exporting..." : "Export Spreadsheet"}
                 </Button>
                 <Button
-                  disabled={rows.length === 0 || risExportPending}
-                  onClick={() => void handleExportRis(rows.map((row) => row.id), "Displayed Rows")}
+                  disabled={
+                    spreadsheetExportPending ||
+                    risExportPending ||
+                    !(Number(repositoryStatus?.total_sources || 0) > 0)
+                  }
+                  onClick={() => openExportModal("ris")}
                 >
-                  Export RIS For Displayed Rows
+                  {risExportPending ? "Exporting..." : "Export RIS"}
                 </Button>
               </div>
             </div>
           </SurfaceCard>
         </div>
 
-        {activeRow && detailDraft ? (
-          <SourceDetailsDrawer
-            draft={detailDraft}
-            row={activeRow}
-            saveError={detailSaveError}
-            saveState={detailSaveState}
-            onChange={(field, value) => {
-              setDetailDraft((prev) => (prev ? { ...prev, [field]: value } : prev));
-              setDetailSaveState("idle");
-              setDetailSaveError("");
-            }}
-          />
-        ) : (
-          <SurfaceCard className="h-full">
-            <EmptyState
-              title="Select A Source"
-              detail="Click a row to inspect status, open files, and edit metadata, summary, and rating fields."
+        <div className="hidden min-h-0 shrink-0 xl:flex xl:items-stretch">
+          <button
+            aria-label="Resize spreadsheet and source details panels"
+            className="group flex w-4 cursor-col-resize items-center justify-center"
+            onMouseDown={beginPaneResize}
+            type="button"
+          >
+            <span className="h-20 w-1 rounded-full bg-outline-variant/60 transition group-hover:bg-primary/80" />
+          </button>
+        </div>
+
+        <div
+          className="repository-browser-details-pane min-h-0 w-full xl:shrink-0"
+          style={
+            {
+              "--repository-browser-details-pane-width": `${detailPaneWidth}px`,
+            } as CSSProperties
+          }
+        >
+          {activeRow && detailDraft ? (
+            <SourceDetailsDrawer
+              draft={detailDraft}
+              row={activeRow}
+              saveError={detailSaveError}
+              saveState={detailSaveState}
+              onChange={(field, value) => {
+                setDetailDraft((prev) => (prev ? { ...prev, [field]: value } : prev));
+                setDetailSaveState("idle");
+                setDetailSaveError("");
+              }}
             />
-          </SurfaceCard>
-        )}
+          ) : (
+            <SurfaceCard className="h-full">
+              <EmptyState
+                title="Select A Source"
+                detail="Click a row to inspect status, open files, and edit metadata, summary, and rating fields."
+              />
+            </SurfaceCard>
+          )}
+        </div>
       </div>
       {columnPromptDraft && (
         <ColumnPromptModal
@@ -2986,8 +3400,8 @@ export function RepositoryBrowserPage() {
             setColumnPromptDraft(null);
             setColumnPromptError("");
           }}
-          onChange={(nextValue) => {
-            setColumnPromptDraft((prev) => (prev ? { ...prev, prompt: nextValue } : prev));
+          onChange={(patch) => {
+            setColumnPromptDraft((prev) => (prev ? { ...prev, ...patch } : prev));
             setColumnPromptError("");
           }}
           onFixPrompt={() => void handleFixColumnPrompt()}
@@ -3007,6 +3421,25 @@ export function RepositoryBrowserPage() {
             setColumnRunScopeDraft((prev) => (prev ? { ...prev, scope } : prev))
           }
           onConfirm={() => void handleRunColumn(columnRunScopeDraft)}
+        />
+      )}
+      {exportModalDraft && (
+        <ExportModal
+          draft={exportModalDraft}
+          displayedCount={rows.length}
+          pendingKind={
+            spreadsheetExportPending ? "spreadsheet" : risExportPending ? "ris" : null
+          }
+          selectedCount={selectedIds.size}
+          totalCount={Number(repositoryStatus?.total_sources || 0)}
+          onCancel={() => {
+            if (spreadsheetExportPending || risExportPending) return;
+            setExportModalDraft(null);
+          }}
+          onChange={(patch) =>
+            setExportModalDraft((prev) => (prev ? { ...prev, ...patch } : prev))
+          }
+          onConfirm={() => void handleExport()}
         />
       )}
     </div>

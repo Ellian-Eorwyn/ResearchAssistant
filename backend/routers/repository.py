@@ -30,6 +30,7 @@ from backend.models.repository import (
     RepositoryColumnRunStatus,
     RepositoryColumnUpdateRequest,
     RepositoryDocumentImportListResponse,
+    RepositoryManifestExportRequest,
     RepositorySourceDeleteRequest,
     RepositorySourceDeleteResponse,
     RepositorySourceExportRequest,
@@ -765,6 +766,23 @@ async def export_repository_citations_ris(
     return Response(
         content=content,
         media_type="application/x-research-info-systems; charset=utf-8",
+        headers=headers,
+    )
+
+
+@router.post("/repository/manifest/export")
+async def export_repository_manifest(
+    request: Request,
+    payload: RepositoryManifestExportRequest,
+) -> Response:
+    service = request.app.state.repository_service
+    try:
+        content, headers, media_type = service.export_manifest(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return Response(
+        content=content,
+        media_type=media_type,
         headers=headers,
     )
 

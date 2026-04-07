@@ -156,6 +156,20 @@ body {
   opacity: 0.45;
 }
 
+.repository-browser-horizontal-scrollbar {
+  cursor: pointer;
+}
+
+.repository-browser-details-pane {
+  width: 100%;
+}
+
+@media (min-width: 1280px) {
+  .repository-browser-details-pane {
+    width: var(--repository-browser-details-pane-width, 384px);
+  }
+}
+
 .data-table tbody tr:nth-child(odd) {
   background: rgba(12, 19, 36, 0.75);
 }

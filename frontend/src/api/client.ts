@@ -20,11 +20,12 @@ import type {
   RepositoryColumnRunStartResponse,
   RepositoryColumnRunStatus,
   RepositoryCitationDataResponse,
-  RepositoryCitationRisDownloadResult,
   RepositoryCitationRisExportRequest,
   RepositoryDashboardResponse,
   RepositoryDocumentImportListResponse,
+  RepositoryFileDownloadResult,
   RepositoryImportResponse,
+  RepositoryManifestExportRequest,
   RepositoryManifestResponse,
   RepositoryManifestFilterPayload,
   RepositoryMergeResponse,
@@ -87,7 +88,7 @@ function parseContentDispositionFilename(value: string | null): string {
   return simpleMatch?.[1]?.trim() || "export.ris";
 }
 
-async function apiPostDownload(path: string, body: unknown): Promise<RepositoryCitationRisDownloadResult> {
+async function apiPostDownload(path: string, body: unknown): Promise<RepositoryFileDownloadResult> {
   const resp = await fetch(`/api/${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -242,6 +243,8 @@ export const api = {
       label?: string;
       instruction_prompt?: string;
       output_constraint?: RepositoryColumnConfig["output_constraint"];
+      include_row_context?: boolean;
+      include_source_text?: boolean;
     },
   ) =>
     apiPatch<RepositoryColumnConfig>(
@@ -290,4 +293,6 @@ export const api = {
     }),
   exportRepositoryCitationRis: (payload: RepositoryCitationRisExportRequest) =>
     apiPostDownload("repository/citations/export-ris", payload),
+  exportRepositoryManifest: (payload: RepositoryManifestExportRequest) =>
+    apiPostDownload("repository/manifest/export", payload),
 };
