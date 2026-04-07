@@ -77,8 +77,8 @@ By default, primary source text is included and row metadata is not.
 ### 1. Clone the repository
 
 ```bash
-git clone <your-github-repository-url>
-cd ResearchAssistant
+git clone https://github.com/Ellian-Eorwyn/ResearchAssistantLLM
+cd ResearchAssistantLLM
 ```
 
 ### 2. Set up Python dependencies and Playwright
