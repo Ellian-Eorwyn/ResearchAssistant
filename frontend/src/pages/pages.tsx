@@ -503,7 +503,7 @@ export function DocumentsPage() {
     <div>
       <SectionHeader
         title="Ingest"
-        description="Bring seed links or primary documents into the repository. Uploaded files become repository sources; citation extraction now lives under Advanced/Legacy."
+        description="Bring seed links or primary documents into the repository. Uploaded files become repository sources and now start repository markdown, metadata, and citation processing automatically."
       />
 
       <div className="grid gap-4 xl:grid-cols-2">
@@ -558,7 +558,7 @@ export function DocumentsPage() {
         <SurfaceCard>
           <div className="text-title-sm font-semibold">Add Documents To Repository</div>
           <div className="mt-2 text-body-md text-on-surface-variant">
-            Upload PDFs, docs, markdown, or HTML directly into the repository. These become first-class local sources and can be processed in bulk through convert, catalog, summary, and tagging phases.
+            Upload PDFs, docs, markdown, or HTML directly into the repository. These become first-class local sources and immediately enter the repository conversion, catalog, and citation pipeline for the newly added batch.
           </div>
           <div
             className="mt-4 rounded-lg border border-dashed border-outline-variant bg-surface-container-low p-6 text-center"

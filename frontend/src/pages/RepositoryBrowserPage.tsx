@@ -1439,6 +1439,7 @@ export function RepositoryBrowserPage() {
   const [linksPending, setLinksPending] = useState(false);
   const [filesPending, setFilesPending] = useState(false);
   const [downloadAllPending, setDownloadAllPending] = useState(false);
+  const [redownloadSelectedPending, setRedownloadSelectedPending] = useState(false);
   const [downloadAllWithCleanup, setDownloadAllWithCleanup] = useState(false);
   const [runPending, setRunPending] = useState(false);
   const [deletePending, setDeletePending] = useState(false);
@@ -2262,16 +2263,95 @@ export function RepositoryBrowserPage() {
     setFilesPending(true);
     setActionMessage("");
     setActionError("");
+    let importResponse:
+      | {
+          accepted_new: number;
+          duplicates_skipped: number;
+          import_id: string;
+          message: string;
+        }
+      | null = null;
     try {
       const response = await api.ingestRepositoryDocuments(files);
+      importResponse = response;
       await refreshDashboard();
+      if (response.accepted_new <= 0) {
+        setActionMessage(
+          response.message ||
+            `Imported 0 new file(s) into the repository (${response.duplicates_skipped} duplicates skipped).`,
+        );
+        void manifestQuery.refetch();
+        return;
+      }
+      setSourceTaskDraft((prev) => ({
+        ...prev,
+        scope: "import",
+        import_id: response.import_id,
+        source_ids: [],
+        run_download: false,
+        run_convert: true,
+        run_catalog: true,
+        run_citation_verify: true,
+        run_llm_cleanup: false,
+        run_llm_title: false,
+        run_llm_summary: false,
+        run_llm_rating: false,
+        force_redownload: false,
+        force_convert: false,
+        force_catalog: false,
+        force_citation_verify: false,
+        force_llm_cleanup: false,
+        force_title: false,
+        force_summary: false,
+        force_rating: false,
+        include_raw_file: true,
+        include_rendered_html: true,
+        include_rendered_pdf: true,
+        include_markdown: true,
+      }));
+      const startResponse = await api.startRepositorySourceTasks({
+        ...sourceTaskDraft,
+        scope: "import",
+        import_id: response.import_id,
+        source_ids: [],
+        rerun_failed_only: false,
+        run_download: false,
+        run_convert: true,
+        run_catalog: true,
+        run_citation_verify: true,
+        run_llm_cleanup: false,
+        run_llm_title: false,
+        run_llm_summary: false,
+        run_llm_rating: false,
+        force_redownload: false,
+        force_convert: false,
+        force_catalog: false,
+        force_citation_verify: false,
+        force_llm_cleanup: false,
+        force_title: false,
+        force_summary: false,
+        force_rating: false,
+        include_raw_file: true,
+        include_rendered_html: true,
+        include_rendered_pdf: true,
+        include_markdown: true,
+        project_profile_name: settingsDraft.default_project_profile_name,
+      });
       setActionMessage(
-        response.message ||
-          `Imported ${response.accepted_new} file(s) into the repository. No AI enrichment was started.`,
+        startResponse.message ||
+          `Imported ${response.accepted_new} file(s) and started markdown conversion, cataloging, and citation verification for that batch.`,
       );
+      trackSourceTaskJob(startResponse.job_id || null, startResponse.message || "");
       void manifestQuery.refetch();
     } catch (error) {
-      setActionError(String((error as Error).message || "Failed to import files"));
+      const detail = String((error as Error).message || "Failed to import files");
+      if (importResponse && importResponse.accepted_new > 0) {
+        setActionError(
+          `Imported ${importResponse.accepted_new} file(s), but failed to start repository processing: ${detail}`,
+        );
+      } else {
+        setActionError(detail);
+      }
     } finally {
       setFilesPending(false);
     }
@@ -2335,6 +2415,13 @@ export function RepositoryBrowserPage() {
     const selectedTaskIds = Array.from(selectedIds);
     const scope = browserTaskScope === "selected" ? "all" : browserTaskScope;
     const sourceIds = browserTaskScope === "selected" ? selectedTaskIds : [];
+    const shouldConvertBeforeEnrichment =
+      Boolean(sourceTaskDraft.run_llm_cleanup) ||
+      Boolean(sourceTaskDraft.run_catalog) ||
+      Boolean(sourceTaskDraft.run_citation_verify) ||
+      Boolean(sourceTaskDraft.run_llm_title) ||
+      Boolean(sourceTaskDraft.run_llm_summary) ||
+      Boolean(sourceTaskDraft.run_llm_rating);
     if (
       !sourceTaskDraft.run_llm_cleanup &&
       !sourceTaskDraft.run_catalog &&
@@ -2362,7 +2449,7 @@ export function RepositoryBrowserPage() {
         source_ids: sourceIds,
         rerun_failed_only: false,
         run_download: false,
-        run_convert: false,
+        run_convert: shouldConvertBeforeEnrichment,
         run_catalog: Boolean(sourceTaskDraft.run_catalog),
         run_citation_verify: Boolean(sourceTaskDraft.run_citation_verify),
         run_llm_cleanup: Boolean(sourceTaskDraft.run_llm_cleanup),
@@ -2391,6 +2478,58 @@ export function RepositoryBrowserPage() {
       setActionError(String((error as Error).message || "Failed to start repository enrichment"));
     } finally {
       setRunPending(false);
+    }
+  };
+
+  const handleRedownloadSelected = async () => {
+    const sourceIds = Array.from(selectedIds);
+    if (sourceIds.length === 0 || redownloadSelectedPending || sourceRunning) return;
+
+    setRedownloadSelectedPending(true);
+    setActionMessage("");
+    setActionError("");
+    try {
+      const response = await api.startRepositorySourceTasks({
+        ...sourceTaskDraft,
+        scope: "all",
+        import_id: "",
+        source_ids: sourceIds,
+        rerun_failed_only: false,
+        run_download: true,
+        run_convert: true,
+        run_catalog: false,
+        run_citation_verify: false,
+        run_llm_cleanup: false,
+        run_llm_title: false,
+        run_llm_summary: false,
+        run_llm_rating: false,
+        force_redownload: true,
+        force_convert: true,
+        force_catalog: false,
+        force_citation_verify: false,
+        force_llm_cleanup: false,
+        force_title: false,
+        force_summary: false,
+        force_rating: false,
+        include_raw_file: true,
+        include_rendered_html: true,
+        include_rendered_pdf: true,
+        include_markdown: true,
+        project_profile_name: settingsDraft.default_project_profile_name,
+      });
+      setActionMessage(
+        response.message ||
+          `Started redownload and reconversion for ${sourceIds.length} selected row(s).`,
+      );
+      trackSourceTaskJob(response.job_id || null, response.message || "");
+      void refreshDashboard();
+      void manifestQuery.refetch();
+    } catch (error) {
+      setActionError(
+        String((error as Error).message || "Failed to start selected-row redownload"),
+      );
+    } finally {
+      setRedownloadSelectedPending(false);
     }
   };
 
@@ -2578,7 +2717,7 @@ export function RepositoryBrowserPage() {
             </div>
             <div className="text-body-md text-on-surface-variant">
               `Add Links` imports seed/link files, then starts deterministic fetch and conversion only.
-              `Add Files` imports local documents into the repository without triggering AI enrichment.
+              `Add Files` imports local documents, converts them to markdown, and starts repository metadata and citation processing for the new batch.
               `Download All Sources` runs the existing repository download/conversion pipeline across the full repository.
             </div>
             <input
@@ -2969,6 +3108,14 @@ export function RepositoryBrowserPage() {
                 250 rows per page
               </div>
               <div className="md:mt-5 flex flex-wrap gap-2">
+                <Button
+                  disabled={selectedIds.size === 0 || redownloadSelectedPending || sourceRunning}
+                  onClick={() => void handleRedownloadSelected()}
+                >
+                  {redownloadSelectedPending
+                    ? "Starting Redownload..."
+                    : `Redownload Selected${selectedIds.size ? ` (${selectedIds.size})` : ""}`}
+                </Button>
                 <Button
                   disabled={selectedIds.size === 0 || deletePending}
                   variant="danger"

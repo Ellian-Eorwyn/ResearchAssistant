@@ -701,24 +701,104 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       }
       setRepoError("");
       setRepoMessage("Adding documents to the repository...");
+      let importResponse:
+        | {
+            accepted_new: number;
+            duplicates_skipped: number;
+            import_id: string;
+            message: string;
+            total_sources: number;
+          }
+        | null = null;
       try {
         const response = await api.ingestRepositoryDocuments(files);
+        importResponse = response;
         await refreshDashboard();
         setHasSourceUrls((response.total_sources || 0) > 0);
+        if (response.accepted_new <= 0) {
+          setSourceTaskDraft((prev) => ({
+            ...prev,
+            scope: "import",
+            import_id: response.import_id,
+          }));
+          setRepoMessage(
+            response.message ||
+              `Added 0 new repository documents (${response.duplicates_skipped} duplicates skipped).`,
+          );
+          return;
+        }
         setSourceTaskDraft((prev) => ({
           ...prev,
           scope: "import",
           import_id: response.import_id,
+          source_ids: [],
+          run_download: false,
+          run_convert: true,
+          run_catalog: true,
+          run_citation_verify: true,
+          run_llm_cleanup: false,
+          run_llm_title: false,
+          run_llm_summary: false,
+          run_llm_rating: false,
+          force_redownload: false,
+          force_convert: false,
+          force_catalog: false,
+          force_citation_verify: false,
+          force_llm_cleanup: false,
+          force_title: false,
+          force_summary: false,
+          force_rating: false,
+          include_raw_file: true,
+          include_rendered_html: true,
+          include_rendered_pdf: true,
+          include_markdown: true,
         }));
+        const startResponse = await api.startRepositorySourceTasks({
+          rerun_failed_only: false,
+          run_download: false,
+          run_convert: true,
+          run_catalog: true,
+          run_citation_verify: true,
+          run_llm_cleanup: false,
+          run_llm_title: false,
+          run_llm_summary: false,
+          run_llm_rating: false,
+          force_redownload: false,
+          force_convert: false,
+          force_catalog: false,
+          force_citation_verify: false,
+          force_llm_cleanup: false,
+          force_title: false,
+          force_summary: false,
+          force_rating: false,
+          project_profile_name: settingsDraft.default_project_profile_name,
+          include_raw_file: true,
+          include_rendered_html: true,
+          include_rendered_pdf: true,
+          include_markdown: true,
+          scope: "import",
+          import_id: response.import_id,
+          source_ids: [],
+        });
+        setSourceTaskJobId(startResponse.job_id || null);
+        setSourceStatus(null);
+        setSourcePolling(Boolean(startResponse.job_id));
         setRepoMessage(
-          response.message ||
-            `Added ${response.accepted_new} repository documents (${response.duplicates_skipped} duplicates skipped).`,
+          startResponse.message ||
+            `Added ${response.accepted_new} repository documents and started markdown conversion, cataloging, and citation verification for that batch.`,
         );
       } catch (error) {
-        setRepoError(String((error as Error).message || "Repository document ingest failed"));
+        const detail = String((error as Error).message || "Repository document ingest failed");
+        if (importResponse && importResponse.accepted_new > 0) {
+          setRepoError(
+            `Added ${importResponse.accepted_new} repository documents, but failed to start processing: ${detail}`,
+          );
+        } else {
+          setRepoError(detail);
+        }
       }
     },
-    [refreshDashboard],
+    [refreshDashboard, settingsDraft.default_project_profile_name],
   );
 
   const importSourceList = useCallback(
