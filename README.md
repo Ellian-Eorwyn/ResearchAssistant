@@ -26,7 +26,7 @@ Everything is designed around a persistent on-disk repository that you control. 
 - Export repository data as spreadsheet files (`.csv` or `.xlsx`) or export citations as RIS.
 
 ## Core Concepts
-
+ 
 ### Repository-first workflow
 
 ResearchAssistant is centered on a repository folder on disk. That folder becomes the working dataset for a project and stores:
