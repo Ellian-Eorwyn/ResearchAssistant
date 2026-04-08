@@ -13,6 +13,8 @@
 
 # Local repro or tool-specific folders
 /.claude/
+/docs/
+/tests/
 /test documents/
 
 # Local virtual environments
