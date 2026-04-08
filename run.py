@@ -1,5 +1,6 @@
 """Entry point: starts the FastAPI server and opens the browser."""
 
+import os
 import threading
 import time
 import webbrowser
@@ -10,13 +11,13 @@ from backend.app import create_app
 
 app = create_app()
 
-HOST = "127.0.0.1"
-PORT = 7995
+HOST = os.environ.get("RA_HOST", "0.0.0.0")
+PORT = int(os.environ.get("RA_PORT", "7995"))
 
 
 def open_browser():
     time.sleep(1.5)
-    webbrowser.open(f"http://{HOST}:{PORT}")
+    webbrowser.open(f"http://127.0.0.1:{PORT}")
 
 
 if __name__ == "__main__":

@@ -96,6 +96,7 @@ interface QueuedSourceTask {
 }
 
 interface AppStateValue {
+  initializing: boolean;
   repoLoaded: boolean;
   repositoryStatus: RepositoryStatusResponse | null;
   dashboard: RepositoryDashboardResponse | null;
@@ -271,6 +272,7 @@ function repositoryFinalizeInFlight(status: JobStatusResponse | null): boolean {
 }
 
 export function AppStateProvider({ children }: PropsWithChildren) {
+  const [initializing, setInitializing] = useState(true);
   const [repoLoaded, setRepoLoaded] = useState(false);
   const [repositoryStatus, setRepositoryStatus] = useState<RepositoryStatusResponse | null>(null);
   const [dashboard, setDashboard] = useState<RepositoryDashboardResponse | null>(null);
@@ -608,6 +610,28 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       resetJobScopedState,
     ],
   );
+
+  // On mount, check if the backend already has a repo attached (survives page refresh).
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getRepoStatus()
+      .then(async (status) => {
+        if (!cancelled && status.attached) {
+          await onRepoLoaded(status);
+        }
+      })
+      .catch(() => {
+        // Backend not ready or no repo attached — show landing page.
+      })
+      .finally(() => {
+        if (!cancelled) setInitializing(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const openRepository = useCallback(
     async (path: string): Promise<boolean> => {
@@ -1397,6 +1421,7 @@ export function AppStateProvider({ children }: PropsWithChildren) {
 
   const value = useMemo<AppStateValue>(
     () => ({
+      initializing,
       repoLoaded,
       repositoryStatus,
       dashboard,
@@ -1473,6 +1498,7 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       warnings,
     }),
     [
+      initializing,
       repoLoaded,
       repositoryStatus,
       dashboard,

@@ -21,7 +21,11 @@ import {
 import { useAppState } from "./state/AppState";
 
 export default function App() {
-  const { repoLoaded } = useAppState();
+  const { initializing, repoLoaded } = useAppState();
+
+  if (initializing) {
+    return null;
+  }
 
   if (!repoLoaded) {
     return <LandingPage />;
