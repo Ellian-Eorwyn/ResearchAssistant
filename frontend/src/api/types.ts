@@ -278,6 +278,7 @@ export interface RepoSettings {
   research_purpose: string;
   default_project_profile_name: string;
   fetch_delay: number;
+  searxng_base_url: string;
 }
 
 export interface AppSettings {
@@ -677,6 +678,7 @@ export interface RepositoryManifestColumn {
   kind: "builtin" | "custom";
   renamable: boolean;
   processable: boolean;
+  requires_llm: boolean;
   sort_type: "text" | "number" | "date";
   instruction_prompt: string;
   output_constraint: RepositoryColumnOutputConstraint | null;
@@ -728,6 +730,43 @@ export interface RepositoryManifestResponse {
 
 export type RepositorySourceFileKind = "pdf" | "html" | "rendered" | "md";
 
+export interface RepositoryDuplicateCandidateRow {
+  id: string;
+  title: string;
+  author_names: string;
+  publication_date: string;
+  publication_year: string;
+  organization_name: string;
+  document_type: string;
+  source_kind: string;
+  fetch_status: string;
+  original_url: string;
+  final_url: string;
+  citation_url: string;
+  citation_doi: string;
+  imported_at: string;
+  quality_score: number;
+}
+
+export interface RepositoryDuplicateCandidateGroup {
+  group_id: string;
+  match_reason: string;
+  confidence: "high" | "medium";
+  suggested_keep_id: string;
+  suggested_delete_ids: string[];
+  rows: RepositoryDuplicateCandidateRow[];
+}
+
+export interface RepositoryDuplicateCandidateResponse {
+  status: string;
+  scanned_sources: number;
+  total_groups: number;
+  total_candidate_rows: number;
+  truncated: boolean;
+  message: string;
+  groups: RepositoryDuplicateCandidateGroup[];
+}
+
 export interface RepositorySourceDeleteResponse {
   status: string;
   deleted_sources: number;
@@ -735,6 +774,14 @@ export interface RepositorySourceDeleteResponse {
   deleted_files: number;
   total_sources: number;
   total_citations: number;
+  message: string;
+}
+
+export interface RepositorySourceBulkRisReadyResponse {
+  status: string;
+  requested_sources: number;
+  ready_sources: number;
+  blocked_sources: number;
   message: string;
 }
 
@@ -751,6 +798,18 @@ export interface RepositorySourceExportResponse {
   missing_files: number;
   destination_path: string;
   message: string;
+}
+
+export type RepositoryBundleExportScope = "all" | "selected";
+export type RepositoryBundleFileKind = "pdf" | "rendered" | "html" | "md";
+export type RepositoryBundleExportMode = "offline" | "cloud";
+
+export interface RepositoryBundleExportRequest {
+  scope: RepositoryBundleExportScope;
+  source_ids: string[];
+  file_kinds: RepositoryBundleFileKind[];
+  mode: RepositoryBundleExportMode;
+  base_url: string;
 }
 
 export interface RepositorySourcePatchRequest {
@@ -852,4 +911,42 @@ export type RepositoryCitationRisDownloadResult = RepositoryFileDownloadResult;
 export interface UploadResponse {
   job_id: string;
   files: Array<{ filename: string; file_type: string; size_bytes: number }>;
+}
+
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+
+export interface SearchResultItem {
+  url: string;
+  title: string;
+  snippet: string;
+  engine: string;
+  engines: string[];
+  searxng_score: number;
+  category: string;
+  published_date: string;
+  relevance_score: number;
+  relevance_scored: boolean;
+}
+
+export interface SearchJobStatus {
+  job_id: string;
+  state: "pending" | "generating_queries" | "searching" | "scoring" | "completed" | "failed";
+  prompt: string;
+  generated_queries: string[];
+  queries_completed: number;
+  total_queries: number;
+  results_found: number;
+  results_scored: number;
+  results_total: number;
+  results: SearchResultItem[];
+  error_message: string;
+}
+
+export interface SearchImportResponse {
+  imported_count: number;
+  duplicates_skipped: number;
+  total_sources: number;
+  message: string;
 }

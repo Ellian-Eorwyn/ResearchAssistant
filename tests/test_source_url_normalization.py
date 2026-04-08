@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +9,7 @@ from unittest.mock import patch
 from backend.pipeline.source_downloader import (
     RuntimeCapabilities,
     SourceDownloadOrchestrator,
+    SourceManifestRow,
     SourceTarget,
     dedupe_url_key,
     normalize_url,
@@ -140,6 +142,75 @@ class SourceDownloadCancellationTests(unittest.TestCase):
         self.assertTrue(status["cancel_requested"])
         self.assertTrue(status["stop_after_current_item"])
         self.assertIn("finishing current item before stopping", status["message"])
+
+    def test_target_rows_prefer_manual_citation_url_override(self):
+        job_id = self.store.create_job()
+        repo_dir = self.tmp_path / "repository"
+        repo_dir.mkdir()
+        catalog_rel = "sources/000001/000001_catalog.json"
+        catalog_path = repo_dir / catalog_rel
+        catalog_path.parent.mkdir(parents=True)
+        catalog_path.write_text(
+            json.dumps(
+                {
+                    "citation": {
+                        "url": "fixed.example.com/report.pdf",
+                        "manual_override_fields": ["url"],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        orchestrator = SourceDownloadOrchestrator(
+            job_id=job_id,
+            store=self.store,
+            target_rows=[
+                SourceManifestRow(
+                    id="000001",
+                    source_document_name="doc-a.md",
+                    citation_number="1",
+                    original_url="https://broken.example.com/report.pdf",
+                    catalog_file=catalog_rel,
+                )
+            ],
+            output_dir=repo_dir,
+            writes_to_repository=True,
+        )
+
+        targets = orchestrator._build_targets()
+
+        self.assertEqual(targets[0].original_url, "https://fixed.example.com/report.pdf")
+
+    def test_target_rows_keep_original_url_without_manual_override(self):
+        job_id = self.store.create_job()
+        repo_dir = self.tmp_path / "repository-no-override"
+        repo_dir.mkdir()
+        catalog_rel = "sources/000001/000001_catalog.json"
+        catalog_path = repo_dir / catalog_rel
+        catalog_path.parent.mkdir(parents=True)
+        catalog_path.write_text(
+            json.dumps({"citation": {"url": "https://metadata.example.com/report"}}),
+            encoding="utf-8",
+        )
+        orchestrator = SourceDownloadOrchestrator(
+            job_id=job_id,
+            store=self.store,
+            target_rows=[
+                SourceManifestRow(
+                    id="000001",
+                    source_document_name="doc-a.md",
+                    citation_number="1",
+                    original_url="https://broken.example.com/report.pdf",
+                    catalog_file=catalog_rel,
+                )
+            ],
+            output_dir=repo_dir,
+            writes_to_repository=True,
+        )
+
+        targets = orchestrator._build_targets()
+
+        self.assertEqual(targets[0].original_url, "https://broken.example.com/report.pdf")
 
 
 if __name__ == "__main__":

@@ -8,18 +8,24 @@ import {
   type DragEvent as ReactDragEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
+  type ReactNode,
 } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { api } from "../api/client";
 import type {
   CitationFieldEvidence,
+  RepositoryBundleExportMode,
+  RepositoryBundleFileKind,
+  RepositoryDuplicateCandidateResponse,
+  RepositoryDuplicateCandidateRow,
   RepositoryColumnOutputConstraint,
   RepositoryColumnRunStatus,
   RepositoryManifestColumn,
   RepositoryManifestRow,
   RepositorySourceFileKind,
   RepositorySourcePatchRequest,
+  RepositorySourceTaskRequest,
 } from "../api/types";
 import {
   Button,
@@ -33,11 +39,12 @@ import {
 } from "../components/primitives";
 import { useAppState } from "../state/AppState";
 import {
+  buildRepositoryBrowserDownloadTaskPayload,
   buildRepositoryBrowserSourceTaskQueue,
   buildRepositoryManifestFilterPayload,
+  clampRepositoryBrowserColumnWidth,
   buildRepositoryBrowserQuery,
   buildRepositoryBrowserStorageKey,
-  clampRepositoryBrowserColumnWidth,
   labelRepositoryBrowserColumn,
   migrateRepositoryBrowserVisibleColumns,
   mergeRepositoryBrowserColumns,
@@ -50,10 +57,15 @@ import {
   REPOSITORY_BROWSER_FILE_COLUMNS,
   REPOSITORY_BROWSER_PAGE_SIZE,
   toggleRepositoryBrowserSelection,
+  type RepositoryBrowserDownloadScope,
   type RepositoryBrowserFilters,
   type RepositoryBrowserTaskScope,
   type RepositoryBrowserStoredState,
 } from "./repositoryBrowserUtils";
+import {
+  DEFAULT_REPOSITORY_CLOUD_BASE_URL,
+  validateRepositoryBundleBaseUrlInput,
+} from "./repositoryExportUtils";
 
 const REPOSITORY_BROWSER_SELECTION_COLUMN_WIDTH = 52;
 const REPOSITORY_BROWSER_ACTION_ROW_HEIGHT = 84;
@@ -959,6 +971,7 @@ type ExportKind = "spreadsheet" | "ris";
 type ExportScope = "all" | "displayed" | "selected";
 type SpreadsheetExportFormat = "csv" | "xlsx";
 type SpreadsheetExportColumnScope = "all" | "visible";
+type RepositoryBundleScope = "all" | "selected";
 
 interface ColumnRunScopeDraftState {
   columnId: string;
@@ -966,11 +979,26 @@ interface ColumnRunScopeDraftState {
   scope: ColumnRunScope;
 }
 
+interface DownloadSourcesModalDraftState {
+  scope: RepositoryBrowserDownloadScope;
+  include_raw_file: boolean;
+  include_rendered_html: boolean;
+  include_rendered_pdf: boolean;
+  include_markdown: boolean;
+}
+
 interface ExportModalDraftState {
   kind: ExportKind;
   scope: ExportScope;
   format: SpreadsheetExportFormat;
   columnScope: SpreadsheetExportColumnScope;
+}
+
+interface RepositoryBundleExportModalDraftState {
+  mode: RepositoryBundleExportMode;
+  scope: RepositoryBundleScope;
+  fileKinds: RepositoryBundleFileKind[];
+  baseUrl: string;
 }
 
 function repositoryColumnActionButtonClass(disabled = false): string {
@@ -992,6 +1020,84 @@ function columnRunScopeOptionClass(selected: boolean, disabled: boolean): string
   ].join(" ");
 }
 
+type DownloadSourceOutputKey =
+  | "include_raw_file"
+  | "include_rendered_html"
+  | "include_rendered_pdf"
+  | "include_markdown";
+
+const DOWNLOAD_SOURCE_OUTPUT_OPTIONS: Array<{
+  key: DownloadSourceOutputKey;
+  label: string;
+  detail: string;
+}> = [
+  {
+    key: "include_raw_file",
+    label: "Raw files",
+    detail: "Save the original fetched file, such as HTML or PDF.",
+  },
+  {
+    key: "include_rendered_html",
+    label: "Rendered HTML",
+    detail: "Save the Playwright-rendered page HTML when available.",
+  },
+  {
+    key: "include_rendered_pdf",
+    label: "Rendered PDF",
+    detail: "Capture webpage screenshots and package them into a PDF.",
+  },
+  {
+    key: "include_markdown",
+    label: "Markdown extraction",
+    detail: "Convert source content into markdown for downstream processing.",
+  },
+];
+
+function buildDownloadSourcesModalDraft(
+  scope: RepositoryBrowserDownloadScope,
+  draft: Pick<
+    RepositorySourceTaskRequest,
+    | "include_raw_file"
+    | "include_rendered_html"
+    | "include_rendered_pdf"
+    | "include_markdown"
+  >,
+  lockMarkdown = false,
+): DownloadSourcesModalDraftState {
+  return {
+    scope,
+    include_raw_file: Boolean(draft.include_raw_file),
+    include_rendered_html: Boolean(draft.include_rendered_html),
+    include_rendered_pdf: Boolean(draft.include_rendered_pdf),
+    include_markdown: Boolean(draft.include_markdown || lockMarkdown),
+  };
+}
+
+function hasSelectedDownloadOutputs(draft: DownloadSourcesModalDraftState): boolean {
+  return Boolean(
+    draft.include_raw_file ||
+      draft.include_rendered_html ||
+      draft.include_rendered_pdf ||
+      draft.include_markdown,
+  );
+}
+
+function duplicateConfidenceTone(
+  confidence: "high" | "medium",
+): "success" | "warning" {
+  return confidence === "high" ? "success" : "warning";
+}
+
+function duplicateCandidateDisplayUrl(row: RepositoryDuplicateCandidateRow): string {
+  return (
+    row.citation_url ||
+    row.final_url ||
+    row.original_url ||
+    row.citation_doi ||
+    ""
+  );
+}
+
 function ColumnInstructionsIcon() {
   return (
     <svg aria-hidden="true" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
@@ -1003,6 +1109,34 @@ function ColumnInstructionsIcon() {
         strokeWidth="1.7"
       />
     </svg>
+  );
+}
+
+function BrowserTopPanel({
+  title,
+  open,
+  onToggle,
+  children,
+}: {
+  title: string;
+  open: boolean;
+  onToggle: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <section className="rounded-md border border-outline-variant/30 bg-surface-container-low p-3">
+      <div className="flex items-center justify-between gap-3">
+        <div className="text-title-sm font-semibold">{title}</div>
+        <Button
+          variant="ghost"
+          className="shrink-0 px-0 py-0 text-label-sm font-semibold"
+          onClick={onToggle}
+        >
+          {open ? "Collapse" : "Expand"}
+        </Button>
+      </div>
+      {open ? <div className="mt-3 space-y-3">{children}</div> : null}
+    </section>
   );
 }
 
@@ -1036,7 +1170,7 @@ function formatColumnActionStatus(
     return `${activeRun.processed_rows}/${activeRun.total_rows} processed`;
   }
   if (!column.processable) return "Not available";
-  if (!column.instruction_prompt.trim()) return "No instructions";
+  if (column.requires_llm && !column.instruction_prompt.trim()) return "No instructions";
   if (column.last_run_status.trim()) {
     return column.last_run_status.replace(/_/g, " ");
   }
@@ -1180,6 +1314,11 @@ function ColumnRunScopeModal({
   onConfirm: () => void;
 }) {
   const selectedDisabled = selectedCount === 0;
+  const emptyOnlyLabel = draft.columnId === "citation_ready" ? "Not RIS Ready" : "Blank Rows Only";
+  const emptyOnlyDetail =
+    draft.columnId === "citation_ready"
+      ? "Recompute only rows that are not currently marked RIS ready."
+      : "Fill only rows where this column is currently empty.";
   return (
     <div className="fixed inset-0 z-40 flex items-center justify-center bg-surface/80 p-4 backdrop-blur-sm">
       <div className="w-full max-w-xl rounded-xl border border-outline-variant/40 bg-surface-container p-5 shadow-2xl">
@@ -1216,10 +1355,8 @@ function ColumnRunScopeModal({
             onClick={() => onChangeScope("empty_only")}
             type="button"
           >
-            <div className="font-semibold text-on-surface">Blank Rows Only</div>
-            <div className="mt-1 text-body-md text-on-surface-variant">
-              Fill only rows where this column is currently empty.
-            </div>
+            <div className="font-semibold text-on-surface">{emptyOnlyLabel}</div>
+            <div className="mt-1 text-body-md text-on-surface-variant">{emptyOnlyDetail}</div>
           </button>
           <button
             className={columnRunScopeOptionClass(draft.scope === "selected", selectedDisabled)}
@@ -1242,6 +1379,543 @@ function ColumnRunScopeModal({
           </Button>
           <Button disabled={startPending} variant="primary" onClick={onConfirm}>
             {startPending ? "Starting..." : "Start Run"}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DownloadSourcesModal({
+  draft,
+  totalCount,
+  selectedCount,
+  startPending,
+  runCleanup,
+  error,
+  onCancel,
+  onChangeScope,
+  onChangeOutput,
+  onConfirm,
+}: {
+  draft: DownloadSourcesModalDraftState;
+  totalCount: number;
+  selectedCount: number;
+  startPending: boolean;
+  runCleanup: boolean;
+  error: string;
+  onCancel: () => void;
+  onChangeScope: (scope: RepositoryBrowserDownloadScope) => void;
+  onChangeOutput: (key: DownloadSourceOutputKey, value: boolean) => void;
+  onConfirm: () => void;
+}) {
+  const selectedDisabled = selectedCount === 0;
+  const hasSelectedOutputs = hasSelectedDownloadOutputs(draft);
+
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-surface/80 p-4 backdrop-blur-sm">
+      <div className="w-full max-w-xl rounded-xl border border-outline-variant/40 bg-surface-container p-5 shadow-2xl">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <div className="text-title-sm font-semibold">Download Sources</div>
+            <div className="mt-1 text-body-md text-on-surface-variant">
+              Choose which repository rows and output files should be retried.
+            </div>
+          </div>
+          <button
+            className="rounded-sm px-2 py-1 text-label-sm text-on-surface-variant hover:text-on-surface"
+            disabled={startPending}
+            onClick={onCancel}
+            type="button"
+          >
+            Close
+          </button>
+        </div>
+
+        <div className="mt-4 grid gap-2">
+          <button
+            className={columnRunScopeOptionClass(draft.scope === "all", false)}
+            disabled={startPending}
+            onClick={() => onChangeScope("all")}
+            type="button"
+          >
+            <div className="font-semibold text-on-surface">All Sources</div>
+            <div className="mt-1 text-body-md text-on-surface-variant">
+              Attempt to refresh the selected outputs for all {totalCount} repository source
+              {totalCount === 1 ? "" : "s"}.
+            </div>
+          </button>
+          <button
+            className={columnRunScopeOptionClass(draft.scope === "selected", selectedDisabled)}
+            disabled={startPending || selectedDisabled}
+            onClick={() => onChangeScope("selected")}
+            type="button"
+          >
+            <div className="font-semibold text-on-surface">Checked Sources</div>
+            <div className="mt-1 text-body-md text-on-surface-variant">
+              {selectedDisabled
+                ? "Check one or more rows in the table to use this scope."
+                : `Attempt to refresh the selected outputs for the ${selectedCount} checked source${selectedCount === 1 ? "" : "s"}.`}
+            </div>
+          </button>
+          <button
+            className={columnRunScopeOptionClass(draft.scope === "failed_fetch", false)}
+            disabled={startPending}
+            onClick={() => onChangeScope("failed_fetch")}
+            type="button"
+          >
+            <div className="font-semibold text-on-surface">Failed Fetches</div>
+            <div className="mt-1 text-body-md text-on-surface-variant">
+              Retry only rows already flagged with failed fetch status. Successful rows will
+              be skipped automatically.
+            </div>
+          </button>
+        </div>
+
+        <div className="mt-4 rounded-lg border border-outline-variant/30 bg-surface-container-low p-4">
+          <div className="text-title-sm font-semibold text-on-surface">Download Outputs</div>
+          <div className="mt-1 text-body-md text-on-surface-variant">
+            Choose which files to regenerate for the selected rows.
+          </div>
+          <div className="mt-3 grid gap-3">
+            {DOWNLOAD_SOURCE_OUTPUT_OPTIONS.map((option) => {
+              const markdownLocked = runCleanup && option.key === "include_markdown";
+              return (
+                <label key={option.key} className="flex items-start gap-3 text-body-md text-on-surface">
+                  <input
+                    checked={draft[option.key]}
+                    disabled={startPending || markdownLocked}
+                    type="checkbox"
+                    onChange={(event) => onChangeOutput(option.key, event.target.checked)}
+                  />
+                  <span>
+                    {option.label}
+                    <span className="block text-on-surface-variant">
+                      {markdownLocked
+                        ? "Required while auto cleanup is enabled."
+                        : option.detail}
+                    </span>
+                  </span>
+                </label>
+              );
+            })}
+          </div>
+        </div>
+
+        {!hasSelectedOutputs && (
+          <div className="mt-3 rounded-md bg-warning/10 px-3 py-2 text-body-md text-warning">
+            Select at least one download output.
+          </div>
+        )}
+        {error && (
+          <div className="mt-3 rounded-md bg-error/10 px-3 py-2 text-body-md text-error">
+            {error}
+          </div>
+        )}
+
+        <div className="mt-5 flex justify-end gap-2">
+          <Button disabled={startPending} onClick={onCancel}>
+            Cancel
+          </Button>
+          <Button disabled={startPending || !hasSelectedOutputs} variant="primary" onClick={onConfirm}>
+            {startPending ? "Starting..." : "Start Download"}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DuplicateReviewModal({
+  response,
+  selectedIds,
+  deletePending,
+  error,
+  onCancel,
+  onToggleRow,
+  onUseSuggested,
+  onConfirm,
+}: {
+  response: RepositoryDuplicateCandidateResponse;
+  selectedIds: Set<string>;
+  deletePending: boolean;
+  error: string;
+  onCancel: () => void;
+  onToggleRow: (sourceId: string, checked: boolean, shiftKey: boolean) => void;
+  onUseSuggested: (groupId: string) => void;
+  onConfirm: () => void;
+}) {
+  const selectedCount = selectedIds.size;
+
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-surface/80 p-4 backdrop-blur-sm">
+      <div className="flex max-h-[90vh] w-full max-w-5xl flex-col rounded-xl border border-outline-variant/40 bg-surface-container p-5 shadow-2xl">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <div className="text-title-sm font-semibold">Review Potential Duplicates</div>
+            <div className="mt-1 text-body-md text-on-surface-variant">
+              {response.total_groups} group{response.total_groups === 1 ? "" : "s"} across{" "}
+              {response.scanned_sources} scanned source{response.scanned_sources === 1 ? "" : "s"}.
+              Suggested removals are preselected.
+            </div>
+          </div>
+          <button
+            className="rounded-sm px-2 py-1 text-label-sm text-on-surface-variant hover:text-on-surface"
+            disabled={deletePending}
+            onClick={onCancel}
+            type="button"
+          >
+            Close
+          </button>
+        </div>
+
+        {response.truncated && (
+          <div className="mt-3 rounded-md bg-warning/10 px-3 py-2 text-body-md text-warning">
+            Only the first {response.total_groups} duplicate groups are shown. Resolve these and run
+            the scan again if needed.
+          </div>
+        )}
+
+        {error && (
+          <div className="mt-3 rounded-md bg-error/10 px-3 py-2 text-body-md text-error">
+            {error}
+          </div>
+        )}
+
+        <div className="mt-4 min-h-0 flex-1 space-y-4 overflow-y-auto pr-1">
+          {response.groups.map((group, index) => {
+            const groupSelectedCount = group.rows.filter((row) => selectedIds.has(row.id)).length;
+            return (
+              <div
+                key={group.group_id}
+                className="rounded-lg border border-outline-variant/30 bg-surface-container-low p-4"
+              >
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div className="text-title-sm font-semibold">Group {index + 1}</div>
+                      <StatusBadge
+                        text={group.confidence === "high" ? "High Confidence" : "Medium Confidence"}
+                        tone={duplicateConfidenceTone(group.confidence)}
+                      />
+                    </div>
+                    <div className="mt-1 text-body-md text-on-surface-variant">
+                      {group.match_reason}
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="text-label-sm text-on-surface-variant">
+                      {groupSelectedCount} selected for removal
+                    </div>
+                    <Button disabled={deletePending} onClick={() => onUseSuggested(group.group_id)}>
+                      Use Suggested
+                    </Button>
+                  </div>
+                </div>
+
+                <div className="mt-3 space-y-3">
+                  {group.rows.map((row) => {
+                    const checked = selectedIds.has(row.id);
+                    const displayUrl = duplicateCandidateDisplayUrl(row);
+                    return (
+                      <label
+                        key={row.id}
+                        className="flex cursor-pointer gap-3 rounded-lg border border-outline-variant/20 bg-surface px-3 py-3"
+                      >
+                        <input
+                          checked={checked}
+                          disabled={deletePending}
+                          type="checkbox"
+                          onChange={(event) => {
+                            const nativeEvent = event.nativeEvent as MouseEvent | Event;
+                            onToggleRow(
+                              row.id,
+                              event.target.checked,
+                              "shiftKey" in nativeEvent ? Boolean(nativeEvent.shiftKey) : false,
+                            );
+                          }}
+                        />
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <div className="text-body-lg font-semibold text-on-surface">
+                              {row.title || displayUrl || `Source ${row.id}`}
+                            </div>
+                            <StatusBadge text={`#${row.id}`} tone="neutral" />
+                            <StatusBadge
+                              text={row.fetch_status || "unknown"}
+                              tone={statusTone(row.fetch_status || "")}
+                            />
+                            <StatusBadge text={`Quality ${row.quality_score}`} tone="active" />
+                            {row.id === group.suggested_keep_id ? (
+                              <StatusBadge text="Suggested Keep" tone="success" />
+                            ) : checked ? (
+                              <StatusBadge text="Remove" tone="error" />
+                            ) : null}
+                          </div>
+                          <div className="mt-1 text-body-md text-on-surface-variant">
+                            {[
+                              row.author_names,
+                              row.organization_name,
+                              row.publication_year || row.publication_date,
+                              row.document_type,
+                            ]
+                              .filter(Boolean)
+                              .join(" • ") || "No additional metadata"}
+                          </div>
+                          {displayUrl && (
+                            <div className="mt-2 break-all text-body-md text-on-surface">
+                              {displayUrl}
+                            </div>
+                          )}
+                          {row.citation_doi && (
+                            <div className="mt-1 break-all text-label-sm text-on-surface-variant">
+                              DOI: {row.citation_doi}
+                            </div>
+                          )}
+                        </div>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="mt-5 flex flex-wrap items-center justify-between gap-3">
+          <div className="text-body-md text-on-surface-variant">
+            Delete {selectedCount} duplicate row{selectedCount === 1 ? "" : "s"}.
+          </div>
+          <div className="flex gap-2">
+            <Button disabled={deletePending} onClick={onCancel}>
+              Cancel
+            </Button>
+            <Button
+              disabled={deletePending || selectedCount === 0}
+              variant="danger"
+              onClick={onConfirm}
+            >
+              {deletePending ? "Deleting..." : "Delete Selected Duplicates"}
+            </Button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RepositoryBundleExportModal({
+  draft,
+  selectedCount,
+  totalCount,
+  pending,
+  error,
+  onCancel,
+  onChange,
+  onConfirm,
+}: {
+  draft: RepositoryBundleExportModalDraftState;
+  selectedCount: number;
+  totalCount: number;
+  pending: boolean;
+  error: string;
+  onCancel: () => void;
+  onChange: (patch: Partial<RepositoryBundleExportModalDraftState>) => void;
+  onConfirm: () => void;
+}) {
+  const selectedDisabled = selectedCount === 0;
+  const isCloudMode = draft.mode === "cloud";
+  const usesTypeDirectories =
+    draft.fileKinds.includes("pdf") &&
+    draft.fileKinds.includes("html") &&
+    draft.fileKinds.includes("md") &&
+    (draft.fileKinds.includes("rendered") || draft.fileKinds.length === 3);
+
+  const toggleFileKind = (kind: RepositoryBundleFileKind) => {
+    if (draft.fileKinds.includes(kind)) {
+      onChange({ fileKinds: draft.fileKinds.filter((value) => value !== kind) });
+      return;
+    }
+    onChange({ fileKinds: [...draft.fileKinds, kind] });
+  };
+
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-surface/80 p-4 backdrop-blur-sm">
+      <div className="w-full max-w-xl rounded-xl border border-outline-variant/40 bg-surface-container p-5 shadow-2xl">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <div className="text-title-sm font-semibold">
+              {isCloudMode ? "Export Repository (Cloud)" : "Export Repository"}
+            </div>
+            <div className="mt-1 text-body-md text-on-surface-variant">
+              {isCloudMode
+                ? "Download a ZIP bundle with a cloud-ready index.html, manifest.json, renamed files for object storage upload, a research CSV, and RIS."
+                : "Download a ZIP bundle with source files, an offline HTML browser, a research CSV, and RIS."}
+            </div>
+          </div>
+          <button
+            className="rounded-sm px-2 py-1 text-label-sm text-on-surface-variant hover:text-on-surface"
+            disabled={pending}
+            onClick={onCancel}
+            type="button"
+          >
+            Close
+          </button>
+        </div>
+
+        <div className="mt-4">
+          <div className="text-label-sm uppercase tracking-[0.08em] text-on-surface-variant">
+            Export Mode
+          </div>
+          <div className="mt-3 grid gap-2">
+            <button
+              className={columnRunScopeOptionClass(draft.mode === "offline", false)}
+              disabled={pending}
+              onClick={() => onChange({ mode: "offline" })}
+              type="button"
+            >
+              <div className="font-semibold text-on-surface">Offline Package</div>
+              <div className="mt-1 text-body-md text-on-surface-variant">
+                Self-contained browser with local relative file links and folder-based re-export.
+              </div>
+            </button>
+            <button
+              className={columnRunScopeOptionClass(draft.mode === "cloud", false)}
+              disabled={pending}
+              onClick={() => onChange({ mode: "cloud" })}
+              type="button"
+            >
+              <div className="font-semibold text-on-surface">Export Repository (Cloud)</div>
+              <div className="mt-1 text-body-md text-on-surface-variant">
+                Static browser for Pages/CDN hosting with storageName-based links and a single editable `BASE_URL`.
+              </div>
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-4 text-label-sm uppercase tracking-[0.08em] text-on-surface-variant">
+          Scope
+        </div>
+        <div className="mt-4 grid gap-2">
+          <button
+            className={columnRunScopeOptionClass(draft.scope === "all", false)}
+            disabled={pending}
+            onClick={() => onChange({ scope: "all" })}
+            type="button"
+          >
+            <div className="font-semibold text-on-surface">Whole Repository</div>
+            <div className="mt-1 text-body-md text-on-surface-variant">
+              Export all {totalCount} repository row{totalCount === 1 ? "" : "s"}.
+            </div>
+          </button>
+          <button
+            className={columnRunScopeOptionClass(draft.scope === "selected", selectedDisabled)}
+            disabled={pending || selectedDisabled}
+            onClick={() => onChange({ scope: "selected" })}
+            type="button"
+          >
+            <div className="font-semibold text-on-surface">Selected Rows</div>
+            <div className="mt-1 text-body-md text-on-surface-variant">
+              {selectedDisabled
+                ? "Select one or more rows in the table to use this scope."
+                : `Export the ${selectedCount} selected row${selectedCount === 1 ? "" : "s"}.`}
+            </div>
+          </button>
+        </div>
+
+        {isCloudMode && (
+          <div className="mt-4 rounded-lg border border-outline-variant/30 bg-surface-container-low p-4">
+            <InputField
+              className="gap-2"
+              disabled={pending}
+              id="repository-cloud-base-url"
+              label="Base URL"
+              placeholder={DEFAULT_REPOSITORY_CLOUD_BASE_URL}
+              spellCheck={false}
+              type="text"
+              value={draft.baseUrl}
+              onChange={(event) => onChange({ baseUrl: event.target.value })}
+            />
+            <div className="mt-3 text-body-md text-on-surface-variant">
+              Point this to the object-storage folder or CDN prefix where the renamed
+              <span className="font-semibold text-on-surface"> storageName </span>
+              files will be uploaded. The export will write this directly into
+              <span className="font-semibold text-on-surface"> const BASE_URL = "..."</span>
+              near the top of `index.html`.
+            </div>
+            <div className="mt-3 text-body-md text-on-surface-variant">
+              Example production URL: <span className="font-semibold text-on-surface">https://files.example.com/client-a/</span>
+            </div>
+            <div className="mt-1 text-body-md text-on-surface-variant">
+              Example local preview URL: <span className="font-semibold text-on-surface">./files/</span>
+            </div>
+          </div>
+        )}
+
+        <div className="mt-4 rounded-lg border border-outline-variant/30 bg-surface-container-low p-4">
+          <div className="text-title-sm font-semibold">Included in Every Bundle</div>
+          <div className="mt-1 text-body-md text-on-surface-variant">
+            {isCloudMode
+              ? "Cloud-ready `index.html`, `manifest.json`, research CSV with key columns and custom columns, plus RIS citations."
+              : "Self-contained `index.html` browser, research CSV with key columns and custom columns, plus RIS citations."}
+          </div>
+
+          <div className="mt-4 text-label-sm uppercase tracking-[0.08em] text-on-surface-variant">
+            Source File Types
+          </div>
+          <div className="mt-3 grid gap-2 sm:grid-cols-2">
+            {(
+              [
+                { kind: "pdf", label: "PDF" },
+                { kind: "rendered", label: "Rendered" },
+                { kind: "html", label: "HTML" },
+                { kind: "md", label: "MD" },
+              ] as Array<{ kind: RepositoryBundleFileKind; label: string }>
+            ).map(({ kind, label }) => (
+              <label
+                key={kind}
+                className="flex items-center gap-2 rounded-md border border-outline-variant/20 bg-surface px-3 py-3 text-body-md text-on-surface"
+              >
+                <input
+                  checked={draft.fileKinds.includes(kind)}
+                  disabled={pending}
+                  type="checkbox"
+                  onChange={() => toggleFileKind(kind)}
+                />
+                {label}
+              </label>
+            ))}
+          </div>
+          <div className="mt-3 text-body-md text-on-surface-variant">
+            {isCloudMode ? (
+              <>
+                The browser shows each file&apos;s original <span className="font-semibold text-on-surface">displayName</span>,
+                while uploaded objects use deterministic, URL-safe <span className="font-semibold text-on-surface">storageName</span> values inside <span className="font-semibold text-on-surface">files/</span>.
+                Edit the single <span className="font-semibold text-on-surface">BASE_URL</span> line near the top of `index.html` after upload.
+              </>
+            ) : (
+              <>
+                Files are named as <span className="font-semibold text-on-surface">Author - Date - Title</span>.
+                {usesTypeDirectories
+                  ? " PDF, Rendered, HTML, and MD files will be placed into separate folders in the ZIP when selected."
+                  : " CSV and RIS stay at the root of the ZIP bundle."}
+              </>
+            )}
+          </div>
+        </div>
+
+        {error && (
+          <div className="mt-3 rounded-md bg-error/10 px-3 py-2 text-body-md text-error">
+            {error}
+          </div>
+        )}
+
+        <div className="mt-5 flex justify-end gap-2">
+          <Button disabled={pending} onClick={onCancel}>
+            Cancel
+          </Button>
+          <Button disabled={pending} variant="primary" onClick={onConfirm}>
+            {pending ? "Exporting..." : isCloudMode ? "Export Repository (Cloud)" : "Export Repository"}
           </Button>
         </div>
       </div>
@@ -1437,18 +2111,24 @@ export function RepositoryBrowserPage() {
   const [lastAnchorId, setLastAnchorId] = useState<string | null>(null);
   const [showColumnChooser, setShowColumnChooser] = useState(false);
   const [showFilters, setShowFilters] = useState(false);
+  const [showIngestionPanel, setShowIngestionPanel] = useState(true);
+  const [showEnrichmentPanel, setShowEnrichmentPanel] = useState(true);
+  const [showViewPanel, setShowViewPanel] = useState(true);
   const [browserTaskScope, setBrowserTaskScope] = useState<RepositoryBrowserTaskScope>("empty_only");
   const [actionMessage, setActionMessage] = useState("");
   const [actionError, setActionError] = useState("");
   const [linksPending, setLinksPending] = useState(false);
   const [filesPending, setFilesPending] = useState(false);
-  const [downloadAllPending, setDownloadAllPending] = useState(false);
-  const [redownloadSelectedPending, setRedownloadSelectedPending] = useState(false);
-  const [downloadAllWithCleanup, setDownloadAllWithCleanup] = useState(false);
+  const [downloadSourcesPending, setDownloadSourcesPending] = useState(false);
+  const [downloadSourcesWithCleanup, setDownloadSourcesWithCleanup] = useState(false);
   const [runPending, setRunPending] = useState(false);
+  const [bulkRisReadyPending, setBulkRisReadyPending] = useState(false);
   const [deletePending, setDeletePending] = useState(false);
+  const [dedupeScanPending, setDedupeScanPending] = useState(false);
+  const [dedupeDeletePending, setDedupeDeletePending] = useState(false);
   const [risExportPending, setRisExportPending] = useState(false);
   const [spreadsheetExportPending, setSpreadsheetExportPending] = useState(false);
+  const [repositoryExportPending, setRepositoryExportPending] = useState(false);
   const [activeRowId, setActiveRowId] = useState<string | null>(null);
   const [detailDraft, setDetailDraft] = useState<SourceDetailsDraft | null>(null);
   const [detailSaveState, setDetailSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
@@ -1468,12 +2148,31 @@ export function RepositoryBrowserPage() {
   const [columnRunScopeDraft, setColumnRunScopeDraft] = useState<ColumnRunScopeDraftState | null>(null);
   const [columnRunStarting, setColumnRunStarting] = useState(false);
   const [columnRunJobId, setColumnRunJobId] = useState("");
+  const [downloadSourcesModalDraft, setDownloadSourcesModalDraft] =
+    useState<DownloadSourcesModalDraftState | null>(null);
+  const [downloadSourcesModalError, setDownloadSourcesModalError] = useState("");
+  const [dedupeModalData, setDedupeModalData] =
+    useState<RepositoryDuplicateCandidateResponse | null>(null);
+  const [dedupeModalError, setDedupeModalError] = useState("");
+  const [dedupeSelectedIds, setDedupeSelectedIds] = useState<Set<string>>(new Set());
+  const [dedupeLastAnchorId, setDedupeLastAnchorId] = useState<string | null>(null);
   const [exportModalDraft, setExportModalDraft] = useState<ExportModalDraftState | null>(null);
+  const [repositoryBundleExportDraft, setRepositoryBundleExportDraft] =
+    useState<RepositoryBundleExportModalDraftState | null>(null);
+  const [repositoryBundleExportError, setRepositoryBundleExportError] = useState("");
   const [horizontalScrollMetrics, setHorizontalScrollMetrics] = useState({
     viewportWidth: 0,
     scrollWidth: 0,
     scrollLeft: 0,
   });
+
+  useEffect(() => {
+    if (!downloadSourcesWithCleanup) return;
+    setDownloadSourcesModalDraft((prev) => {
+      if (!prev || prev.include_markdown) return prev;
+      return { ...prev, include_markdown: true };
+    });
+  }, [downloadSourcesWithCleanup]);
 
   const storageKey = useMemo(
     () => buildRepositoryBrowserStorageKey(repositoryStatus?.path || ""),
@@ -1684,6 +2383,8 @@ export function RepositoryBrowserPage() {
     setColumnRunScopeDraft(null);
     setColumnRunStarting(false);
     setColumnRunJobId("");
+    setDownloadSourcesModalDraft(null);
+    setDownloadSourcesModalError("");
     setExportModalDraft(null);
   }, [repositoryStatus?.path]);
 
@@ -1747,27 +2448,38 @@ export function RepositoryBrowserPage() {
     [activeRow, detailDraft],
   );
 
+  const persistSourceDetailsPatch = async (
+    sourceId: string,
+    patch: RepositorySourcePatchRequest,
+  ): Promise<RepositoryManifestRow> => {
+    const updatedRow = await api.patchRepositorySource(sourceId, patch);
+    queryClient.setQueryData(
+      manifestQueryKey,
+      (previous: typeof manifestQuery.data) =>
+        previous
+          ? {
+              ...previous,
+              rows: previous.rows.map((row) => (row.id === updatedRow.id ? updatedRow : row)),
+            }
+          : previous,
+    );
+    void refreshDashboard();
+    return updatedRow;
+  };
+
   useEffect(() => {
     if (!activeRow || !detailPatch) return;
     setDetailSaveState("saving");
     setDetailSaveError("");
+    const activeRowIdSnapshot = activeRow.id;
     const timer = window.setTimeout(async () => {
       try {
-        const updatedRow = await api.patchRepositorySource(activeRow.id, detailPatch);
-        queryClient.setQueryData(
-          manifestQueryKey,
-          (previous: typeof manifestQuery.data) =>
-            previous
-              ? {
-                  ...previous,
-                  rows: previous.rows.map((row) => (row.id === updatedRow.id ? updatedRow : row)),
-                }
-              : previous,
-        );
-        setDetailDraft(createSourceDetailsDraft(updatedRow));
+        const updatedRow = await persistSourceDetailsPatch(activeRowIdSnapshot, detailPatch);
+        if (updatedRow.id === activeRowIdSnapshot) {
+          setDetailDraft(createSourceDetailsDraft(updatedRow));
+        }
         setDetailSaveState("saved");
         setDetailSaveError("");
-        void refreshDashboard();
       } catch (error) {
         setDetailSaveState("error");
         setDetailSaveError(String((error as Error).message || "Failed to save source details"));
@@ -1775,6 +2487,47 @@ export function RepositoryBrowserPage() {
     }, 700);
     return () => window.clearTimeout(timer);
   }, [activeRow, detailPatch, manifestQueryKey, queryClient, refreshDashboard]);
+
+  const flushActiveDetailDraft = async (failurePrefix: string): Promise<void> => {
+    if (!activeRow || !detailPatch) return;
+
+    setDetailSaveState("saving");
+    setDetailSaveError("");
+    try {
+      const updatedRow = await persistSourceDetailsPatch(activeRow.id, detailPatch);
+      if (updatedRow.id === activeRow.id) {
+        setDetailDraft(createSourceDetailsDraft(updatedRow));
+      }
+      setDetailSaveState("saved");
+      setDetailSaveError("");
+    } catch (error) {
+      const detail = String((error as Error).message || "Failed to save source details");
+      setDetailSaveState("error");
+      setDetailSaveError(detail);
+      throw new Error(`${failurePrefix}: ${detail}`);
+    }
+  };
+
+  const shouldFlushActiveDetailDraftForDownload = (scope: RepositoryBrowserDownloadScope): boolean => {
+    if (!activeRow || !detailPatch) return false;
+    if (scope === "all") return true;
+    if (scope === "selected") return selectedIds.has(activeRow.id);
+    return String(activeRow.fetch_status || "").trim().toLowerCase() === "failed";
+  };
+
+  const flushActiveDetailDraftForDownload = async (
+    scope: RepositoryBrowserDownloadScope,
+  ): Promise<void> => {
+    if (!activeRow || !detailPatch || !shouldFlushActiveDetailDraftForDownload(scope)) {
+      return;
+    }
+    await flushActiveDetailDraft("Save the edited source details before starting download");
+  };
+
+  const flushActiveDetailDraftForDedupe = async (): Promise<void> => {
+    if (!activeRow || !detailPatch) return;
+    await flushActiveDetailDraft("Save the edited source details before running de-duplication");
+  };
 
   useEffect(() => {
     if (!renamingColumnId) return;
@@ -2413,57 +3166,93 @@ export function RepositoryBrowserPage() {
     }
   };
 
-  const handleDownloadAllSources = async () => {
-    if (downloadAllPending) return;
-    if (downloadAllWithCleanup && !llmReady) {
-      setActionError("Configure and enable the repository LLM backend before using auto cleanup.");
-      setActionMessage("");
-      return;
+  const startDownloadSources = async (
+    downloadDraft: DownloadSourcesModalDraftState,
+    runCleanup = false,
+  ): Promise<boolean> => {
+    if (downloadSourcesPending || sourceRunning) return false;
+    if (downloadDraft.scope === "selected" && selectedIds.size === 0) {
+      throw new Error("Check one or more rows before downloading only checked sources.");
+    }
+    if (runCleanup && !llmReady) {
+      throw new Error("Configure and enable the repository LLM backend before using auto cleanup.");
+    }
+    if (!hasSelectedDownloadOutputs(downloadDraft)) {
+      throw new Error("Select at least one download output.");
     }
 
-    setDownloadAllPending(true);
+    await flushActiveDetailDraftForDownload(downloadDraft.scope);
+
+    const effectiveDownloadDraft: RepositorySourceTaskRequest = {
+      ...sourceTaskDraft,
+      include_raw_file: downloadDraft.include_raw_file,
+      include_rendered_html: downloadDraft.include_rendered_html,
+      include_rendered_pdf: downloadDraft.include_rendered_pdf,
+      include_markdown: downloadDraft.include_markdown || runCleanup,
+    };
+    setSourceTaskDraft((prev) => ({
+      ...prev,
+      include_raw_file: effectiveDownloadDraft.include_raw_file,
+      include_rendered_html: effectiveDownloadDraft.include_rendered_html,
+      include_rendered_pdf: effectiveDownloadDraft.include_rendered_pdf,
+      include_markdown: effectiveDownloadDraft.include_markdown,
+    }));
+
+    setDownloadSourcesPending(true);
     setActionMessage("");
     setActionError("");
     try {
-      const response = await api.startRepositorySourceTasks({
-        ...sourceTaskDraft,
-        scope: "all",
-        import_id: "",
-        source_ids: [],
-        rerun_failed_only: false,
-        run_download: true,
-        run_convert: true,
-        run_catalog: false,
-        run_citation_verify: false,
-        run_llm_cleanup: downloadAllWithCleanup,
-        run_llm_title: false,
-        run_llm_summary: false,
-        run_llm_rating: false,
-        force_redownload: false,
-        force_convert: false,
-        force_catalog: false,
-        force_citation_verify: false,
-        force_llm_cleanup: false,
-        force_title: false,
-        force_summary: false,
-        force_rating: false,
-        include_raw_file: true,
-        include_rendered_html: true,
-        include_rendered_pdf: true,
-        include_markdown: true,
-        project_profile_name: settingsDraft.default_project_profile_name,
-      });
-      setActionMessage(
-        response.message ||
-          `Started download and conversion for ${response.total_urls} repository source(s).`,
+      const response = await api.startRepositorySourceTasks(
+        buildRepositoryBrowserDownloadTaskPayload({
+          draft: effectiveDownloadDraft,
+          scope: downloadDraft.scope,
+          selectedSourceIds: Array.from(selectedIds),
+          defaultProjectProfileName: settingsDraft.default_project_profile_name,
+          runCleanup,
+        }),
       );
-      trackSourceTaskJob(response.job_id || null, response.message || "");
+      const selectedCount = selectedIds.size;
+      const outputAction = runCleanup
+        ? "redownload, reconversion, and cleanup"
+        : effectiveDownloadDraft.include_markdown
+          ? "redownload and reconversion"
+          : "redownload";
+      const successMessage =
+        downloadDraft.scope === "selected"
+          ? `Started ${outputAction} for ${selectedCount} checked source${selectedCount === 1 ? "" : "s"}.`
+          : downloadDraft.scope === "failed_fetch"
+            ? "Started retry for the selected outputs on sources flagged with failed fetch status. Rows without failed fetches will be skipped."
+            : `Started ${outputAction} for ${response.total_urls} repository source${response.total_urls === 1 ? "" : "s"}.`;
+      setActionMessage(successMessage);
+      trackSourceTaskJob(response.job_id || null, response.message || successMessage);
       void refreshDashboard();
       void manifestQuery.refetch();
-    } catch (error) {
-      setActionError(String((error as Error).message || "Failed to start repository download"));
+      return true;
     } finally {
-      setDownloadAllPending(false);
+      setDownloadSourcesPending(false);
+    }
+  };
+
+  const handleDownloadAllSources = () => {
+    setDownloadSourcesModalDraft(
+      buildDownloadSourcesModalDraft("all", sourceTaskDraft, downloadSourcesWithCleanup),
+    );
+    setDownloadSourcesModalError("");
+  };
+
+  const handleConfirmDownloadSources = async () => {
+    if (!downloadSourcesModalDraft) return;
+    setDownloadSourcesModalError("");
+    try {
+      const started = await startDownloadSources(downloadSourcesModalDraft, downloadSourcesWithCleanup);
+      if (started) {
+        setDownloadSourcesModalDraft(null);
+      }
+    } catch (error) {
+      const detail = String((error as Error).message || "Failed to start repository download");
+      setDownloadSourcesModalError(detail);
+      setActionError(detail);
+      setActionMessage("");
     }
   };
 
@@ -2516,54 +3305,43 @@ export function RepositoryBrowserPage() {
   };
 
   const handleRedownloadSelected = async () => {
-    const sourceIds = Array.from(selectedIds);
-    if (sourceIds.length === 0 || redownloadSelectedPending || sourceRunning) return;
+    if (selectedIds.size === 0 || downloadSourcesPending || sourceRunning) return;
+    setDownloadSourcesModalDraft(
+      buildDownloadSourcesModalDraft("selected", sourceTaskDraft, downloadSourcesWithCleanup),
+    );
+    setDownloadSourcesModalError("");
+  };
 
-    setRedownloadSelectedPending(true);
+  const handleBulkMarkRisReady = async () => {
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0 || bulkRisReadyPending) return;
+    const confirmed = window.confirm(
+      `Use the current title, authors, and publication date/year to manually mark ${ids.length} selected source(s) as RIS ready?`,
+    );
+    if (!confirmed) return;
+
+    setBulkRisReadyPending(true);
     setActionMessage("");
     setActionError("");
     try {
-      const response = await api.startRepositorySourceTasks({
-        ...sourceTaskDraft,
-        scope: "all",
-        import_id: "",
-        source_ids: sourceIds,
-        rerun_failed_only: false,
-        run_download: true,
-        run_convert: true,
-        run_catalog: false,
-        run_citation_verify: false,
-        run_llm_cleanup: false,
-        run_llm_title: false,
-        run_llm_summary: false,
-        run_llm_rating: false,
-        force_redownload: true,
-        force_convert: true,
-        force_catalog: false,
-        force_citation_verify: false,
-        force_llm_cleanup: false,
-        force_title: false,
-        force_summary: false,
-        force_rating: false,
-        include_raw_file: true,
-        include_rendered_html: true,
-        include_rendered_pdf: true,
-        include_markdown: true,
-        project_profile_name: settingsDraft.default_project_profile_name,
-      });
-      setActionMessage(
-        response.message ||
-          `Started redownload and reconversion for ${sourceIds.length} selected row(s).`,
-      );
-      trackSourceTaskJob(response.job_id || null, response.message || "");
-      void refreshDashboard();
-      void manifestQuery.refetch();
+      if (activeRow && detailPatch && ids.includes(activeRow.id)) {
+        await flushActiveDetailDraft(
+          "Save the edited source details before bulk-marking sources RIS ready",
+        );
+      }
+      const response = await api.bulkMarkRepositorySourcesRisReady(ids);
+      if (activeRowId && ids.includes(activeRowId)) {
+        setDetailDraft(null);
+        setDetailSaveState("idle");
+        setDetailSaveError("");
+      }
+      await refreshDashboard();
+      await manifestQuery.refetch();
+      setActionMessage(response.message || "Selected sources updated.");
     } catch (error) {
-      setActionError(
-        String((error as Error).message || "Failed to start selected-row redownload"),
-      );
+      setActionError(String((error as Error).message || "Failed to mark selected sources RIS ready"));
     } finally {
-      setRedownloadSelectedPending(false);
+      setBulkRisReadyPending(false);
     }
   };
 
@@ -2593,6 +3371,112 @@ export function RepositoryBrowserPage() {
     }
   };
 
+  const handleScanDuplicates = async () => {
+    if (dedupeScanPending || dedupeDeletePending) return;
+    setDedupeScanPending(true);
+    setDedupeModalError("");
+    setActionMessage("");
+    setActionError("");
+    try {
+      await flushActiveDetailDraftForDedupe();
+      const response = await api.getRepositoryDuplicateCandidates();
+      if (response.groups.length === 0) {
+        setDedupeModalData(null);
+        setDedupeSelectedIds(new Set());
+        setDedupeLastAnchorId(null);
+        setActionMessage(response.message || "No likely duplicates found.");
+        return;
+      }
+      setDedupeModalData(response);
+      setDedupeSelectedIds(
+        new Set(response.groups.flatMap((group) => group.suggested_delete_ids)),
+      );
+      setDedupeLastAnchorId(null);
+      setActionMessage(response.message || `Found ${response.total_groups} potential duplicate group(s).`);
+    } catch (error) {
+      setActionError(String((error as Error).message || "Failed to scan for duplicate sources"));
+    } finally {
+      setDedupeScanPending(false);
+    }
+  };
+
+  const handleToggleDedupeSource = (sourceId: string, checked: boolean, shiftKey: boolean) => {
+    const orderedIds = dedupeModalData?.groups.flatMap((group) => group.rows.map((row) => row.id)) ?? [];
+    const result = toggleRepositoryBrowserSelection({
+      orderedIds,
+      currentSelectedIds: dedupeSelectedIds,
+      targetId: sourceId,
+      checked,
+      lastAnchorId: dedupeLastAnchorId,
+      shiftKey,
+    });
+    setDedupeSelectedIds(result.selectedIds);
+    setDedupeLastAnchorId(result.anchorId);
+    setDedupeModalError("");
+  };
+
+  const handleUseSuggestedDuplicateSelections = (groupId: string) => {
+    setDedupeSelectedIds((prev) => {
+      const next = new Set(prev);
+      const group = dedupeModalData?.groups.find((item) => item.group_id === groupId);
+      if (!group) return next;
+      group.rows.forEach((row) => next.delete(row.id));
+      group.suggested_delete_ids.forEach((sourceId) => next.add(sourceId));
+      return next;
+    });
+    setDedupeLastAnchorId(null);
+    setDedupeModalError("");
+  };
+
+  const handleConfirmDuplicateDelete = async () => {
+    if (!dedupeModalData || dedupeDeletePending) return;
+    const ids = Array.from(dedupeSelectedIds);
+    if (ids.length === 0) {
+      setDedupeModalError("Select one or more duplicate rows to remove.");
+      return;
+    }
+    const invalidGroup = dedupeModalData.groups.find((group) =>
+      group.rows.every((row) => dedupeSelectedIds.has(row.id)),
+    );
+    if (invalidGroup) {
+      setDedupeModalError(
+        `Leave at least one row in group ${dedupeModalData.groups.indexOf(invalidGroup) + 1}.`,
+      );
+      return;
+    }
+
+    setDedupeDeletePending(true);
+    setDedupeModalError("");
+    setActionMessage("");
+    setActionError("");
+    try {
+      const response = await api.deleteRepositorySources(ids);
+      const deletedIdSet = new Set(ids);
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        ids.forEach((sourceId) => next.delete(sourceId));
+        return next;
+      });
+      setLastAnchorId((current) => (current && deletedIdSet.has(current) ? null : current));
+      setActiveRowId((current) => (current && deletedIdSet.has(current) ? null : current));
+      setDedupeModalData(null);
+      setDedupeSelectedIds(new Set());
+      setDedupeLastAnchorId(null);
+      await refreshDashboard();
+      await manifestQuery.refetch();
+      setActionMessage(
+        response.message ||
+          `Deleted ${ids.length} duplicate source row${ids.length === 1 ? "" : "s"}.`,
+      );
+    } catch (error) {
+      const detail = String((error as Error).message || "Failed to delete duplicate sources");
+      setDedupeModalError(detail);
+      setActionError(detail);
+    } finally {
+      setDedupeDeletePending(false);
+    }
+  };
+
   const openExportModal = (kind: ExportKind) => {
     setExportModalDraft({
       kind,
@@ -2600,6 +3484,17 @@ export function RepositoryBrowserPage() {
       format: "csv",
       columnScope: "all",
     });
+    setActionError("");
+  };
+
+  const openRepositoryBundleExportModal = () => {
+    setRepositoryBundleExportDraft({
+      mode: "offline",
+      scope: selectedIds.size > 0 ? "selected" : "all",
+      fileKinds: ["pdf", "rendered", "html", "md"],
+      baseUrl: DEFAULT_REPOSITORY_CLOUD_BASE_URL,
+    });
+    setRepositoryBundleExportError("");
     setActionError("");
   };
 
@@ -2674,6 +3569,53 @@ export function RepositoryBrowserPage() {
     }
   };
 
+  const handleExportRepositoryBundle = async () => {
+    if (!repositoryBundleExportDraft) return;
+    const normalizedBaseUrl =
+      repositoryBundleExportDraft.mode === "cloud"
+        ? validateRepositoryBundleBaseUrlInput(repositoryBundleExportDraft.baseUrl)
+        : { normalizedValue: "", error: "" };
+    const sourceIds =
+      repositoryBundleExportDraft.scope === "selected"
+        ? Array.from(selectedIds)
+        : [];
+    if (repositoryBundleExportDraft.scope === "selected" && sourceIds.length === 0) {
+      setRepositoryBundleExportError("Select one or more rows before exporting selected rows.");
+      return;
+    }
+    if (normalizedBaseUrl.error) {
+      setRepositoryBundleExportError(normalizedBaseUrl.error);
+      return;
+    }
+
+    setRepositoryExportPending(true);
+    setRepositoryBundleExportError("");
+    setActionMessage("");
+    setActionError("");
+    try {
+      const result = await api.exportRepositoryBundle({
+        mode: repositoryBundleExportDraft.mode,
+        scope: repositoryBundleExportDraft.scope,
+        source_ids: sourceIds,
+        file_kinds: repositoryBundleExportDraft.fileKinds,
+        base_url: normalizedBaseUrl.normalizedValue,
+      });
+      downloadBlob(result.blob, result.filename);
+      setRepositoryBundleExportDraft(null);
+      setActionMessage(
+        repositoryBundleExportDraft.scope === "selected"
+          ? `Downloaded ${repositoryBundleExportDraft.mode === "cloud" ? "cloud " : ""}repository export bundle for ${sourceIds.length} selected row${sourceIds.length === 1 ? "" : "s"}.`
+          : `Downloaded ${repositoryBundleExportDraft.mode === "cloud" ? "cloud " : ""}repository export bundle for the whole repository.`,
+      );
+    } catch (error) {
+      const detail = String((error as Error).message || "Failed to export repository bundle");
+      setRepositoryBundleExportError(detail);
+      setActionError(detail);
+    } finally {
+      setRepositoryExportPending(false);
+    }
+  };
+
   const availableProfiles =
     profiles.length > 0
       ? profiles
@@ -2696,8 +3638,11 @@ export function RepositoryBrowserPage() {
 
       <SurfaceCard className="thin-scrollbar shrink-0 overflow-y-auto max-h-[34vh]">
         <div className="grid gap-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)_minmax(0,0.85fr)]">
-          <div className="space-y-3">
-            <div className="text-title-sm font-semibold">Ingestion And Context</div>
+          <BrowserTopPanel
+            title="Ingestion And Context"
+            open={showIngestionPanel}
+            onToggle={() => setShowIngestionPanel((prev) => !prev)}
+          >
             <div className="flex flex-wrap gap-2">
               <Button
                 variant="primary"
@@ -2711,25 +3656,25 @@ export function RepositoryBrowserPage() {
               </Button>
               <Button
                 disabled={
-                  downloadAllPending ||
+                  downloadSourcesPending ||
                   sourceRunning ||
                   !(Number(repositoryStatus?.total_sources || 0) > 0)
                 }
-                onClick={() => void handleDownloadAllSources()}
+                onClick={handleDownloadAllSources}
               >
-                {downloadAllPending ? "Starting Download..." : "Download All Sources"}
+                {downloadSourcesPending ? "Starting Download..." : "download sources"}
               </Button>
             </div>
             <label className="flex items-center gap-2 text-body-md text-on-surface-variant">
               <input
-                checked={downloadAllWithCleanup}
-                disabled={downloadAllPending}
+                checked={downloadSourcesWithCleanup}
+                disabled={downloadSourcesPending}
                 type="checkbox"
-                onChange={(event) => setDownloadAllWithCleanup(event.target.checked)}
+                onChange={(event) => setDownloadSourcesWithCleanup(event.target.checked)}
               />
               Auto clean markdown with LLM after download
             </label>
-            {downloadAllWithCleanup && !llmReady && (
+            {downloadSourcesWithCleanup && !llmReady && (
               <div className="rounded-md bg-warning/10 px-3 py-2 text-body-md text-warning">
                 LLM cleanup requires an enabled repository LLM backend and selected model.
               </div>
@@ -2752,7 +3697,7 @@ export function RepositoryBrowserPage() {
             <div className="text-body-md text-on-surface-variant">
               `Add Links` imports seed/link files, then starts deterministic fetch and conversion only.
               `Add Files` imports local documents, converts them to markdown, and starts repository metadata and citation processing for the new batch.
-              `Download All Sources` runs the existing repository download/conversion pipeline across the full repository.
+              `download sources` opens scope and output options for retrying all sources, checked rows, or failed fetches.
             </div>
             <input
               ref={addLinksRef}
@@ -2778,10 +3723,13 @@ export function RepositoryBrowserPage() {
                 event.currentTarget.value = "";
               }}
             />
-          </div>
+          </BrowserTopPanel>
 
-          <div className="space-y-3">
-            <div className="text-title-sm font-semibold">AI Enrichment Panel</div>
+          <BrowserTopPanel
+            title="AI Enrichment Panel"
+            open={showEnrichmentPanel}
+            onToggle={() => setShowEnrichmentPanel((prev) => !prev)}
+          >
             <div className="grid gap-2 md:grid-cols-2">
               <label className="flex items-center gap-2 text-body-md">
                 <input
@@ -2873,10 +3821,9 @@ export function RepositoryBrowserPage() {
               <option value="empty_only">Empty spaces only</option>
             </SelectField>
 
-            <div className="rounded-md bg-surface-container-low p-3 text-body-md text-on-surface-variant">
+            <div className="rounded-md bg-surface p-3 text-body-md text-on-surface-variant">
               Catalog metadata updates browsing fields. Citation verification separately builds the
-              authoritative RIS-ready citation record, including verification status, evidence, and
-              export blocking when required fields are not verified.
+              authoritative RIS citation record from the available source metadata.
             </div>
 
             <div className="flex flex-wrap gap-2">
@@ -2884,10 +3831,13 @@ export function RepositoryBrowserPage() {
                 {runPending ? "Starting..." : "Run Selected Tasks"}
               </Button>
             </div>
-          </div>
+          </BrowserTopPanel>
 
-          <div className="space-y-3">
-            <div className="text-title-sm font-semibold">View Customization</div>
+          <BrowserTopPanel
+            title="View Customization"
+            open={showViewPanel}
+            onToggle={() => setShowViewPanel((prev) => !prev)}
+          >
             <div className="flex flex-wrap gap-2">
               <Button onClick={() => setShowColumnChooser((prev) => !prev)}>
                 {showColumnChooser ? "Hide Columns" : "Column Visibility"}
@@ -2912,10 +3862,10 @@ export function RepositoryBrowserPage() {
             <div className="text-body-md text-on-surface-variant">
               Column visibility changes are stored per repository path. Column widths can be resized and visible columns can be reordered directly from the Browser header row.
             </div>
-          </div>
+          </BrowserTopPanel>
         </div>
 
-        {showColumnChooser && (
+        {showViewPanel && showColumnChooser && (
           <div className="mt-4 rounded-md border border-outline-variant/30 bg-surface-container-low p-4">
             <div className="space-y-4">
               {columnVisibilityCategories.map((category) => {
@@ -2968,7 +3918,7 @@ export function RepositoryBrowserPage() {
           </div>
         )}
 
-        {showFilters && (
+        {showViewPanel && showFilters && (
           <div className="mt-4 rounded-md border border-outline-variant/30 bg-surface-container-low p-4">
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
               <div className="text-title-sm font-semibold">Advanced Filters</div>
@@ -3143,12 +4093,30 @@ export function RepositoryBrowserPage() {
               </div>
               <div className="md:mt-5 flex flex-wrap gap-2">
                 <Button
-                  disabled={selectedIds.size === 0 || redownloadSelectedPending || sourceRunning}
+                  disabled={selectedIds.size === 0 || downloadSourcesPending || sourceRunning}
                   onClick={() => void handleRedownloadSelected()}
                 >
-                  {redownloadSelectedPending
+                  {downloadSourcesPending
                     ? "Starting Redownload..."
                     : `Redownload Selected${selectedIds.size ? ` (${selectedIds.size})` : ""}`}
+                </Button>
+                <Button
+                  disabled={selectedIds.size === 0 || bulkRisReadyPending}
+                  onClick={() => void handleBulkMarkRisReady()}
+                >
+                  {bulkRisReadyPending
+                    ? "Marking RIS Ready..."
+                    : `Mark RIS Ready${selectedIds.size ? ` (${selectedIds.size})` : ""}`}
+                </Button>
+                <Button
+                  disabled={
+                    Number(repositoryStatus?.total_sources || 0) === 0 ||
+                    dedupeScanPending ||
+                    dedupeDeletePending
+                  }
+                  onClick={() => void handleScanDuplicates()}
+                >
+                  {dedupeScanPending ? "Scanning Duplicates..." : "De-duplicate"}
                 </Button>
                 <Button
                   disabled={selectedIds.size === 0 || deletePending}
@@ -3205,11 +4173,11 @@ export function RepositoryBrowserPage() {
                       const style = columnWidthStyle(columnWidths, column.key);
                       const label = labelRepositoryBrowserColumn(column.key, column.label);
                       const runningThisColumn = activeColumnRun?.column_id === column.key;
-                      const instructionsDisabled = !column.processable;
+                      const instructionsDisabled = !column.processable || !column.requires_llm;
                       const runDisabled =
                         !column.processable ||
-                        !llmReady ||
-                        !column.instruction_prompt.trim() ||
+                        (column.requires_llm && !llmReady) ||
+                        (column.requires_llm && !column.instruction_prompt.trim()) ||
                         Boolean(activeColumnRun);
                       const activeSort = filters.sortBy === column.key;
                       const directionLabel =
@@ -3530,6 +4498,7 @@ export function RepositoryBrowserPage() {
                 <div className="mt-1 text-body-md text-on-surface-variant">
                   Choose whole database, selected rows, or the currently displayed rows in the export dialog.
                   Spreadsheet exports support `.csv` and `.xlsx`. RIS exports citation records only.
+                  Repository export supports both offline packages and cloud-ready bundles with a static `index.html`.
                 </div>
               </div>
               <div className="flex flex-wrap gap-2">
@@ -3538,6 +4507,7 @@ export function RepositoryBrowserPage() {
                   disabled={
                     spreadsheetExportPending ||
                     risExportPending ||
+                    repositoryExportPending ||
                     !(Number(repositoryStatus?.total_sources || 0) > 0)
                   }
                   onClick={() => openExportModal("spreadsheet")}
@@ -3548,11 +4518,23 @@ export function RepositoryBrowserPage() {
                   disabled={
                     spreadsheetExportPending ||
                     risExportPending ||
+                    repositoryExportPending ||
                     !(Number(repositoryStatus?.total_sources || 0) > 0)
                   }
                   onClick={() => openExportModal("ris")}
                 >
                   {risExportPending ? "Exporting..." : "Export RIS"}
+                </Button>
+                <Button
+                  disabled={
+                    spreadsheetExportPending ||
+                    risExportPending ||
+                    repositoryExportPending ||
+                    !(Number(repositoryStatus?.total_sources || 0) > 0)
+                  }
+                  onClick={openRepositoryBundleExportModal}
+                >
+                  {repositoryExportPending ? "Exporting..." : "Export Repository"}
                 </Button>
               </div>
             </div>
@@ -3633,6 +4615,80 @@ export function RepositoryBrowserPage() {
             setColumnRunScopeDraft((prev) => (prev ? { ...prev, scope } : prev))
           }
           onConfirm={() => void handleRunColumn(columnRunScopeDraft)}
+        />
+      )}
+      {downloadSourcesModalDraft && (
+        <DownloadSourcesModal
+          draft={downloadSourcesModalDraft}
+          error={downloadSourcesModalError}
+          runCleanup={downloadSourcesWithCleanup}
+          selectedCount={selectedIds.size}
+          startPending={downloadSourcesPending}
+          totalCount={Number(repositoryStatus?.total_sources || 0)}
+          onCancel={() => {
+            if (downloadSourcesPending) return;
+            setDownloadSourcesModalDraft(null);
+            setDownloadSourcesModalError("");
+          }}
+          onChangeScope={(scope) => {
+            setDownloadSourcesModalDraft((prev) => (prev ? { ...prev, scope } : prev));
+            setDownloadSourcesModalError("");
+          }}
+          onChangeOutput={(key, value) => {
+            setDownloadSourcesModalDraft((prev) => {
+              if (!prev) return prev;
+              if (downloadSourcesWithCleanup && key === "include_markdown" && !value) {
+                return prev;
+              }
+              return { ...prev, [key]: value };
+            });
+            setDownloadSourcesModalError("");
+          }}
+          onConfirm={() => void handleConfirmDownloadSources()}
+        />
+      )}
+      {dedupeModalData && (
+        <DuplicateReviewModal
+          deletePending={dedupeDeletePending}
+          error={dedupeModalError}
+          response={dedupeModalData}
+          selectedIds={dedupeSelectedIds}
+          onCancel={() => {
+            if (dedupeDeletePending) return;
+            setDedupeModalData(null);
+            setDedupeModalError("");
+            setDedupeSelectedIds(new Set());
+            setDedupeLastAnchorId(null);
+          }}
+          onToggleRow={handleToggleDedupeSource}
+          onUseSuggested={handleUseSuggestedDuplicateSelections}
+          onConfirm={() => void handleConfirmDuplicateDelete()}
+        />
+      )}
+      {repositoryBundleExportDraft && (
+        <RepositoryBundleExportModal
+          draft={repositoryBundleExportDraft}
+          error={repositoryBundleExportError}
+          pending={repositoryExportPending}
+          selectedCount={selectedIds.size}
+          totalCount={Number(repositoryStatus?.total_sources || 0)}
+          onCancel={() => {
+            if (repositoryExportPending) return;
+            setRepositoryBundleExportDraft(null);
+            setRepositoryBundleExportError("");
+          }}
+          onChange={(patch) => {
+            setRepositoryBundleExportDraft((prev) => {
+              if (!prev) return prev;
+              const next = { ...prev, ...patch };
+              if (patch.mode === "cloud" && !String(next.baseUrl || "").trim()) {
+                next.baseUrl = DEFAULT_REPOSITORY_CLOUD_BASE_URL;
+              }
+              return next;
+            });
+            setRepositoryBundleExportError("");
+          }}
+          onConfirm={() => void handleExportRepositoryBundle()}
         />
       )}
       {exportModalDraft && (

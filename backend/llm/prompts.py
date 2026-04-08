@@ -418,3 +418,50 @@ Current compatible template YAML:
 
 Generate a project-specific profile draft that remains compatible with the template's output schema.
 Return JSON only."""
+
+# ---------------------------------------------------------------------------
+# Search: query generation
+# ---------------------------------------------------------------------------
+
+SEARCH_QUERY_GENERATION_SYSTEM = """You generate diverse web search queries for a research assistant.
+Given a research purpose and a user-provided search prompt, produce search queries
+that cover different angles, terminology, and perspectives on the topic.
+Return JSON only."""
+
+SEARCH_QUERY_GENERATION_USER = """Research purpose:
+{research_purpose}
+
+User search prompt:
+{search_prompt}
+
+Generate exactly {query_count} diverse web search queries that would help find
+relevant sources for this research. Cover different angles: technical terms,
+synonyms, related concepts, specific subtopics, and broader context queries.
+
+Return JSON in exactly this shape:
+{{"queries": ["query1", "query2", "..."]}}"""
+
+# ---------------------------------------------------------------------------
+# Search: lightweight snippet relevance scoring (batched)
+# ---------------------------------------------------------------------------
+
+SEARCH_RELEVANCE_SYSTEM = """You score the relevance of web search results to a research project.
+You are given only titles and snippets (not full content).
+Score each result from 0.0 to 1.0 in 0.05 increments.
+0.0 = completely irrelevant, 1.0 = highly relevant.
+Be calibrated: most results should fall between 0.1 and 0.7.
+Only truly on-target results with clear research value should score above 0.7.
+Return JSON only."""
+
+SEARCH_RELEVANCE_USER = """Research purpose:
+{research_purpose}
+
+Search prompt:
+{search_prompt}
+
+Score each of the following search results for relevance.
+
+{results_block}
+
+Return JSON in exactly this shape:
+{{"scores": [{{"index": 0, "relevance_score": 0.0}}, {{"index": 1, "relevance_score": 0.0}}, ...]}}"""

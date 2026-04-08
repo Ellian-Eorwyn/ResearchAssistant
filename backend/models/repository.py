@@ -177,6 +177,55 @@ class RepositorySourceDeleteResponse(BaseModel):
     message: str = ""
 
 
+class RepositorySourceBulkRisReadyRequest(BaseModel):
+    source_ids: list[str] = Field(default_factory=list)
+
+
+class RepositorySourceBulkRisReadyResponse(BaseModel):
+    status: str = "completed"
+    requested_sources: int = 0
+    ready_sources: int = 0
+    blocked_sources: int = 0
+    message: str = ""
+
+
+class RepositoryDuplicateCandidateRow(BaseModel):
+    id: str = ""
+    title: str = ""
+    author_names: str = ""
+    publication_date: str = ""
+    publication_year: str = ""
+    organization_name: str = ""
+    document_type: str = ""
+    source_kind: str = ""
+    fetch_status: str = ""
+    original_url: str = ""
+    final_url: str = ""
+    citation_url: str = ""
+    citation_doi: str = ""
+    imported_at: str = ""
+    quality_score: int = 0
+
+
+class RepositoryDuplicateCandidateGroup(BaseModel):
+    group_id: str = ""
+    match_reason: str = ""
+    confidence: Literal["high", "medium"] = "medium"
+    suggested_keep_id: str = ""
+    suggested_delete_ids: list[str] = Field(default_factory=list)
+    rows: list[RepositoryDuplicateCandidateRow] = Field(default_factory=list)
+
+
+class RepositoryDuplicateCandidateResponse(BaseModel):
+    status: str = "completed"
+    scanned_sources: int = 0
+    total_groups: int = 0
+    total_candidate_rows: int = 0
+    truncated: bool = False
+    message: str = ""
+    groups: list[RepositoryDuplicateCandidateGroup] = Field(default_factory=list)
+
+
 class RepositorySourceExportRequest(BaseModel):
     source_ids: list[str] = Field(default_factory=list)
     file_kinds: list[str] = Field(default_factory=list)
@@ -190,6 +239,14 @@ class RepositorySourceExportResponse(BaseModel):
     missing_files: int = 0
     destination_path: str = ""
     message: str = ""
+
+
+class RepositoryBundleExportRequest(BaseModel):
+    scope: Literal["all", "selected"] = "all"
+    source_ids: list[str] = Field(default_factory=list)
+    file_kinds: list[Literal["pdf", "rendered", "html", "md"]] = Field(default_factory=list)
+    mode: Literal["offline", "cloud"] = "offline"
+    base_url: str = ""
 
 
 class RepositorySourcePatchRequest(BaseModel):

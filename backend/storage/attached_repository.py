@@ -12,10 +12,13 @@ import re
 import shutil
 import tempfile
 import threading
+import unicodedata
 import uuid
+import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -51,6 +54,7 @@ from backend.models.ingestion_profiles import (
 )
 from backend.models.repository import (
     RepositoryActionResponse,
+    RepositoryBundleExportRequest,
     RepositoryCitationRisExportRequest,
     RepositoryColumnConfig,
     RepositoryColumnCreateRequest,
@@ -64,6 +68,9 @@ from backend.models.repository import (
     RepositoryDocumentImportDocument,
     RepositoryDocumentImportListResponse,
     RepositoryDocumentImportRecord,
+    RepositoryDuplicateCandidateGroup,
+    RepositoryDuplicateCandidateResponse,
+    RepositoryDuplicateCandidateRow,
     RepositoryExportJobResponse,
     RepositoryHealth,
     RepositoryImportResponse,
@@ -72,6 +79,7 @@ from backend.models.repository import (
     RepositoryManifestExportRequest,
     RepositoryProcessDocumentsResponse,
     RepositoryReprocessDocumentsResponse,
+    RepositorySourceBulkRisReadyResponse,
     RepositoryScanSummary,
     RepositorySourceDeleteResponse,
     RepositorySourceExportResponse,
@@ -126,6 +134,7 @@ from backend.pipeline.source_downloader import (
     _finalize_citation_metadata,
     _merge_citation_metadata,
     _normalize_phase_name,
+    _citation_reference_url_for_row,
     _normalize_row_phase_metadata,
     _row_citation_verification_status,
     SourceDownloadOrchestrator,
@@ -150,11 +159,13 @@ from backend.pipeline.stage_export import write_csv
 from backend.pipeline.stage_export_sqlite import build_wikiclaude_sqlite_db
 from backend.pipeline.stage_ingest import run_ingestion
 from backend.pipeline.stage_references import detect_references_section
+from backend.parsers.text_utils import normalize_unicode
 from backend.storage.file_store import FileStore
 from backend.storage.project_profiles import (
     DEFAULT_PROJECT_PROFILE_FILENAME,
     resolve_project_profile_yaml,
 )
+from backend.storage.repository_bundle_viewer import build_repository_bundle_viewer_html
 
 try:  # pragma: no cover - POSIX only
     import fcntl
@@ -199,6 +210,24 @@ JOB_SEED_FILE_FIELDS = [
 
 TRACKING_PARAM_EXACT = {"gclid", "fbclid", "msclkid"}
 TRACKING_PARAM_PREFIXES = ("utm_",)
+DUPLICATE_SCAN_MAX_GROUPS = 100
+DUPLICATE_TITLE_STOP_WORDS = {
+    "a",
+    "an",
+    "and",
+    "at",
+    "by",
+    "for",
+    "from",
+    "in",
+    "into",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "with",
+}
 
 FILE_FIELDS = [
     "raw_file",
@@ -210,6 +239,21 @@ FILE_FIELDS = [
     "summary_file",
     "rating_file",
     "metadata_file",
+]
+
+REPOSITORY_BUNDLE_FILE_KINDS = ("pdf", "rendered", "html", "md")
+REPOSITORY_BUNDLE_RESEARCH_COLUMNS: list[tuple[str, str]] = [
+    ("title", "Title"),
+    ("author_names", "Authors"),
+    ("publication_date", "Publication Date"),
+    ("organization_name", "Organization"),
+    ("organization_type", "Organization Type"),
+    ("export_url", "URL"),
+    ("markdown_char_count", "Markdown Char Count"),
+    ("citation_report_number", "Report Number"),
+    ("document_type", "Document Type"),
+    ("citation_type", "Citation Type"),
+    ("export_overall_rating", "Overall Rating"),
 ]
 
 SUPPORTED_DOCUMENT_IMPORT_EXTENSIONS = {".pdf", ".docx", ".md"}
@@ -636,8 +680,6 @@ class AttachedRepositoryService:
             raise ValueError("No repository attached")
 
         repo_settings = self.load_repo_settings()
-        if not repo_settings.use_llm or not llm_backend_ready_for_chat(repo_settings.llm_backend):
-            raise ValueError("Column runs require an enabled chat-capable LLM backend.")
 
         with self._writer_lock():
             if self._download_thread and self._download_thread.is_alive():
@@ -652,11 +694,17 @@ class AttachedRepositoryService:
                 column_configs,
                 create_builtin=True,
             )
+            requires_llm = _column_requires_llm(config)
+            if requires_llm and (
+                not repo_settings.use_llm
+                or not llm_backend_ready_for_chat(repo_settings.llm_backend)
+            ):
+                raise ValueError("Column runs require an enabled chat-capable LLM backend.")
             config.instruction_prompt = self._normalize_source_patch_multiline_text(config.instruction_prompt)
             effective_prompt = _effective_column_instruction_prompt(config)
-            if not effective_prompt:
+            if requires_llm and not effective_prompt:
                 raise ValueError("Save instructions for this column before running it.")
-            if config.output_constraint is None:
+            if requires_llm and config.output_constraint is None:
                 config.output_constraint = _effective_column_output_constraint(config)
 
             records = [
@@ -693,7 +741,10 @@ class AttachedRepositoryService:
                 target_records = [
                     record
                     for record in base_records
-                    if not str(record.get(str(config.builtin_key or config.id) or "")).strip()
+                    if not _manifest_record_has_column_value(
+                        record,
+                        str(config.builtin_key or config.id),
+                    )
                 ]
             else:
                 target_records = base_records
@@ -713,7 +764,10 @@ class AttachedRepositoryService:
             populated_rows = sum(
                 1
                 for record in target_records
-                if str(record.get(str(config.builtin_key or config.id) or "")).strip()
+                if _manifest_record_has_column_value(
+                    record,
+                    str(config.builtin_key or config.id),
+                )
             )
             normalized_column_id = str(config.builtin_key or config.id or column_id).strip()
 
@@ -857,16 +911,22 @@ class AttachedRepositoryService:
                 job_store.save_source_status(job_id, status.model_dump(mode="json"))
 
                 try:
-                    next_value = self._generate_column_value_for_row(
-                        config=config,
-                        row=row,
-                        manifest_record=manifest_record,
-                        repo_settings=repo_settings,
-                    )
-                    self.update_source(
-                        source_id,
-                        patch=_column_value_patch_for_field(config, next_value),
-                    )
+                    if _column_requires_llm(config):
+                        next_value = self._generate_column_value_for_row(
+                            config=config,
+                            row=row,
+                            manifest_record=manifest_record,
+                            repo_settings=repo_settings,
+                        )
+                        self.update_source(
+                            source_id,
+                            patch=_column_value_patch_for_field(config, next_value),
+                        )
+                    else:
+                        self._run_non_llm_column_for_row(
+                            config=config,
+                            source_id=source_id,
+                        )
                     status.succeeded_rows += 1
                 except Exception as exc:
                     status.failed_rows += 1
@@ -1028,6 +1088,18 @@ class AttachedRepositoryService:
             return str(output_constraint.fallback_value or "")
         return normalized_value
 
+    def _run_non_llm_column_for_row(
+        self,
+        *,
+        config: RepositoryColumnConfig,
+        source_id: str,
+    ) -> None:
+        target_key = str(config.builtin_key or config.id).strip()
+        if target_key == "citation_ready":
+            self.refresh_source_citation_readiness(source_id)
+            return
+        raise ValueError(f"Unsupported non-LLM column: {target_key}")
+
     def update_source(
         self,
         source_id: str,
@@ -1173,6 +1245,143 @@ class AttachedRepositoryService:
                 column_configs=column_configs,
             )
 
+    def refresh_source_citation_readiness(self, source_id: str) -> dict[str, Any]:
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+
+        normalized_id = str(source_id or "").strip()
+        if not normalized_id:
+            raise ValueError("source_id is required")
+
+        with self._writer_lock():
+            state = self._load_state_locked()
+            rows = _load_source_rows(state.get("sources", []))
+            citations = _load_citation_rows(state.get("citations", []))
+            column_configs = _load_column_configs(state.get("column_configs", []))
+            row_index = next((index for index, item in enumerate(rows) if item.id == normalized_id), -1)
+            if row_index < 0:
+                raise ValueError(f"Unknown source_id: {normalized_id}")
+
+            row = rows[row_index].model_copy(deep=True)
+            catalog_payload = self._load_repository_json_artifact(row, "catalog_file")
+            citation = _coerce_citation_metadata(catalog_payload.get("citation"))
+            citation = _merge_citation_metadata(
+                citation,
+                self._row_citation_defaults_payload(row),
+                overwrite_existing=False,
+            )
+            markdown_path = self._resolve_source_file_path_for_kind(row, "md")
+            citation.verification_content_digest = _file_sha256(markdown_path)
+            citation = _finalize_citation_metadata(citation)
+            self._write_catalog_citation_payload(
+                row,
+                catalog_payload=catalog_payload,
+                citation=citation,
+            )
+
+            self._write_repository_source_metadata(row)
+            rows[row_index] = row
+            rows = self._sort_rows(rows)
+            self._save_state_locked(
+                sources=rows,
+                citations=citations,
+                imports=state.get("imports", []),
+                column_configs=column_configs,
+            )
+            self._save_meta_locked(
+                {
+                    **self._load_meta_locked(),
+                    "next_source_id": _next_source_id_from_rows(rows),
+                    "updated_at": _utc_now_iso(),
+                }
+            )
+            self._rebuild_outputs_locked(rows, citations)
+            return build_manifest_record(
+                row,
+                base_dir=self.path,
+                column_configs=column_configs,
+            )
+
+    def bulk_mark_sources_ris_ready(
+        self,
+        source_ids: list[str],
+    ) -> RepositorySourceBulkRisReadyResponse:
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+
+        normalized_ids = _dedupe_strings(
+            [str(source_id or "").strip() for source_id in source_ids if str(source_id or "").strip()]
+        )
+        if not normalized_ids:
+            raise ValueError("Select at least one repository source.")
+
+        with self._writer_lock():
+            state = self._load_state_locked()
+            rows = _load_source_rows(state.get("sources", []))
+            column_configs = _load_column_configs(state.get("column_configs", []))
+            row_by_id = {row.id: row for row in rows}
+            missing_ids = [source_id for source_id in normalized_ids if source_id not in row_by_id]
+            if missing_ids:
+                raise ValueError(f"Unknown source_id: {missing_ids[0]}")
+            manifest_by_id = {
+                source_id: build_manifest_record(
+                    row_by_id[source_id],
+                    base_dir=self.path,
+                    column_configs=column_configs,
+                )
+                for source_id in normalized_ids
+            }
+
+        ready_sources = 0
+        blocked_sources = 0
+        for source_id in normalized_ids:
+            manifest_record = manifest_by_id[source_id]
+            patch: dict[str, Any] = {}
+            override_fields: list[str] = []
+            title_value = str(manifest_record.get("citation_title") or manifest_record.get("title") or "").strip()
+            authors_value = str(
+                manifest_record.get("citation_authors") or manifest_record.get("author_names") or ""
+            ).strip()
+            issued_value = str(
+                manifest_record.get("citation_issued")
+                or manifest_record.get("publication_date")
+                or manifest_record.get("publication_year")
+                or ""
+            ).strip()
+            if title_value:
+                patch["citation_title"] = title_value
+                override_fields.append("title")
+            if authors_value:
+                patch["citation_authors"] = authors_value
+                override_fields.append("authors")
+            if issued_value:
+                patch["citation_issued"] = issued_value
+                override_fields.append("issued")
+            if override_fields:
+                patch["citation_override_fields"] = override_fields
+                updated = self.update_source(source_id, patch=patch)
+            else:
+                updated = self.refresh_source_citation_readiness(source_id)
+            if bool(updated.get("citation_ready")):
+                ready_sources += 1
+            else:
+                blocked_sources += 1
+
+        message = (
+            f"Marked {ready_sources} source(s) RIS ready."
+            if blocked_sources == 0
+            else (
+                f"Marked {ready_sources} source(s) RIS ready. "
+                f"{blocked_sources} source(s) still need title, authors, or publication year."
+            )
+        )
+        return RepositorySourceBulkRisReadyResponse(
+            requested_sources=len(normalized_ids),
+            ready_sources=ready_sources,
+            blocked_sources=blocked_sources,
+            message=message,
+        )
+
     def _load_project_profile_template(self, filename: str) -> str:
         safe_name = Path(filename or DEFAULT_PROJECT_PROFILE_FILENAME).name
         if safe_name != (filename or DEFAULT_PROJECT_PROFILE_FILENAME):
@@ -1276,6 +1485,32 @@ class AttachedRepositoryService:
     def _write_catalog_patch(self, row: SourceManifestRow) -> None:
         catalog_payload = self._load_repository_json_artifact(row, "catalog_file")
         citation = _coerce_citation_metadata(catalog_payload.get("citation"))
+        self._write_catalog_citation_payload(
+            row,
+            catalog_payload=catalog_payload,
+            citation=citation,
+        )
+
+    def _row_citation_defaults_payload(self, row: SourceManifestRow) -> dict[str, Any]:
+        return {
+            "title": row.title,
+            "authors": [
+                author.model_dump(mode="json")
+                for author in normalize_citation_authors(row.author_names)
+            ],
+            "issued": row.publication_date or row.publication_year,
+            "publisher": row.organization_name,
+            "item_type": row.document_type,
+            "url": _citation_reference_url_for_row(row),
+        }
+
+    def _write_catalog_citation_payload(
+        self,
+        row: SourceManifestRow,
+        *,
+        catalog_payload: dict[str, Any],
+        citation: CitationMetadata,
+    ) -> None:
         catalog_payload.update(
             {
                 "title": row.title,
@@ -1307,17 +1542,7 @@ class AttachedRepositoryService:
         citation = _coerce_citation_metadata(catalog_payload.get("citation"))
         citation = _merge_citation_metadata(
             citation,
-            {
-                "title": row.title,
-                "authors": [
-                    author.model_dump(mode="json")
-                    for author in normalize_citation_authors(row.author_names)
-                ],
-                "issued": row.publication_date,
-                "publisher": row.organization_name,
-                "item_type": row.document_type,
-                "url": row.original_url or row.final_url,
-            },
+            self._row_citation_defaults_payload(row),
             overwrite_existing=False,
         )
 
@@ -1380,24 +1605,11 @@ class AttachedRepositoryService:
         citation = _finalize_citation_metadata(citation)
         citation = _apply_citation_manual_overrides(citation, citation)
 
-        catalog_payload.update(
-            {
-                "title": row.title,
-                "title_status": "existing" if row.title else row.title_status,
-                "author_names": row.author_names,
-                "publication_date": row.publication_date,
-                "publication_year": row.publication_year,
-                "document_type": row.document_type,
-                "organization_name": row.organization_name,
-                "organization_type": row.organization_type,
-                "source_kind": row.source_kind,
-                "citation": citation.model_dump(mode="json"),
-            }
+        self._write_catalog_citation_payload(
+            row,
+            catalog_payload=catalog_payload,
+            citation=citation,
         )
-        catalog_rel = self._source_catalog_rel(row)
-        self._write_repository_json_file(catalog_rel, catalog_payload)
-        row.catalog_file = catalog_rel.as_posix()
-        row.catalog_status = "existing"
 
     def _write_summary_patch(self, row: SourceManifestRow, summary_text: str) -> None:
         if not summary_text:
@@ -2845,6 +3057,136 @@ class AttachedRepositoryService:
         headers = _repository_source_file_headers(source_path)
         return source_path, media_type, headers
 
+    def find_duplicate_source_candidates(self) -> RepositoryDuplicateCandidateResponse:
+        if not self.is_attached:
+            raise ValueError("Attach a repository before scanning for duplicate sources")
+
+        with self._writer_lock():
+            state = self._load_state_locked()
+            rows = _load_source_rows(state.get("sources", []))
+
+        if len(rows) < 2:
+            return RepositoryDuplicateCandidateResponse(
+                status="completed",
+                scanned_sources=len(rows),
+                total_groups=0,
+                total_candidate_rows=0,
+                truncated=False,
+                message="No likely duplicates found.",
+                groups=[],
+            )
+
+        contexts = [
+            _build_duplicate_candidate_context(row, base_dir=self.path)
+            for row in self._sort_rows(rows)
+        ]
+        assigned_ids: set[str] = set()
+        groups: list[RepositoryDuplicateCandidateGroup] = []
+        truncated = False
+
+        def append_group(
+            candidates: list[_DuplicateCandidateContext],
+            *,
+            reason: str,
+            confidence: str,
+        ) -> None:
+            nonlocal truncated
+            available = [
+                candidate
+                for candidate in candidates
+                if candidate.row.id not in assigned_ids
+            ]
+            unique_available = sorted(
+                {candidate.row.id: candidate for candidate in available}.values(),
+                key=lambda candidate: _sortable_source_id(candidate.row.id),
+            )
+            if len(unique_available) < 2:
+                return
+            if len(groups) >= DUPLICATE_SCAN_MAX_GROUPS:
+                truncated = True
+                return
+            groups.append(
+                _build_duplicate_candidate_group(
+                    unique_available,
+                    group_id=f"dup-{len(groups) + 1:04d}",
+                    match_reason=reason,
+                    confidence=confidence,
+                )
+            )
+            assigned_ids.update(candidate.row.id for candidate in unique_available)
+
+        doi_buckets: dict[str, list[_DuplicateCandidateContext]] = {}
+        url_buckets: dict[str, list[_DuplicateCandidateContext]] = {}
+        sha_buckets: dict[str, list[_DuplicateCandidateContext]] = {}
+        for context in contexts:
+            if context.doi_key:
+                doi_buckets.setdefault(context.doi_key, []).append(context)
+            for url_key in context.url_keys:
+                url_buckets.setdefault(url_key, []).append(context)
+            if context.sha_key:
+                sha_buckets.setdefault(context.sha_key, []).append(context)
+
+        for bucket in _duplicate_contexts_by_bucket_size(doi_buckets):
+            append_group(bucket, reason="Matching DOI", confidence="high")
+        for bucket in _duplicate_contexts_by_bucket_size(url_buckets):
+            append_group(bucket, reason="Matching normalized URL", confidence="high")
+        for bucket in _duplicate_contexts_by_bucket_size(sha_buckets):
+            append_group(bucket, reason="Matching source content digest", confidence="high")
+
+        remaining_contexts = [
+            context for context in contexts if context.row.id not in assigned_ids
+        ]
+        author_year_buckets: dict[str, list[_DuplicateCandidateContext]] = {}
+        organization_year_buckets: dict[str, list[_DuplicateCandidateContext]] = {}
+        for context in remaining_contexts:
+            if context.year and context.author_signature and len(context.title_token_set) >= 3:
+                author_year_buckets.setdefault(
+                    f"{context.year}|{context.author_signature}",
+                    [],
+                ).append(context)
+            if (
+                context.year
+                and context.organization_signature
+                and len(context.title_token_set) >= 3
+            ):
+                organization_year_buckets.setdefault(
+                    f"{context.year}|{context.organization_signature}",
+                    [],
+                ).append(context)
+
+        for bucket in _duplicate_contexts_by_bucket_size(author_year_buckets):
+            for cluster in _cluster_duplicate_title_contexts(bucket):
+                append_group(
+                    cluster,
+                    reason="Similar title, year, and authors",
+                    confidence="medium",
+                )
+        for bucket in _duplicate_contexts_by_bucket_size(organization_year_buckets):
+            for cluster in _cluster_duplicate_title_contexts(bucket):
+                append_group(
+                    cluster,
+                    reason="Similar title, year, and organization",
+                    confidence="medium",
+                )
+
+        total_candidate_rows = sum(len(group.rows) for group in groups)
+        if groups:
+            message = f"Found {len(groups)} potential duplicate group(s)."
+            if truncated:
+                message += " Showing the first 100 groups."
+        else:
+            message = "No likely duplicates found."
+
+        return RepositoryDuplicateCandidateResponse(
+            status="completed",
+            scanned_sources=len(contexts),
+            total_groups=len(groups),
+            total_candidate_rows=total_candidate_rows,
+            truncated=truncated,
+            message=message,
+            groups=groups,
+        )
+
     def delete_sources(self, source_ids: list[str]) -> RepositorySourceDeleteResponse:
         if not self.is_attached:
             raise ValueError("Attach a repository before deleting sources")
@@ -2995,6 +3337,179 @@ class AttachedRepositoryService:
             destination_path=str(destination_dir),
             message=message,
         )
+
+    def export_repository_bundle(
+        self,
+        payload: RepositoryBundleExportRequest,
+    ) -> tuple[bytes, dict[str, str]]:
+        if not self.is_attached:
+            raise ValueError("Attach a repository before exporting a repository bundle")
+
+        normalized_scope = str(payload.scope or "all").strip().lower() or "all"
+        if normalized_scope not in {"all", "selected"}:
+            raise ValueError("Invalid scope. Use `all` or `selected`.")
+        normalized_mode = str(payload.mode or "offline").strip().lower() or "offline"
+        if normalized_mode not in {"offline", "cloud"}:
+            raise ValueError("Invalid mode. Use `offline` or `cloud`.")
+        normalized_base_url = (
+            _normalize_repository_bundle_base_url(payload.base_url)
+            if normalized_mode == "cloud"
+            else ""
+        )
+        normalized_file_kinds = _normalize_repository_bundle_file_kinds(payload.file_kinds)
+
+        _scope, target_rows = self._resolve_manifest_export_rows(
+            scope=normalized_scope,
+            source_ids=payload.source_ids,
+            filters=RepositoryManifestFilterRequest(),
+        )
+        if not target_rows:
+            raise ValueError("No repository rows are available for export.")
+
+        with self._writer_lock():
+            column_configs = _load_column_configs(self._load_state_locked().get("column_configs", []))
+
+        manifest_records = {
+            row.id: build_manifest_record(row, base_dir=self.path, column_configs=column_configs)
+            for row in target_rows
+        }
+        custom_configs, base_headers, custom_headers, csv_headers = _repository_bundle_csv_layout(column_configs)
+        csv_export_records = [
+            _build_repository_bundle_csv_record(
+                manifest_records[row.id],
+                custom_configs=custom_configs,
+                base_headers=base_headers,
+                custom_headers=custom_headers,
+            )
+            for row in target_rows
+        ]
+        csv_text = _render_repository_bundle_csv(csv_headers, csv_export_records)
+        csv_records_by_id = {
+            row.id: export_record
+            for row, export_record in zip(target_rows, csv_export_records)
+        }
+        ris_text, ris_exported_count, ris_skipped_count = build_ris_records(
+            target_rows,
+            base_dir=self.path,
+        )
+        zip_filename = (
+            "selected-repository-cloud-export.zip"
+            if normalized_mode == "cloud" and normalized_scope == "selected"
+            else "repository-cloud-export.zip"
+            if normalized_mode == "cloud"
+            else "selected-repository-export.zip"
+            if normalized_scope == "selected"
+            else "repository-export.zip"
+        )
+
+        selected_bundle_kinds = set(normalized_file_kinds)
+        use_type_directories = normalized_mode == "offline" and selected_bundle_kinds in (
+            {"pdf", "html", "md"},
+            set(REPOSITORY_BUNDLE_FILE_KINDS),
+        )
+        directory_names = {
+            "pdf": "PDF",
+            "rendered": "RENDERED",
+            "html": "HTML",
+            "md": "MD",
+        }
+        used_names_by_directory: dict[str, set[str]] = {}
+        artifact_entries_by_row: dict[str, dict[str, dict[str, str]]] = {}
+        file_entries: list[tuple[str, Path]] = []
+        exported_files = 0
+        missing_files = 0
+
+        for row in target_rows:
+            record = manifest_records[row.id]
+            row_artifact_entries = artifact_entries_by_row.setdefault(row.id, {})
+            for kind in normalized_file_kinds:
+                source_path = _resolve_repository_bundle_file_path(self, row, kind)
+                if source_path is None or not source_path.is_file():
+                    missing_files += 1
+                    continue
+                display_name = source_path.name
+                if normalized_mode == "cloud":
+                    storage_name = _build_repository_bundle_storage_filename(
+                        row=row,
+                        kind=kind,
+                        display_name=display_name,
+                        extension=source_path.suffix or _default_extension_for_source_kind(kind),
+                    )
+                    archive_name = f"files/{storage_name}"
+                    row_artifact_entries[kind] = {
+                        "kind": kind,
+                        "displayName": display_name,
+                        "storageName": storage_name,
+                    }
+                else:
+                    directory = directory_names[kind] if use_type_directories else ""
+                    used_names = used_names_by_directory.setdefault(directory, set())
+                    filename = _build_repository_bundle_filename(
+                        row=row,
+                        record=record,
+                        extension=source_path.suffix or _default_extension_for_source_kind(kind),
+                        used_names=used_names,
+                    )
+                    archive_name = f"{directory}/{filename}" if directory else filename
+                    row_artifact_entries[kind] = {
+                        "kind": kind,
+                        "displayName": display_name,
+                        "relativePath": archive_name,
+                    }
+                file_entries.append((archive_name, source_path))
+                exported_files += 1
+
+        viewer_payload = {
+            "repositoryName": self.path.name if self.path is not None else "Repository Browser",
+            "exportMode": normalized_mode,
+            "exportScope": normalized_scope,
+            "bundleFileKinds": normalized_file_kinds,
+            "exportedAt": datetime.now(timezone.utc).isoformat(),
+            "csvHeaders": csv_headers,
+            "rows": [
+                _build_repository_bundle_viewer_row(
+                    self,
+                    row,
+                    record=manifest_records[row.id],
+                    csv_record=csv_records_by_id[row.id],
+                    custom_configs=custom_configs,
+                    custom_headers=custom_headers,
+                    artifact_entries=artifact_entries_by_row.get(row.id, {}),
+                )
+                for row in target_rows
+            ],
+        }
+        viewer_html = build_repository_bundle_viewer_html(
+            viewer_payload,
+            base_url=(
+                normalized_base_url
+                if normalized_mode == "cloud"
+                else ""
+            ),
+        )
+
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, mode="w", compression=zipfile.ZIP_DEFLATED) as bundle:
+            bundle.writestr("index.html", viewer_html.encode("utf-8"))
+            bundle.writestr("research-export.csv", csv_text.encode("utf-8-sig"))
+            bundle.writestr("citations.ris", ris_text.encode("utf-8"))
+            if normalized_mode == "cloud":
+                bundle.writestr(
+                    "manifest.json",
+                    json.dumps(viewer_payload, ensure_ascii=False, indent=2).encode("utf-8"),
+                )
+            for archive_name, source_path in file_entries:
+                bundle.writestr(archive_name, source_path.read_bytes())
+
+        archive.seek(0)
+        auxiliary_file_count = 4 if normalized_mode == "cloud" else 3
+        headers = {
+            "Content-Disposition": f'attachment; filename="{zip_filename}"',
+            "X-ResearchAssistant-Requested-Count": str(len(target_rows)),
+            "X-ResearchAssistant-Exported-Count": str(exported_files + auxiliary_file_count),
+            "X-ResearchAssistant-Skipped-Count": str(missing_files + ris_skipped_count),
+        }
+        return archive.getvalue(), headers
 
     def _resolve_manifest_export_rows(
         self,
@@ -3511,6 +4026,9 @@ class AttachedRepositoryService:
                         "total_candidates": total_candidates,
                         "accepted_new": accepted_new,
                         "duplicates_skipped": duplicates,
+                        "source_ids": _dedupe_strings(
+                            [str(item.get("source_id") or "").strip() for item in document_records]
+                        ),
                         "documents": document_records,
                     },
                 ],
@@ -4090,6 +4608,7 @@ class AttachedRepositoryService:
             total_candidates = 0
             accepted_new = 0
             duplicates = 0
+            touched_source_ids: list[str] = []
 
             for raw_entry in bibliography_raw.get("entries", []):
                 try:
@@ -4117,6 +4636,7 @@ class AttachedRepositoryService:
                 existing = by_key.get(dedupe_key)
                 if existing:
                     duplicates += 1
+                    touched_source_ids.append(existing.id)
                     if not existing.source_document_name:
                         existing.source_document_name = entry.source_document_name
                     if not existing.citation_number and entry.ref_number:
@@ -4143,6 +4663,7 @@ class AttachedRepositoryService:
                 rows.append(row)
                 by_key[dedupe_key] = row
                 accepted_new += 1
+                touched_source_ids.append(source_id)
 
             merged_citations = list(citations)
             for export_row in export_rows:
@@ -4208,6 +4729,7 @@ class AttachedRepositoryService:
                     "total_candidates": total_candidates,
                     "accepted_new": accepted_new,
                     "duplicates_skipped": duplicates,
+                    "source_ids": _dedupe_strings(touched_source_ids),
                     "accepted_documents": len(documents),
                     "documents": documents,
                     "processing_job_id": job_id,
@@ -4326,6 +4848,7 @@ class AttachedRepositoryService:
             total_candidates = 0
             accepted_new = 0
             duplicates = 0
+            touched_source_ids: list[str] = []
 
             for raw_entry in bibliography_raw.get("entries", []):
                 try:
@@ -4353,6 +4876,7 @@ class AttachedRepositoryService:
                 existing = by_key.get(dedupe_key)
                 if existing:
                     duplicates += 1
+                    touched_source_ids.append(existing.id)
                     if not existing.source_document_name:
                         existing.source_document_name = display_name
                     if not existing.citation_number and entry.ref_number:
@@ -4379,6 +4903,7 @@ class AttachedRepositoryService:
                 rows.append(row)
                 by_key[dedupe_key] = row
                 accepted_new += 1
+                touched_source_ids.append(source_id)
 
             new_citations_by_path: dict[str, list[ExportRow]] = {
                 str(item.get("repository_path") or "").strip(): [] for item in documents
@@ -4481,6 +5006,7 @@ class AttachedRepositoryService:
                     "total_candidates": total_candidates,
                     "accepted_new": accepted_new,
                     "duplicates_skipped": duplicates,
+                    "source_ids": _dedupe_strings(touched_source_ids),
                     "accepted_documents": len(documents),
                     "replaced_documents": replaced_documents,
                     "preserved_failed_documents": preserved_failed_documents,
@@ -5878,6 +6404,21 @@ class AttachedRepositoryService:
         if normalized_import_id not in known_import_ids:
             raise ValueError(f"Unknown import_id: {normalized_import_id}")
 
+        import_record = next(
+            (
+                item
+                for item in imports
+                if str(item.get("import_id") or "").strip() == normalized_import_id
+            ),
+            None,
+        )
+        if import_record is not None:
+            selected_ids = set(_import_source_ids(import_record))
+            if selected_ids:
+                selected = [row for row in ordered_rows if row.id in selected_ids]
+                if selected:
+                    return selected, normalized_import_id
+
         prefix = f"{normalized_import_id}:"
         selected = [row for row in ordered_rows if (row.provenance_ref or "").startswith(prefix)]
         return selected, normalized_import_id
@@ -6022,7 +6563,12 @@ class AttachedRepositoryService:
         except Exception:
             return False
         citation = _coerce_citation_metadata(payload.get("citation"))
-        return bool(str(citation.verification_status or "").strip())
+        citation = _merge_citation_metadata(
+            citation,
+            self._row_citation_defaults_payload(row),
+            overwrite_existing=False,
+        )
+        return bool(citation.ready_for_ris)
 
     def _build_export_job_bibliography(
         self,
@@ -6631,13 +7177,6 @@ class AttachedRepositoryService:
             return None
 
         if normalized_kind == "rendered":
-            rendered_path = self._resolve_repository_artifact_path(
-                row,
-                "rendered_file",
-                row.rendered_file,
-            )
-            if rendered_path is not None:
-                return rendered_path
             rendered_pdf_path = self._resolve_repository_artifact_path(
                 row,
                 "rendered_pdf_file",
@@ -6645,6 +7184,13 @@ class AttachedRepositoryService:
             )
             if rendered_pdf_path is not None:
                 return rendered_pdf_path
+            rendered_path = self._resolve_repository_artifact_path(
+                row,
+                "rendered_file",
+                row.rendered_file,
+            )
+            if rendered_path is not None:
+                return rendered_path
             return None
 
         cleanup_path = self._resolve_repository_artifact_path(
@@ -6967,6 +7513,7 @@ class AttachedRepositoryService:
             total_candidates = 0
             accepted_new = 0
             duplicates = 0
+            touched_source_ids: list[str] = []
 
             for entry in entries:
                 url = _entry_url(entry)
@@ -6981,6 +7528,7 @@ class AttachedRepositoryService:
                 existing = by_key.get(dedupe_key)
                 if existing:
                     duplicates += 1
+                    touched_source_ids.append(existing.id)
                     if not existing.title and entry.title:
                         existing.title = entry.title
                     if write_placeholder_citations:
@@ -7016,6 +7564,7 @@ class AttachedRepositoryService:
                 rows.append(row)
                 by_key[dedupe_key] = row
                 accepted_new += 1
+                touched_source_ids.append(source_id)
 
                 if write_placeholder_citations:
                     citations.append(
@@ -7042,6 +7591,7 @@ class AttachedRepositoryService:
                     "total_candidates": total_candidates,
                     "accepted_new": accepted_new,
                     "duplicates_skipped": duplicates,
+                    "source_ids": _dedupe_strings(touched_source_ids),
                 }
             )
 
@@ -8051,11 +8601,286 @@ def _build_flat_export_filename(
     return candidate
 
 
+def _normalize_repository_bundle_file_kinds(values: list[str]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        kind = str(item or "").strip().lower()
+        if kind not in REPOSITORY_BUNDLE_FILE_KINDS:
+            raise ValueError("Invalid bundle file kind. Use `pdf`, `rendered`, `html`, or `md`.")
+        if kind in seen:
+            continue
+        seen.add(kind)
+        normalized.append(kind)
+    return normalized
+
+
+def _normalize_repository_bundle_base_url(value: str) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        raise ValueError("Cloud exports require a Base URL for the uploaded storage files.")
+    if re.search(r"\s", normalized):
+        raise ValueError("Base URL cannot contain whitespace.")
+
+    if re.match(r"^https?://", normalized, flags=re.IGNORECASE):
+        parsed = urlsplit(normalized)
+        if not parsed.scheme or not parsed.netloc:
+            raise ValueError("Base URL must be a valid http(s) URL or a relative preview path like ./files/.")
+        return normalized.rstrip("/") + "/"
+
+    if normalized.startswith("/") or normalized.startswith("//") or "://" in normalized:
+        raise ValueError("Base URL must be a valid http(s) URL or a relative preview path like ./files/.")
+    if not re.fullmatch(r"(?:\.\.?/)?[A-Za-z0-9._~!$&'()*+,;=:@%-]+(?:/[A-Za-z0-9._~!$&'()*+,;=:@%-]+)*/?", normalized):
+        raise ValueError("Base URL must be a valid http(s) URL or a relative preview path like ./files/.")
+    return normalized.rstrip("/") + "/"
+
+
+def _repository_bundle_metadata_value(record: dict[str, Any], key: str) -> str:
+    if key == "export_url":
+        return str(
+            record.get("citation_url")
+            or record.get("final_url")
+            or record.get("original_url")
+            or ""
+        )
+    if key == "export_overall_rating":
+        value = record.get("rating_overall_relevance")
+        if value in {"", None}:
+            value = record.get("rating_overall")
+        return "" if value in {"", None} else str(value)
+    value = record.get(key, "")
+    return "" if value is None else str(value)
+
+
+def _dedupe_export_header(label: str, used_headers: set[str]) -> str:
+    candidate = str(label or "").strip() or "Column"
+    if candidate not in used_headers:
+        used_headers.add(candidate)
+        return candidate
+    counter = 2
+    while f"{candidate} ({counter})" in used_headers:
+        counter += 1
+    deduped = f"{candidate} ({counter})"
+    used_headers.add(deduped)
+    return deduped
+
+
+def _repository_bundle_csv_layout(
+    column_configs: list[RepositoryColumnConfig] | None = None,
+) -> tuple[list[RepositoryColumnConfig], list[str], list[str], list[str]]:
+    custom_configs = [config for config in column_configs or [] if config.kind == "custom"]
+    used_headers: set[str] = set()
+    base_headers = [
+        _dedupe_export_header(label, used_headers)
+        for _field_name, label in REPOSITORY_BUNDLE_RESEARCH_COLUMNS
+    ]
+    custom_headers = [
+        _dedupe_export_header(
+            _manifest_column_label(config.id, column_configs),
+            used_headers,
+        )
+        for config in custom_configs
+    ]
+    return custom_configs, base_headers, custom_headers, base_headers + custom_headers
+
+
+def _build_repository_bundle_csv_record(
+    record: dict[str, Any],
+    *,
+    custom_configs: list[RepositoryColumnConfig],
+    base_headers: list[str],
+    custom_headers: list[str],
+) -> dict[str, str]:
+    export_record: dict[str, str] = {}
+    for (field_name, _label), header in zip(REPOSITORY_BUNDLE_RESEARCH_COLUMNS, base_headers):
+        export_record[header] = _repository_bundle_metadata_value(record, field_name)
+    for config, header in zip(custom_configs, custom_headers):
+        export_record[header] = _repository_bundle_metadata_value(record, config.id)
+    return export_record
+
+
+def _build_repository_bundle_csv_rows(
+    rows: list[SourceManifestRow],
+    *,
+    base_dir: Path | None = None,
+    column_configs: list[RepositoryColumnConfig] | None = None,
+    manifest_records: dict[str, dict[str, Any]] | None = None,
+) -> tuple[list[str], list[dict[str, str]]]:
+    custom_configs, base_headers, custom_headers, fieldnames = _repository_bundle_csv_layout(column_configs)
+    export_records: list[dict[str, str]] = []
+    for row in rows:
+        record = (
+            manifest_records.get(row.id)
+            if manifest_records is not None and row.id in manifest_records
+            else build_manifest_record(row, base_dir=base_dir, column_configs=column_configs)
+        )
+        export_records.append(
+            _build_repository_bundle_csv_record(
+                record,
+                custom_configs=custom_configs,
+                base_headers=base_headers,
+                custom_headers=custom_headers,
+            )
+        )
+    return fieldnames, export_records
+
+
+def _render_repository_bundle_csv(
+    fieldnames: list[str],
+    export_records: list[dict[str, str]],
+) -> str:
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    for export_record in export_records:
+        writer.writerow(export_record)
+    return output.getvalue()
+
+
+def _repository_bundle_author_label(record: dict[str, Any]) -> str:
+    raw = str(
+        record.get("citation_authors")
+        or record.get("author_names")
+        or record.get("citation_publisher")
+        or record.get("organization_name")
+        or ""
+    ).strip()
+    if not raw:
+        return "Unknown Author"
+    authors = [chunk.strip() for chunk in raw.split(";") if chunk.strip()]
+    if not authors:
+        return _sanitize_export_title(raw) or "Unknown Author"
+    first = authors[0]
+    if len(authors) > 1:
+        first = f"{first} et al"
+    return _sanitize_export_title(first) or "Unknown Author"
+
+
+def _repository_bundle_date_label(record: dict[str, Any]) -> str:
+    raw = str(
+        record.get("citation_issued")
+        or record.get("publication_date")
+        or record.get("publication_year")
+        or ""
+    ).strip()
+    return _sanitize_export_title(raw) or "Undated"
+
+
+def _repository_bundle_title_label(row: SourceManifestRow, record: dict[str, Any]) -> str:
+    raw = str(record.get("citation_title") or record.get("title") or "").strip()
+    if not raw:
+        raw = f"Source {row.id}"
+    return _sanitize_export_title(raw) or f"Source {row.id}"
+
+
+def _build_repository_bundle_filename_base(
+    row: SourceManifestRow,
+    record: dict[str, Any],
+) -> str:
+    return " - ".join(
+        [
+            _repository_bundle_author_label(record),
+            _repository_bundle_date_label(record),
+            _repository_bundle_title_label(row, record),
+        ]
+    )
+
+
+def _build_repository_bundle_filename(
+    *,
+    row: SourceManifestRow,
+    record: dict[str, Any],
+    extension: str,
+    used_names: set[str],
+) -> str:
+    normalized_ext = str(extension or "").strip()
+    if normalized_ext and not normalized_ext.startswith("."):
+        normalized_ext = f".{normalized_ext}"
+    base_name = _build_repository_bundle_filename_base(row, record)
+    candidate = f"{base_name}{normalized_ext}"
+    counter = 2
+    while candidate.lower() in used_names:
+        candidate = f"{base_name} ({counter}){normalized_ext}"
+        counter += 1
+    used_names.add(candidate.lower())
+    return candidate
+
+
+def _normalize_storage_slug(value: str, *, fallback: str = "file", max_length: int = 80) -> str:
+    normalized = normalize_unicode(str(value or ""))
+    normalized = unicodedata.normalize("NFKD", normalized)
+    normalized = normalized.encode("ascii", "ignore").decode("ascii")
+    normalized = normalized.lower()
+    normalized = re.sub(r"[^a-z0-9]+", "-", normalized)
+    normalized = normalized.strip("-")
+    if len(normalized) > max_length:
+        normalized = normalized[:max_length].rstrip("-")
+    return normalized or fallback
+
+
+def _build_repository_bundle_storage_filename(
+    *,
+    row: SourceManifestRow,
+    kind: str,
+    display_name: str,
+    extension: str,
+) -> str:
+    normalized_ext = str(extension or "").strip().lower()
+    if normalized_ext and not normalized_ext.startswith("."):
+        normalized_ext = f".{normalized_ext}"
+    if not normalized_ext:
+        normalized_ext = _default_extension_for_source_kind(kind)
+
+    display_path = Path(str(display_name or "").strip() or f"{row.id}-{kind}")
+    stem = display_path.stem if display_path.suffix else display_path.name
+    normalized_stem = _normalize_storage_slug(stem, fallback="file")
+    normalized_id = _normalize_storage_slug(row.id, fallback="source", max_length=24)
+    normalized_kind = _normalize_storage_slug(kind, fallback="file", max_length=24)
+    return f"{normalized_stem}-{normalized_id}-{normalized_kind}{normalized_ext}"
+
+
+def _resolve_repository_bundle_file_path(
+    service: AttachedRepositoryService,
+    row: SourceManifestRow,
+    kind: str,
+) -> Path | None:
+    normalized_kind = str(kind or "").strip().lower()
+    if normalized_kind == "pdf":
+        raw_path = service._resolve_repository_artifact_path(row, "raw_file", row.raw_file)
+        if raw_path is not None and raw_path.suffix.lower() == ".pdf":
+            return raw_path
+        return None
+    if normalized_kind == "rendered":
+        rendered_pdf_path = service._resolve_repository_artifact_path(
+            row,
+            "rendered_pdf_file",
+            row.rendered_pdf_file,
+        )
+        if rendered_pdf_path is not None:
+            return rendered_pdf_path
+        return service._resolve_repository_artifact_path(row, "rendered_file", row.rendered_file)
+    if normalized_kind == "html":
+        raw_path = service._resolve_repository_artifact_path(row, "raw_file", row.raw_file)
+        if raw_path is not None and raw_path.suffix.lower() in {".html", ".htm"}:
+            return raw_path
+        return service._resolve_repository_artifact_path(row, "rendered_file", row.rendered_file)
+    if normalized_kind == "md":
+        cleanup_path = service._resolve_repository_artifact_path(
+            row,
+            "llm_cleanup_file",
+            row.llm_cleanup_file,
+        )
+        if cleanup_path is not None:
+            return cleanup_path
+        return service._resolve_repository_artifact_path(row, "markdown_file", row.markdown_file)
+    raise ValueError("Invalid bundle file kind. Use `pdf`, `rendered`, `html`, or `md`.")
+
+
 def _default_extension_for_source_kind(kind: str) -> str:
     normalized_kind = _normalize_source_file_kind(kind)
-    if normalized_kind == "pdf":
+    if normalized_kind in {"pdf", "rendered"}:
         return ".pdf"
-    if normalized_kind in {"html", "rendered"}:
+    if normalized_kind == "html":
         return ".html"
     return ".md"
 
@@ -8074,8 +8899,8 @@ def _media_type_for_repository_source_path(path: Path, kind: str) -> str:
         return guessed
     return {
         "pdf": "application/pdf",
+        "rendered": "application/pdf",
         "html": "text/html; charset=utf-8",
-        "rendered": "text/html; charset=utf-8",
         "md": "text/plain; charset=utf-8",
     }[_normalize_source_file_kind(kind)]
 
@@ -8121,6 +8946,11 @@ PROCESSABLE_BUILTIN_COLUMNS = {
     "citation_standard_number",
     "citation_language",
     "citation_accessed",
+    "citation_ready",
+}
+
+NON_LLM_PROCESSABLE_BUILTIN_COLUMNS = {
+    "citation_ready",
 }
 
 DEFAULT_BUILTIN_COLUMN_PROMPTS: dict[str, str] = {
@@ -8274,6 +9104,19 @@ def _effective_column_include_source_text(
     return bool(config.include_source_text)
 
 
+def _column_requires_llm(
+    config: RepositoryColumnConfig | None = None,
+    *,
+    field_name: str = "",
+) -> bool:
+    if config is not None and config.kind == "custom":
+        return True
+    target_key = str(field_name or "").strip()
+    if config is not None:
+        target_key = str(config.builtin_key or config.id or target_key).strip()
+    return target_key not in NON_LLM_PROCESSABLE_BUILTIN_COLUMNS
+
+
 def _manifest_column_label(
     value: str,
     column_configs: list[RepositoryColumnConfig] | None = None,
@@ -8360,6 +9203,16 @@ def _manifest_column_processable(
     return field_name in PROCESSABLE_BUILTIN_COLUMNS
 
 
+def _manifest_record_has_column_value(
+    record: dict[str, str | int | float | bool],
+    field_name: str,
+) -> bool:
+    normalized_field = str(field_name or "").strip()
+    if normalized_field == "citation_ready":
+        return bool(record.get(normalized_field))
+    return bool(str(record.get(normalized_field) or "").strip())
+
+
 def _build_manifest_column_metadata(
     records: list[dict[str, str | int | float | bool]],
     column_configs: list[RepositoryColumnConfig] | None = None,
@@ -8398,6 +9251,10 @@ def _build_manifest_column_metadata(
             "kind": "custom" if field_name in custom_field_id_set else "builtin",
             "renamable": field_name in custom_field_id_set,
             "processable": _manifest_column_processable(field_name, column_configs),
+            "requires_llm": _column_requires_llm(
+                config_lookup.get(field_name),
+                field_name=field_name,
+            ),
             "sort_type": _manifest_column_sort_type(field_name, column_configs),
             "instruction_prompt": _effective_column_instruction_prompt(
                 config_lookup.get(field_name),
@@ -8637,6 +9494,93 @@ def _build_manifest_export_csv(
     for record in records:
         writer.writerow(record)
     return output.getvalue()
+
+
+def _build_repository_bundle_csv(
+    rows: list[SourceManifestRow],
+    *,
+    base_dir: Path | None = None,
+    column_configs: list[RepositoryColumnConfig] | None = None,
+    manifest_records: dict[str, dict[str, Any]] | None = None,
+) -> str:
+    fieldnames, export_records = _build_repository_bundle_csv_rows(
+        rows,
+        base_dir=base_dir,
+        column_configs=column_configs,
+        manifest_records=manifest_records,
+    )
+    return _render_repository_bundle_csv(fieldnames, export_records)
+
+
+def _read_repository_bundle_markdown_text(
+    service: AttachedRepositoryService,
+    row: SourceManifestRow,
+) -> str:
+    markdown_path = _resolve_repository_bundle_file_path(service, row, "md")
+    if markdown_path is None or not markdown_path.is_file():
+        return ""
+    try:
+        return markdown_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return markdown_path.read_text(encoding="utf-8", errors="replace")
+
+
+def _build_repository_bundle_viewer_row(
+    service: AttachedRepositoryService,
+    row: SourceManifestRow,
+    *,
+    record: dict[str, Any],
+    csv_record: dict[str, str],
+    custom_configs: list[RepositoryColumnConfig],
+    custom_headers: list[str],
+    artifact_entries: dict[str, dict[str, str]],
+) -> dict[str, Any]:
+    citation_title = str(record.get("citation_title") or "").strip()
+    source_title = str(record.get("title") or "").strip()
+    citation_authors = str(record.get("citation_authors") or "").strip()
+    source_authors = str(record.get("author_names") or "").strip()
+    citation_issued = str(record.get("citation_issued") or "").strip()
+    publication_date = str(record.get("publication_date") or "").strip()
+    publication_year = str(record.get("publication_year") or "").strip()
+    organization_name = str(record.get("organization_name") or "").strip()
+    citation_publisher = str(record.get("citation_publisher") or "").strip()
+
+    ris_text, _ris_exported, _ris_skipped = build_ris_records([row], base_dir=service.path)
+
+    return {
+        "id": row.id,
+        "sourceTitle": source_title,
+        "title": citation_title or source_title or f"Source {row.id}",
+        "sourceAuthors": source_authors,
+        "authors": citation_authors or source_authors,
+        "publicationDate": citation_issued or publication_date or publication_year,
+        "publicationYear": publication_year,
+        "organization": organization_name or citation_publisher,
+        "organizationType": str(record.get("organization_type") or "").strip(),
+        "overallRating": _repository_bundle_metadata_value(record, "export_overall_rating"),
+        "summary": str(record.get("summary_text") or "").strip(),
+        "ratingRationale": str(record.get("rating_rationale") or "").strip(),
+        "relevantSections": str(record.get("relevant_sections") or "").strip(),
+        "citationType": str(record.get("citation_type") or "").strip(),
+        "reportNumber": str(record.get("citation_report_number") or "").strip(),
+        "citationUrl": str(record.get("citation_url") or "").strip(),
+        "sourceUrl": str(record.get("final_url") or record.get("original_url") or "").strip(),
+        "exportUrl": _repository_bundle_metadata_value(record, "export_url"),
+        "documentType": str(record.get("document_type") or "").strip(),
+        "markdownCharCount": int(row.markdown_char_count or 0),
+        "customFields": [
+            {
+                "key": config.id,
+                "label": header,
+                "value": _repository_bundle_metadata_value(record, config.id),
+            }
+            for config, header in zip(custom_configs, custom_headers)
+        ],
+        "files": artifact_entries,
+        "csvRecord": csv_record,
+        "ris": ris_text,
+        "markdown": _read_repository_bundle_markdown_text(service, row),
+    }
 
 
 def _build_manifest_export_xlsx(
@@ -8955,6 +9899,22 @@ def _dedupe_strings(values: list[str]) -> list[str]:
     return deduped
 
 
+def _import_source_ids(import_record: dict[str, Any]) -> list[str]:
+    ids: list[str] = []
+    explicit_ids = import_record.get("source_ids") or []
+    if isinstance(explicit_ids, list):
+        ids.extend(str(item or "").strip() for item in explicit_ids)
+
+    documents = import_record.get("documents") or []
+    if isinstance(documents, list):
+        for item in documents:
+            if not isinstance(item, dict):
+                continue
+            ids.append(str(item.get("source_id") or "").strip())
+
+    return _dedupe_strings(ids)
+
+
 def _entry_url(entry: BibliographyEntry) -> str:
     url = (entry.url or "").strip()
     if url:
@@ -8984,6 +9944,22 @@ def _row_priority(row: SourceManifestRow) -> tuple[int, int, int, int, int, int,
         1 if row.rendered_pdf_file else 0,
         1 if row.raw_file else 0,
     )
+
+
+@dataclass(frozen=True)
+class _DuplicateCandidateContext:
+    row: SourceManifestRow
+    manifest: dict[str, Any]
+    quality_score: int
+    doi_key: str
+    url_keys: tuple[str, ...]
+    sha_key: str
+    year: str
+    title_normalized: str
+    title_tokens: tuple[str, ...]
+    title_token_set: frozenset[str]
+    author_signature: str
+    organization_signature: str
 
 
 def _next_unique_filename(filename: str, used_filenames: set[str]) -> str:
@@ -9238,6 +10214,317 @@ def _source_row_identity_key(row: SourceManifestRow) -> str:
         return f"url:{fallback}"
     source_id = str(row.repository_source_id or row.id or "").strip()
     return f"url:id:{source_id}" if source_id else ""
+
+
+def _sortable_source_id(value: str) -> tuple[int, str]:
+    raw = str(value or "").strip()
+    return (0, f"{int(raw):09d}") if raw.isdigit() else (1, raw)
+
+
+def _normalize_duplicate_text(value: Any) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(value or "").strip().lower())
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _duplicate_title_tokens(value: Any) -> tuple[str, ...]:
+    normalized = _normalize_duplicate_text(value)
+    if not normalized:
+        return ()
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for token in normalized.split():
+        if token in DUPLICATE_TITLE_STOP_WORDS:
+            continue
+        if token.isdigit():
+            continue
+        if len(token) < 3 and token.isalpha():
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        tokens.append(token)
+    return tuple(tokens)
+
+
+def _duplicate_signature(value: Any) -> str:
+    tokens = sorted(_duplicate_title_tokens(value))
+    if len(tokens) < 2:
+        return ""
+    return " ".join(tokens)
+
+
+def _normalize_duplicate_doi(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    text = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", text)
+    text = re.sub(r"^doi:\s*", "", text)
+    return text.strip(" /")
+
+
+def _duplicate_doi_candidates(manifest: dict[str, Any], row: SourceManifestRow) -> list[str]:
+    return [
+        str(manifest.get("citation_doi") or ""),
+        str(manifest.get("citation_url") or ""),
+        row.original_url,
+        row.final_url,
+    ]
+
+
+def _duplicate_year(manifest: dict[str, Any], row: SourceManifestRow) -> str:
+    for candidate in (
+        manifest.get("citation_issued"),
+        row.publication_year,
+        row.publication_date,
+    ):
+        year = _publication_year_from_date_text(str(candidate or ""))
+        if year:
+            return year
+    return ""
+
+
+def _duplicate_title_value(manifest: dict[str, Any], row: SourceManifestRow) -> str:
+    return str(manifest.get("citation_title") or row.title or "").strip()
+
+
+def _duplicate_author_value(manifest: dict[str, Any], row: SourceManifestRow) -> str:
+    return str(manifest.get("citation_authors") or row.author_names or "").strip()
+
+
+def _duplicate_organization_value(manifest: dict[str, Any], row: SourceManifestRow) -> str:
+    return str(manifest.get("citation_publisher") or row.organization_name or "").strip()
+
+
+def _duplicate_url_keys(manifest: dict[str, Any], row: SourceManifestRow) -> tuple[str, ...]:
+    keys: list[str] = []
+    for candidate in (
+        str(manifest.get("citation_url") or ""),
+        row.canonical_url,
+        row.final_url,
+        row.original_url,
+    ):
+        key = repository_dedupe_key(candidate) or dedupe_url_key(candidate)
+        if key:
+            keys.append(key)
+    return tuple(_dedupe_strings(keys))
+
+
+def _duplicate_quality_score(row: SourceManifestRow, manifest: dict[str, Any]) -> int:
+    fetch_status = str(row.fetch_status or "").strip().lower()
+    score = {
+        "success": 40,
+        "partial": 28,
+        "not_applicable": 22,
+        "queued": 10,
+        "pending": 8,
+        "failed": 0,
+    }.get(fetch_status, 4)
+    score += 8 if row.llm_cleanup_file else 0
+    score += 6 if row.markdown_file else 0
+    score += 6 if row.raw_file else 0
+    score += 4 if row.summary_file else 0
+    score += 4 if row.rating_file else 0
+    score += 4 if row.catalog_file else 0
+    score += 3 if row.metadata_file else 0
+    score += 3 if bool(manifest.get("citation_ready")) else 0
+    score += 2 if _duplicate_title_value(manifest, row) else 0
+    score += 2 if _duplicate_author_value(manifest, row) else 0
+    score += 2 if _duplicate_organization_value(manifest, row) else 0
+    score += 1 if _duplicate_year(manifest, row) else 0
+    return score
+
+
+def _build_duplicate_candidate_context(
+    row: SourceManifestRow,
+    *,
+    base_dir: Path,
+) -> _DuplicateCandidateContext:
+    manifest = build_manifest_record(row, base_dir=base_dir)
+    title_value = _duplicate_title_value(manifest, row)
+    title_tokens = _duplicate_title_tokens(title_value)
+    doi_key = ""
+    for candidate in _duplicate_doi_candidates(manifest, row):
+        doi_key = _normalize_duplicate_doi(candidate)
+        if doi_key:
+            break
+    sha_key = ""
+    raw_sha = str(row.sha256 or "").strip().lower()
+    if raw_sha and (
+        str(row.source_kind or "").strip().lower() == "uploaded_document"
+        or str(row.fetch_status or "").strip().lower() in {"success", "partial", "not_applicable"}
+    ):
+        sha_key = raw_sha
+    return _DuplicateCandidateContext(
+        row=row,
+        manifest=manifest,
+        quality_score=_duplicate_quality_score(row, manifest),
+        doi_key=doi_key,
+        url_keys=_duplicate_url_keys(manifest, row),
+        sha_key=sha_key,
+        year=_duplicate_year(manifest, row),
+        title_normalized=_normalize_duplicate_text(title_value),
+        title_tokens=title_tokens,
+        title_token_set=frozenset(title_tokens),
+        author_signature=_duplicate_signature(_duplicate_author_value(manifest, row)),
+        organization_signature=_duplicate_signature(_duplicate_organization_value(manifest, row)),
+    )
+
+
+def _duplicate_contexts_by_bucket_size(
+    buckets: dict[str, list[_DuplicateCandidateContext]],
+) -> list[list[_DuplicateCandidateContext]]:
+    ordered = []
+    for items in buckets.values():
+        unique: list[_DuplicateCandidateContext] = []
+        seen: set[str] = set()
+        for context in items:
+            if context.row.id in seen:
+                continue
+            seen.add(context.row.id)
+            unique.append(context)
+        if len(unique) >= 2:
+            ordered.append(unique)
+    ordered.sort(
+        key=lambda items: (
+            -len(items),
+            min((_sortable_source_id(item.row.id) for item in items), default=(1, "")),
+        )
+    )
+    return ordered
+
+
+def _duplicate_title_similarity(
+    left: _DuplicateCandidateContext,
+    right: _DuplicateCandidateContext,
+) -> tuple[float, float, float]:
+    if not left.title_token_set or not right.title_token_set:
+        return 0.0, 0.0, 0.0
+    intersection = len(left.title_token_set & right.title_token_set)
+    union = len(left.title_token_set | right.title_token_set)
+    smallest = min(len(left.title_token_set), len(right.title_token_set))
+    if intersection <= 0 or union <= 0 or smallest <= 0:
+        return 0.0, 0.0, 0.0
+    jaccard = intersection / union
+    overlap = intersection / smallest
+    sequence_ratio = SequenceMatcher(
+        None,
+        left.title_normalized,
+        right.title_normalized,
+    ).ratio()
+    return jaccard, overlap, sequence_ratio
+
+
+def _duplicate_titles_match(
+    left: _DuplicateCandidateContext,
+    right: _DuplicateCandidateContext,
+) -> bool:
+    if not left.title_normalized or not right.title_normalized:
+        return False
+    if left.title_normalized == right.title_normalized:
+        return True
+    if len(left.title_token_set) < 3 or len(right.title_token_set) < 3:
+        return False
+    jaccard, overlap, sequence_ratio = _duplicate_title_similarity(left, right)
+    intersection = len(left.title_token_set & right.title_token_set)
+    if overlap >= 0.9 and intersection >= 4:
+        return True
+    return overlap >= 0.8 and jaccard >= 0.65 and sequence_ratio >= 0.74
+
+
+def _cluster_duplicate_title_contexts(
+    contexts: list[_DuplicateCandidateContext],
+) -> list[list[_DuplicateCandidateContext]]:
+    unique = sorted(
+        {context.row.id: context for context in contexts}.values(),
+        key=lambda context: _sortable_source_id(context.row.id),
+    )
+    clusters: list[list[_DuplicateCandidateContext]] = []
+    visited: set[int] = set()
+    for index, context in enumerate(unique):
+        if index in visited:
+            continue
+        stack = [index]
+        component: list[_DuplicateCandidateContext] = []
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            component.append(unique[current])
+            for neighbor, candidate in enumerate(unique):
+                if neighbor == current or neighbor in visited:
+                    continue
+                if _duplicate_titles_match(unique[current], candidate):
+                    stack.append(neighbor)
+        if len(component) >= 2:
+            clusters.append(component)
+    clusters.sort(
+        key=lambda items: (
+            -len(items),
+            min((_sortable_source_id(item.row.id) for item in items), default=(1, "")),
+        )
+    )
+    return clusters
+
+
+def _duplicate_keep_sort_key(context: _DuplicateCandidateContext) -> tuple[int, ...]:
+    priority = _row_priority(context.row)
+    source_id = str(context.row.id or "").strip()
+    return (
+        context.quality_score,
+        priority[0],
+        priority[1],
+        priority[2],
+        priority[3],
+        priority[4],
+        priority[5],
+        priority[6],
+        -int(source_id) if source_id.isdigit() else 0,
+    )
+
+
+def _duplicate_candidate_row(context: _DuplicateCandidateContext) -> RepositoryDuplicateCandidateRow:
+    manifest = context.manifest
+    return RepositoryDuplicateCandidateRow(
+        id=context.row.id,
+        title=_duplicate_title_value(manifest, context.row),
+        author_names=_duplicate_author_value(manifest, context.row),
+        publication_date=str(manifest.get("citation_issued") or context.row.publication_date or ""),
+        publication_year=context.year,
+        organization_name=_duplicate_organization_value(manifest, context.row),
+        document_type=str(context.row.document_type or ""),
+        source_kind=str(context.row.source_kind or ""),
+        fetch_status=str(context.row.fetch_status or ""),
+        original_url=str(context.row.original_url or ""),
+        final_url=str(context.row.final_url or ""),
+        citation_url=str(manifest.get("citation_url") or ""),
+        citation_doi=str(manifest.get("citation_doi") or ""),
+        imported_at=str(context.row.imported_at or ""),
+        quality_score=context.quality_score,
+    )
+
+
+def _build_duplicate_candidate_group(
+    contexts: list[_DuplicateCandidateContext],
+    *,
+    group_id: str,
+    match_reason: str,
+    confidence: str,
+) -> RepositoryDuplicateCandidateGroup:
+    ordered = sorted(
+        contexts,
+        key=lambda context: _duplicate_keep_sort_key(context),
+        reverse=True,
+    )
+    suggested_keep_id = ordered[0].row.id if ordered else ""
+    return RepositoryDuplicateCandidateGroup(
+        group_id=group_id,
+        match_reason=match_reason,
+        confidence=confidence,
+        suggested_keep_id=suggested_keep_id,
+        suggested_delete_ids=[context.row.id for context in ordered[1:]],
+        rows=[_duplicate_candidate_row(context) for context in ordered],
+    )
 
 
 def _repository_source_file_path(

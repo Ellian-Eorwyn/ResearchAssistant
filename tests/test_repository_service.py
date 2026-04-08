@@ -5,6 +5,7 @@ import io
 import json
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,6 +14,7 @@ from openpyxl import Workbook, load_workbook
 from backend.models.export import EXPORT_COLUMNS, ExportRow
 from backend.models.ingestion_profiles import DocumentNormalizationResult, IngestionProfile
 from backend.models.repository import (
+    RepositoryBundleExportRequest,
     RepositoryCitationRisExportRequest,
     RepositoryColumnRunRequest,
     RepositoryManifestExportRequest,
@@ -343,7 +345,7 @@ class RepositoryServiceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.service.create_export_job(scope="import", import_id="does-not-exist")
 
-    def test_create_export_job_scope_import_empty_selection_raises_runtime_error(self):
+    def test_create_export_job_scope_import_duplicate_batch_uses_existing_rows(self):
         repo_dir = self.tmp_path / "repo_empty_import"
         repo_dir.mkdir(parents=True, exist_ok=True)
         self.service.attach(str(repo_dir))
@@ -357,12 +359,76 @@ class RepositoryServiceTests(unittest.TestCase):
         )
         self.assertEqual(duplicate_import.accepted_new, 0)
 
-        artifacts_dir = self._repo_job_store().artifacts_dir
-        before = len(list(artifacts_dir.iterdir())) if artifacts_dir.exists() else 0
-        with self.assertRaises(RuntimeError):
-            self.service.create_export_job(scope="import", import_id=duplicate_import.import_id)
-        after = len(list(artifacts_dir.iterdir())) if artifacts_dir.exists() else 0
-        self.assertEqual(before, after)
+        result = self.service.create_export_job(scope="import", import_id=duplicate_import.import_id)
+        self.assertEqual(result.scope, "import")
+        self.assertEqual(result.import_id, duplicate_import.import_id)
+        self.assertEqual(result.total_urls, 1)
+
+        bib = self.service.job_store_for(result.job_id).load_artifact(result.job_id, "03_bibliography")
+        self.assertIsNotNone(bib)
+        urls = [entry.get("url") for entry in bib.get("entries", [])]
+        self.assertEqual(urls, ["https://example.com/a"])
+
+    def test_find_duplicate_source_candidates_groups_exact_and_similar_matches(self):
+        self._attach_repo("repo_duplicate_candidates")
+        self._save_repo_state(
+            sources=[
+                SourceManifestRow(
+                    id="000001",
+                    original_url="https://example.com/report?utm_source=newsletter",
+                    fetch_status="success",
+                    title="Housing Retrofit Program Evaluation",
+                    author_names="Jane Doe",
+                    publication_date="2025-02-01",
+                ),
+                SourceManifestRow(
+                    id="000002",
+                    original_url="https://example.com/report",
+                    fetch_status="failed",
+                    title="Housing Retrofit Program Evaluation",
+                    author_names="Jane Doe",
+                    publication_date="2025-02-01",
+                ),
+                SourceManifestRow(
+                    id="000003",
+                    original_url="https://data.example.org/grid-modernization-final",
+                    fetch_status="success",
+                    title="Grid Modernization Assessment Final Report",
+                    author_names="Alex Smith; Taylor Jones",
+                    publication_year="2024",
+                ),
+                SourceManifestRow(
+                    id="000004",
+                    original_url="https://mirror.example.net/grid-modernization-report",
+                    fetch_status="failed",
+                    title="Grid Modernization Assessment Report",
+                    author_names="Taylor Jones; Alex Smith",
+                    publication_date="2024-05-20",
+                ),
+            ],
+            citations=[],
+            imports=[],
+        )
+
+        response = self.service.find_duplicate_source_candidates()
+
+        self.assertEqual(response.scanned_sources, 4)
+        self.assertEqual(response.total_groups, 2)
+        self.assertFalse(response.truncated)
+        self.assertEqual(response.groups[0].match_reason, "Matching normalized URL")
+        self.assertEqual(response.groups[0].confidence, "high")
+        self.assertEqual(
+            {row.id for row in response.groups[0].rows},
+            {"000001", "000002"},
+        )
+        self.assertEqual(response.groups[0].suggested_keep_id, "000001")
+        self.assertEqual(response.groups[1].match_reason, "Similar title, year, and authors")
+        self.assertEqual(response.groups[1].confidence, "medium")
+        self.assertEqual(
+            {row.id for row in response.groups[1].rows},
+            {"000003", "000004"},
+        )
+        self.assertEqual(response.groups[1].suggested_keep_id, "000003")
 
     def test_attach_scans_citations_xlsx(self):
         repo_dir = self.tmp_path / "repo_citations_xlsx"
@@ -843,6 +909,318 @@ class RepositoryServiceTests(unittest.TestCase):
         self.assertEqual(list(csv_rows[0].keys()), ["title", "author_names", "file_md"])
         self.assertEqual(csv_rows[0]["title"], "Alpha Source")
 
+    def test_export_repository_bundle_packages_files_csv_ris_and_custom_columns(self):
+        repo_dir = self._attach_repo("repo_bundle_export")
+        self.service.import_source_list(
+            filename="sources.csv",
+            content=(
+                "URL,Title\n"
+                "https://example.com/a,Alpha Source\n"
+                "https://example.com/b,Beta Source\n"
+            ).encode("utf-8"),
+        )
+
+        custom = self.service.create_column("Priority")
+        self.service.update_source(
+            "000001",
+            patch={
+                "author_names": "Jane Doe; John Roe",
+                "publication_date": "2025-03-15",
+                "document_type": "report",
+                "organization_name": "Alpha Agency",
+                "organization_type": "government",
+                "citation_title": "Alpha Policy Memo",
+                "citation_authors": "Jane Doe; John Roe",
+                "citation_issued": "2025-03-15",
+                "citation_url": "https://example.com/a/citation",
+                "citation_type": "report",
+                "citation_report_number": "RPT-001",
+                "overall_relevance": 0.9,
+                "custom_fields": {custom.id: "Core source"},
+            },
+        )
+        self.service.update_source(
+            "000002",
+            patch={
+                "author_names": "Beta Org",
+                "publication_date": "2024",
+                "document_type": "brief",
+                "organization_name": "Beta Org",
+                "organization_type": "nonprofit",
+                "citation_title": "Beta Research Brief",
+                "citation_authors": "Beta Org",
+                "citation_issued": "2024",
+                "citation_url": "https://example.com/b/citation",
+                "citation_type": "webpage",
+                "overall_relevance": 0.7,
+            },
+        )
+
+        state_path = repo_dir / ".ra_repo" / "repository_state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        rows = state["sources"]
+        rows[0]["raw_file"] = "sources/000001/alpha.pdf"
+        rows[0]["llm_cleanup_file"] = "sources/000001/alpha_clean.md"
+        rows[0]["summary_file"] = "sources/000001/alpha_summary.txt"
+        rows[0]["rating_file"] = "sources/000001/alpha_rating.json"
+        rows[0]["fetch_status"] = "success"
+        rows[0]["markdown_char_count"] = 1200
+        rows[1]["raw_file"] = "sources/000002/beta.html"
+        rows[1]["rendered_pdf_file"] = "sources/000002/beta_rendered.pdf"
+        rows[1]["markdown_file"] = "sources/000002/beta.md"
+        rows[1]["fetch_status"] = "success"
+        rows[1]["markdown_char_count"] = 800
+        state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        (repo_dir / "sources" / "000001").mkdir(parents=True, exist_ok=True)
+        (repo_dir / "sources" / "000002").mkdir(parents=True, exist_ok=True)
+        (repo_dir / "sources" / "000001" / "alpha.pdf").write_bytes(b"%PDF-1.4 alpha\n")
+        (repo_dir / "sources" / "000001" / "alpha_clean.md").write_text(
+            "# Alpha clean markdown\n",
+            encoding="utf-8",
+        )
+        (repo_dir / "sources" / "000001" / "alpha_summary.txt").write_text(
+            "Alpha summary for exported browser.",
+            encoding="utf-8",
+        )
+        (repo_dir / "sources" / "000001" / "alpha_rating.json").write_text(
+            json.dumps(
+                {
+                    "summary": "Alpha summary from rating fallback.",
+                    "rationale": "Alpha rationale from rating payload.",
+                    "relevant_sections": ["Executive Summary", "Policy Recommendations"],
+                    "overall_relevance": 0.9,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        (repo_dir / "sources" / "000002" / "beta.html").write_text(
+            "<html><body>Beta</body></html>",
+            encoding="utf-8",
+        )
+        (repo_dir / "sources" / "000002" / "beta_rendered.pdf").write_bytes(
+            b"%PDF-1.4 beta rendered\n"
+        )
+        (repo_dir / "sources" / "000002" / "beta.md").write_text(
+            "# Beta markdown\n",
+            encoding="utf-8",
+        )
+        self.service.rebuild()
+
+        bundle_bytes, headers = self.service.export_repository_bundle(
+            RepositoryBundleExportRequest(
+                scope="selected",
+                source_ids=["000001", "000002"],
+                file_kinds=["pdf", "rendered", "html", "md"],
+            )
+        )
+
+        self.assertEqual(headers["Content-Disposition"], 'attachment; filename="selected-repository-export.zip"')
+        archive = zipfile.ZipFile(io.BytesIO(bundle_bytes))
+        names = set(archive.namelist())
+        self.assertIn("index.html", names)
+        self.assertIn("research-export.csv", names)
+        self.assertIn("citations.ris", names)
+        self.assertIn("PDF/Jane Doe et al - 2025-03-15 - Alpha Policy Memo.pdf", names)
+        self.assertIn("RENDERED/Beta Org - 2024 - Beta Research Brief.pdf", names)
+        self.assertIn("MD/Jane Doe et al - 2025-03-15 - Alpha Policy Memo.md", names)
+        self.assertIn("HTML/Beta Org - 2024 - Beta Research Brief.html", names)
+        self.assertIn("MD/Beta Org - 2024 - Beta Research Brief.md", names)
+
+        viewer_html = archive.read("index.html").decode("utf-8")
+        self.assertIn("Offline Repository Browser", viewer_html)
+        self.assertIn("Export Selected Bundle", viewer_html)
+        self.assertIn("Export All Bundle", viewer_html)
+        self.assertIn("Export Selected RIS", viewer_html)
+        self.assertIn("Alpha Policy Memo", viewer_html)
+        self.assertIn("Alpha summary for exported browser.", viewer_html)
+        self.assertIn("Alpha rationale from rating payload.", viewer_html)
+        self.assertIn("Policy Recommendations", viewer_html)
+        self.assertIn("# Alpha clean markdown", viewer_html)
+        self.assertIn("PDF/Jane Doe et al - 2025-03-15 - Alpha Policy Memo.pdf", viewer_html)
+        self.assertIn("RENDERED/Beta Org - 2024 - Beta Research Brief.pdf", viewer_html)
+        self.assertIn('"Priority"', viewer_html)
+        self.assertIn("Core source", viewer_html)
+        self.assertIn("showDirectoryPicker", viewer_html)
+        self.assertNotIn(str(repo_dir), viewer_html)
+
+        csv_rows = list(
+            csv.DictReader(io.StringIO(archive.read("research-export.csv").decode("utf-8-sig")))
+        )
+        self.assertEqual(
+            list(csv_rows[0].keys()),
+            [
+                "Title",
+                "Authors",
+                "Publication Date",
+                "Organization",
+                "Organization Type",
+                "URL",
+                "Markdown Char Count",
+                "Report Number",
+                "Document Type",
+                "Citation Type",
+                "Overall Rating",
+                "Priority",
+            ],
+        )
+        self.assertEqual(csv_rows[0]["Title"], "Alpha Source")
+        self.assertEqual(csv_rows[0]["URL"], "https://example.com/a/citation")
+        self.assertEqual(csv_rows[0]["Priority"], "Core source")
+        self.assertEqual(csv_rows[0]["Overall Rating"], "0.9")
+
+        ris_text = archive.read("citations.ris").decode("utf-8")
+        self.assertIn("TI  - Alpha Policy Memo", ris_text)
+        self.assertIn("TI  - Beta Research Brief", ris_text)
+
+    def test_export_repository_bundle_cloud_mode_writes_manifest_and_storage_filenames(self):
+        repo_dir = self._attach_repo("repo_bundle_cloud_export")
+        self.service.import_source_list(
+            filename="sources.csv",
+            content=(
+                "URL,Title\n"
+                "https://example.com/a,Alpha Source\n"
+                "https://example.com/b,Beta Source\n"
+            ).encode("utf-8"),
+        )
+
+        self.service.update_source(
+            "000001",
+            patch={
+                "author_names": "Jane Doe",
+                "publication_date": "2025-03-15",
+                "document_type": "report",
+                "organization_name": "Alpha Agency",
+                "organization_type": "government",
+                "citation_title": "Alpha Policy Memo",
+                "citation_authors": "Jane Doe",
+                "citation_issued": "2025-03-15",
+                "citation_url": "https://example.com/a/citation",
+                "citation_type": "report",
+                "overall_relevance": 0.9,
+            },
+        )
+        self.service.update_source(
+            "000002",
+            patch={
+                "author_names": "Beta Org",
+                "publication_date": "2024",
+                "document_type": "brief",
+                "organization_name": "Beta Org",
+                "organization_type": "nonprofit",
+                "citation_title": "Budget Brief",
+                "citation_authors": "Beta Org",
+                "citation_issued": "2024",
+                "citation_url": "https://example.com/b/citation",
+                "citation_type": "webpage",
+                "overall_relevance": 0.7,
+            },
+        )
+
+        state_path = repo_dir / ".ra_repo" / "repository_state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        rows = state["sources"]
+        rows[0]["raw_file"] = "sources/000001/Résumé, Final (A).pdf"
+        rows[0]["fetch_status"] = "success"
+        rows[1]["rendered_pdf_file"] = "sources/000002/Budget (FY2024) – Final.pdf"
+        rows[1]["markdown_file"] = "sources/000002/Budget Notes.md"
+        rows[1]["fetch_status"] = "success"
+        state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        (repo_dir / "sources" / "000001").mkdir(parents=True, exist_ok=True)
+        (repo_dir / "sources" / "000002").mkdir(parents=True, exist_ok=True)
+        (repo_dir / "sources" / "000001" / "Résumé, Final (A).pdf").write_bytes(b"%PDF-1.4 alpha\n")
+        (repo_dir / "sources" / "000002" / "Budget (FY2024) – Final.pdf").write_bytes(
+            b"%PDF-1.4 beta rendered\n"
+        )
+        (repo_dir / "sources" / "000002" / "Budget Notes.md").write_text(
+            "# Budget markdown\n",
+            encoding="utf-8",
+        )
+        self.service.rebuild()
+
+        bundle_bytes, headers = self.service.export_repository_bundle(
+            RepositoryBundleExportRequest(
+                mode="cloud",
+                scope="selected",
+                source_ids=["000001", "000002"],
+                file_kinds=["pdf", "rendered", "md"],
+                base_url="https://cdn.example.com/client-a",
+            )
+        )
+
+        self.assertEqual(
+            headers["Content-Disposition"],
+            'attachment; filename="selected-repository-cloud-export.zip"',
+        )
+        archive = zipfile.ZipFile(io.BytesIO(bundle_bytes))
+        names = set(archive.namelist())
+        self.assertIn("index.html", names)
+        self.assertIn("manifest.json", names)
+        self.assertIn("research-export.csv", names)
+        self.assertIn("citations.ris", names)
+        self.assertIn("files/resume-final-a-000001-pdf.pdf", names)
+        self.assertIn("files/budget-fy2024-final-000002-rendered.pdf", names)
+        self.assertIn("files/budget-notes-000002-md.md", names)
+
+        viewer_html = archive.read("index.html").decode("utf-8")
+        self.assertIn('const BASE_URL = "https://cdn.example.com/client-a/";', viewer_html)
+        self.assertIn("Cloud Repository Browser", viewer_html)
+        self.assertIn("cloud export", viewer_html)
+        self.assertIn("encodeURIComponent", viewer_html)
+        self.assertIn("resume-final-a-000001-pdf.pdf", viewer_html)
+        self.assertIn("const label = file.label;", viewer_html)
+        self.assertIn('let lastAnchorId = "";', viewer_html)
+        self.assertIn("Boolean(event.shiftKey)", viewer_html)
+        self.assertIn("Direct file links can still open without cross-origin byte access.", viewer_html)
+        self.assertIn('window.location.protocol === "file:"', viewer_html)
+        self.assertNotIn("Offline Repository Browser", viewer_html)
+        self.assertNotIn("offline export", viewer_html)
+        self.assertNotIn("Choose Package Folder", viewer_html)
+        self.assertNotIn("showDirectoryPicker", viewer_html)
+        self.assertNotIn("Edit BASE_URL near the top of this file after upload.", viewer_html)
+        self.assertNotIn('folderStatus.textContent = "BASE_URL "', viewer_html)
+        self.assertNotIn("Custom Columns", viewer_html)
+        self.assertLess(viewer_html.index("<h3>Exported Files</h3>"), viewer_html.index('renderRichTextSection("Summary"'))
+        self.assertLess(viewer_html.index("<h3>Full Markdown</h3>"), viewer_html.index('renderRichTextSection("Relevance Rationale"'))
+        self.assertNotIn(str(repo_dir), viewer_html)
+
+        manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+        self.assertEqual(manifest["exportMode"], "cloud")
+        self.assertEqual(manifest["rows"][0]["files"]["pdf"]["displayName"], "Résumé, Final (A).pdf")
+        self.assertEqual(
+            manifest["rows"][0]["files"]["pdf"]["storageName"],
+            "resume-final-a-000001-pdf.pdf",
+        )
+        self.assertEqual(
+            manifest["rows"][1]["files"]["rendered"]["storageName"],
+            "budget-fy2024-final-000002-rendered.pdf",
+        )
+        self.assertEqual(
+            manifest["rows"][1]["files"]["md"]["storageName"],
+            "budget-notes-000002-md.md",
+        )
+        self.assertNotIn("relativePath", manifest["rows"][0]["files"]["pdf"])
+
+    def test_export_repository_bundle_cloud_mode_requires_base_url(self):
+        self._attach_repo("repo_bundle_cloud_requires_url")
+        self.service.import_source_list(
+            filename="sources.csv",
+            content=("URL,Title\nhttps://example.com/a,Alpha Source\n").encode("utf-8"),
+        )
+
+        with self.assertRaisesRegex(ValueError, "Base URL"):
+            self.service.export_repository_bundle(
+                RepositoryBundleExportRequest(
+                    mode="cloud",
+                    scope="all",
+                    source_ids=[],
+                    file_kinds=["pdf"],
+                    base_url="",
+                )
+            )
+
     def test_column_run_uses_all_filtered_rows_across_pages(self):
         self._attach_repo("repo_column_scope")
         csv_rows = ["URL,Title"]
@@ -1103,6 +1481,56 @@ class RepositoryServiceTests(unittest.TestCase):
         decoded = ris_bytes.decode("utf-8")
         self.assertIn("AU  - California Energy Commission", decoded)
         self.assertEqual(headers["X-ResearchAssistant-Exported-Count"], "1")
+
+    def test_citation_ready_column_run_recomputes_using_publication_year_without_llm(self):
+        repo_dir = self._attach_repo("repo_citation_ready_column_run")
+        self.service.import_source_list(
+            filename="sources.csv",
+            content=("URL,Title\nhttps://example.com/a,Alpha Source\n").encode("utf-8"),
+        )
+
+        state_path = repo_dir / ".ra_repo" / "repository_state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["sources"][0]["title"] = "Alpha Source"
+        state["sources"][0]["author_names"] = "Jane Doe"
+        state["sources"][0]["publication_date"] = ""
+        state["sources"][0]["publication_year"] = "2024"
+        state["sources"][0]["document_type"] = "report"
+        state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.service.rebuild()
+
+        manifest = self.service.list_manifest(limit=10, offset=0, sort_by="id", sort_dir="asc")
+        columns = {column["key"]: column for column in manifest["columns"]}
+        self.assertTrue(columns["citation_ready"]["processable"])
+        self.assertFalse(columns["citation_ready"]["requires_llm"])
+
+        settings = self.service.load_repo_settings()
+        with patch("backend.storage.attached_repository.threading.Thread", _NoOpThread):
+            response = self.service.start_column_run(
+                "citation_ready",
+                payload=RepositoryColumnRunRequest(
+                    scope="empty_only",
+                    confirm_overwrite=True,
+                ),
+            )
+            self.service._repository_column_run_worker(
+                response.job_id,
+                "citation_ready",
+                ["000001"],
+                settings,
+            )
+
+        manifest = self.service.list_manifest(limit=10, offset=0, sort_by="id", sort_dir="asc")
+        row = manifest["rows"][0]
+        self.assertTrue(row["citation_ready"])
+        self.assertEqual(row["citation_issued"], "2024")
+        self.assertEqual(row["citation_missing_fields"], "")
+
+        catalog = json.loads(
+            (repo_dir / "sources" / "000001" / "000001_catalog.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(catalog["citation"]["issued"], "2024")
+        self.assertTrue(catalog["citation"]["ready_for_ris"])
 
     def test_list_ingestion_profiles_reads_repo_bundled_snapshot(self):
         repo_dir = self._attach_repo("repo_bundled_profiles")

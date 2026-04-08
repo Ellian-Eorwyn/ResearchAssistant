@@ -15,6 +15,7 @@ import type {
   ProjectProfileSaveResponse,
   RepoSettings,
   RepositoryActionResponse,
+  RepositoryBundleExportRequest,
   RepositoryColumnConfig,
   RepositoryColumnPromptFixResponse,
   RepositoryColumnRunStartResponse,
@@ -22,6 +23,7 @@ import type {
   RepositoryCitationDataResponse,
   RepositoryCitationRisExportRequest,
   RepositoryDashboardResponse,
+  RepositoryDuplicateCandidateResponse,
   RepositoryDocumentImportListResponse,
   RepositoryFileDownloadResult,
   RepositoryImportResponse,
@@ -32,6 +34,7 @@ import type {
   RepositoryProcessDocumentsResponse,
   RepositoryReprocessDocumentsRequest,
   RepositoryReprocessDocumentsResponse,
+  RepositorySourceBulkRisReadyResponse,
   RepositorySourceDeleteResponse,
   RepositorySourceExportRequest,
   RepositorySourceExportResponse,
@@ -39,6 +42,8 @@ import type {
   RepositorySourceTaskRequest,
   RepositorySourceTaskResponse,
   RepositoryStatusResponse,
+  SearchImportResponse,
+  SearchJobStatus,
   SourceCancelResponse,
   SourceDownloadStatus,
 } from "./types";
@@ -281,6 +286,12 @@ export const api = {
       `repository/sources/${encodeURIComponent(sourceId)}`,
       payload,
     ),
+  bulkMarkRepositorySourcesRisReady: (sourceIds: string[]) =>
+    apiPost<RepositorySourceBulkRisReadyResponse>("repository/sources/bulk-mark-ris-ready", {
+      source_ids: sourceIds,
+    }),
+  getRepositoryDuplicateCandidates: () =>
+    apiPost<RepositoryDuplicateCandidateResponse>("repository/sources/duplicate-candidates", {}),
   deleteRepositorySources: (sourceIds: string[]) =>
     apiPost<RepositorySourceDeleteResponse>("repository/sources/bulk-delete", {
       source_ids: sourceIds,
@@ -291,8 +302,28 @@ export const api = {
       file_kinds: payload.file_kinds,
       destination_path: payload.destination_path,
     }),
+  exportRepositoryBundle: (payload: RepositoryBundleExportRequest) =>
+    apiPostDownload("repository/export-bundle", {
+      mode: payload.mode,
+      scope: payload.scope,
+      source_ids: payload.source_ids,
+      file_kinds: payload.file_kinds,
+      base_url: payload.base_url,
+    }),
   exportRepositoryCitationRis: (payload: RepositoryCitationRisExportRequest) =>
     apiPostDownload("repository/citations/export-ris", payload),
   exportRepositoryManifest: (payload: RepositoryManifestExportRequest) =>
     apiPostDownload("repository/manifest/export", payload),
+
+  // Search
+  startSearch: (prompt: string, targetCount: number) =>
+    apiPost<SearchJobStatus>("search/start", { prompt, target_count: targetCount }),
+  getSearchStatus: (jobId: string) =>
+    apiGet<SearchJobStatus>(`search/${encodeURIComponent(jobId)}/status`),
+  cancelSearch: (jobId: string) =>
+    apiPost<{ status: string }>(`search/${encodeURIComponent(jobId)}/cancel`, {}),
+  importSearchResults: (jobId: string, minRelevance: number) =>
+    apiPost<SearchImportResponse>(`search/${encodeURIComponent(jobId)}/import`, {
+      min_relevance: minRelevance,
+    }),
 };

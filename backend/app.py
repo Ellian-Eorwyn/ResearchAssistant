@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.models.settings import LLMBackendConfig, RepoSettings
-from backend.routers import agent, pipeline, repository, results, settings, sources, upload
+from backend.routers import agent, pipeline, repository, results, search, settings, sources, upload
 from backend.storage.attached_repository import AttachedRepositoryService
 from backend.storage.file_store import FileStore
 
@@ -80,6 +80,8 @@ def create_app() -> FastAPI:
     app.state.repository_service = repository_service
     app.state.source_download_jobs = {}
     app.state.source_download_lock = threading.Lock()
+    app.state.search_jobs: dict = {}
+    app.state.search_jobs_lock = threading.Lock()
 
     raw_settings = store.load_settings()
     if raw_settings and "llm_backend" in raw_settings:
@@ -96,6 +98,7 @@ def create_app() -> FastAPI:
     app.include_router(settings.router, prefix="/api", tags=["settings"])
     app.include_router(repository.router, prefix="/api", tags=["repository"])
     app.include_router(agent.router, prefix="/api", tags=["agent"])
+    app.include_router(search.router, prefix="/api", tags=["search"])
 
     # Health check
     @app.get("/api/health")

@@ -12,6 +12,7 @@ import type {
 
 export { AiGuidancePage } from "./AiGuidancePage";
 export { RepositoryBrowserPage } from "./RepositoryBrowserPage";
+export { SearchPage } from "./SearchPage";
 export { SettingsPage } from "./SettingsPage";
 
 function formatBytes(bytes: number): string {

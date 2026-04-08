@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  buildRepositoryBrowserDownloadTaskPayload,
   buildRepositoryBrowserSourceTaskQueue,
   REPOSITORY_BROWSER_BIBLIOGRAPHY_COLUMNS,
   buildRepositoryBrowserQuery,
@@ -164,7 +165,7 @@ describe("repositoryBrowserUtils", () => {
     ).toEqual(["title", "publication_year", "organization_name", "author_names"]);
   });
 
-  it("builds isolated enrichment queues in the expected order", () => {
+  it("builds isolated enrichment queues in the expected order without a forced convert prepass", () => {
     const queue = buildRepositoryBrowserSourceTaskQueue({
       draft: {
         rerun_failed_only: false,
@@ -198,7 +199,6 @@ describe("repositoryBrowserUtils", () => {
     });
 
     expect(queue.map((item) => item.id)).toEqual([
-      "convert",
       "cleanup",
       "title",
       "catalog",
@@ -206,13 +206,197 @@ describe("repositoryBrowserUtils", () => {
       "summary",
       "rating",
     ]);
-    expect(queue[0].payload.scope).toBe("empty_only");
+    expect(queue[0].payload.scope).toBe("all");
     expect(queue[0].payload.source_ids).toEqual(["000001", "000002"]);
-    expect(queue[0].payload.selected_phases).toEqual(["convert"]);
-    expect(queue[2].payload.selected_phases).toEqual(["title"]);
-    expect(queue[4].payload.run_citation_verify).toBe(true);
-    expect(queue[5].payload.scope).toBe("all");
-    expect(queue[5].payload.project_profile_name).toBe("default.yaml");
+    expect(queue[1].payload.selected_phases).toEqual(["title"]);
+    expect(queue[3].payload.run_citation_verify).toBe(true);
+    expect(queue[4].payload.scope).toBe("all");
+    expect(queue[4].payload.project_profile_name).toBe("default.yaml");
+  });
+
+  it("keeps isolated enrichment tasks aligned with the chosen repository scope", () => {
+    const queue = buildRepositoryBrowserSourceTaskQueue({
+      draft: {
+        rerun_failed_only: false,
+        run_download: false,
+        run_convert: false,
+        run_catalog: true,
+        run_citation_verify: false,
+        run_llm_cleanup: false,
+        run_llm_title: false,
+        run_llm_summary: false,
+        run_llm_rating: false,
+        force_redownload: false,
+        force_convert: false,
+        force_catalog: false,
+        force_citation_verify: false,
+        force_llm_cleanup: false,
+        force_title: false,
+        force_summary: false,
+        force_rating: false,
+        project_profile_name: "",
+        include_raw_file: true,
+        include_rendered_html: true,
+        include_rendered_pdf: true,
+        include_markdown: true,
+        scope: "empty_only",
+        import_id: "",
+      },
+      scope: "all",
+      selectedSourceIds: [],
+      defaultProjectProfileName: "default.yaml",
+    });
+
+    expect(queue[0].id).toBe("catalog");
+    expect(queue[0].payload.scope).toBe("all");
+    expect(queue[0].payload.source_ids).toBeUndefined();
+    expect(queue[0].payload.run_convert).toBe(false);
+  });
+
+  it("builds download payloads for all, checked, and failed-fetch scopes", () => {
+    const draft = {
+      rerun_failed_only: false,
+      run_download: false,
+      run_convert: false,
+      run_catalog: true,
+      run_citation_verify: true,
+      run_llm_cleanup: false,
+      run_llm_title: true,
+      run_llm_summary: true,
+      run_llm_rating: true,
+      force_redownload: false,
+      force_convert: false,
+      force_catalog: true,
+      force_citation_verify: true,
+      force_llm_cleanup: true,
+      force_title: true,
+      force_summary: true,
+      force_rating: true,
+      project_profile_name: "",
+      include_raw_file: false,
+      include_rendered_html: false,
+      include_rendered_pdf: false,
+      include_markdown: false,
+      scope: "empty_only" as const,
+      import_id: "latest",
+      source_ids: ["stale"],
+      selected_phases: ["catalog"],
+    };
+
+    const allPayload = buildRepositoryBrowserDownloadTaskPayload({
+      draft: {
+        ...draft,
+        include_raw_file: false,
+        include_rendered_html: false,
+        include_rendered_pdf: true,
+        include_markdown: false,
+      },
+      scope: "all",
+      selectedSourceIds: [" 000001 "],
+      defaultProjectProfileName: "default.yaml",
+      runCleanup: false,
+    });
+    expect(allPayload.scope).toBe("all");
+    expect(allPayload.source_ids).toEqual([]);
+    expect(allPayload.rerun_failed_only).toBe(false);
+    expect(allPayload.force_redownload).toBe(true);
+    expect(allPayload.force_convert).toBe(false);
+    expect(allPayload.run_convert).toBe(false);
+    expect(allPayload.run_llm_cleanup).toBe(false);
+    expect(allPayload.include_raw_file).toBe(false);
+    expect(allPayload.include_rendered_html).toBe(false);
+    expect(allPayload.include_rendered_pdf).toBe(true);
+    expect(allPayload.include_markdown).toBe(false);
+    expect(allPayload.project_profile_name).toBe("default.yaml");
+
+    const selectedPayload = buildRepositoryBrowserDownloadTaskPayload({
+      draft: {
+        ...draft,
+        include_raw_file: true,
+        include_rendered_html: false,
+        include_rendered_pdf: true,
+        include_markdown: false,
+      },
+      scope: "selected",
+      selectedSourceIds: [" 000001 ", "", "000002"],
+      defaultProjectProfileName: "default.yaml",
+      runCleanup: false,
+    });
+    expect(selectedPayload.source_ids).toEqual(["000001", "000002"]);
+    expect(selectedPayload.force_redownload).toBe(true);
+    expect(selectedPayload.force_convert).toBe(false);
+    expect(selectedPayload.run_convert).toBe(false);
+    expect(selectedPayload.run_llm_cleanup).toBe(false);
+    expect(selectedPayload.include_raw_file).toBe(true);
+    expect(selectedPayload.include_rendered_html).toBe(false);
+    expect(selectedPayload.include_rendered_pdf).toBe(true);
+    expect(selectedPayload.include_markdown).toBe(false);
+
+    const failedPayload = buildRepositoryBrowserDownloadTaskPayload({
+      draft: {
+        ...draft,
+        project_profile_name: "custom.yaml",
+        include_raw_file: false,
+        include_rendered_html: true,
+        include_rendered_pdf: false,
+        include_markdown: false,
+      },
+      scope: "failed_fetch",
+      selectedSourceIds: ["000001"],
+      defaultProjectProfileName: "default.yaml",
+      runCleanup: false,
+    });
+    expect(failedPayload.source_ids).toEqual([]);
+    expect(failedPayload.rerun_failed_only).toBe(true);
+    expect(failedPayload.force_redownload).toBe(false);
+    expect(failedPayload.force_convert).toBe(false);
+    expect(failedPayload.project_profile_name).toBe("custom.yaml");
+    expect(failedPayload.run_catalog).toBe(false);
+    expect(failedPayload.run_citation_verify).toBe(false);
+    expect(failedPayload.include_raw_file).toBe(false);
+    expect(failedPayload.include_rendered_html).toBe(true);
+    expect(failedPayload.include_rendered_pdf).toBe(false);
+    expect(failedPayload.include_markdown).toBe(false);
+  });
+
+  it("forces markdown extraction when download cleanup is enabled", () => {
+    const payload = buildRepositoryBrowserDownloadTaskPayload({
+      draft: {
+        rerun_failed_only: false,
+        run_download: false,
+        run_convert: false,
+        run_catalog: false,
+        run_citation_verify: false,
+        run_llm_cleanup: false,
+        run_llm_title: false,
+        run_llm_summary: false,
+        run_llm_rating: false,
+        force_redownload: false,
+        force_convert: false,
+        force_catalog: false,
+        force_citation_verify: false,
+        force_llm_cleanup: false,
+        force_title: false,
+        force_summary: false,
+        force_rating: false,
+        project_profile_name: "",
+        include_raw_file: false,
+        include_rendered_html: false,
+        include_rendered_pdf: true,
+        include_markdown: false,
+        scope: "empty_only",
+        import_id: "",
+      },
+      scope: "selected",
+      selectedSourceIds: ["000001"],
+      defaultProjectProfileName: "default.yaml",
+      runCleanup: true,
+    });
+
+    expect(payload.run_llm_cleanup).toBe(true);
+    expect(payload.include_markdown).toBe(true);
+    expect(payload.run_convert).toBe(true);
+    expect(payload.force_convert).toBe(true);
   });
 
   it("supports shift-range selection and clear behavior", () => {

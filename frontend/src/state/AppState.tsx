@@ -48,6 +48,7 @@ const DEFAULT_SETTINGS: RepoSettings = {
   research_purpose: "",
   default_project_profile_name: "",
   fetch_delay: 2,
+  searxng_base_url: "",
 };
 
 const DEFAULT_SOURCE_TASKS: RepositorySourceTaskRequest = {

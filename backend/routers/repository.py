@@ -21,6 +21,7 @@ from backend.models.repository import (
     CreateRepositoryRequest,
     RepositoryCitationRisExportRequest,
     RepositoryActionResponse,
+    RepositoryBundleExportRequest,
     RepositoryColumnConfig,
     RepositoryColumnCreateRequest,
     RepositoryColumnPromptFixRequest,
@@ -30,7 +31,10 @@ from backend.models.repository import (
     RepositoryColumnRunStatus,
     RepositoryColumnUpdateRequest,
     RepositoryDocumentImportListResponse,
+    RepositoryDuplicateCandidateResponse,
     RepositoryManifestExportRequest,
+    RepositorySourceBulkRisReadyRequest,
+    RepositorySourceBulkRisReadyResponse,
     RepositorySourceDeleteRequest,
     RepositorySourceDeleteResponse,
     RepositorySourceExportRequest,
@@ -720,6 +724,35 @@ async def get_repository_column_run_status(
 
 
 @router.post(
+    "/repository/sources/duplicate-candidates",
+    response_model=RepositoryDuplicateCandidateResponse,
+)
+async def scan_repository_source_duplicates(
+    request: Request,
+) -> RepositoryDuplicateCandidateResponse:
+    service = request.app.state.repository_service
+    try:
+        return service.find_duplicate_source_candidates()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/repository/sources/bulk-mark-ris-ready",
+    response_model=RepositorySourceBulkRisReadyResponse,
+)
+async def bulk_mark_repository_sources_ris_ready(
+    request: Request,
+    payload: RepositorySourceBulkRisReadyRequest,
+) -> RepositorySourceBulkRisReadyResponse:
+    service = request.app.state.repository_service
+    try:
+        return service.bulk_mark_sources_ris_ready(payload.source_ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
     "/repository/sources/bulk-delete",
     response_model=RepositorySourceDeleteResponse,
 )
@@ -766,6 +799,23 @@ async def export_repository_citations_ris(
     return Response(
         content=content,
         media_type="application/x-research-info-systems; charset=utf-8",
+        headers=headers,
+    )
+
+
+@router.post("/repository/export-bundle")
+async def export_repository_bundle(
+    request: Request,
+    payload: RepositoryBundleExportRequest,
+) -> Response:
+    service = request.app.state.repository_service
+    try:
+        content, headers = service.export_repository_bundle(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return Response(
+        content=content,
+        media_type="application/zip",
         headers=headers,
     )
 

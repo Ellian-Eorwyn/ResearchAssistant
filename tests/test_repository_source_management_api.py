@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import io
 import json
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -125,7 +127,7 @@ class RepositorySourceManagementApiTests(unittest.TestCase):
 
         rendered_response = self.client.get("/api/repository/sources/000002/files/rendered")
         self.assertEqual(rendered_response.status_code, 200)
-        self.assertIn("text/html", rendered_response.headers["content-type"])
+        self.assertEqual(rendered_response.headers["content-type"], "application/pdf")
 
         markdown_response = self.client.get("/api/repository/sources/000002/files/md")
         self.assertEqual(markdown_response.status_code, 200)
@@ -160,6 +162,78 @@ class RepositorySourceManagementApiTests(unittest.TestCase):
         self.assertEqual(len(state["citations"]), 1)
         self.assertEqual(state["citations"][0]["repository_source_id"], "000001")
 
+    def test_bulk_mark_ris_ready_uses_selected_row_metadata(self):
+        state_path = self.repo_dir / ".ra_repo" / "repository_state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        rows = state["sources"]
+        rows[0]["author_names"] = "Jane Doe"
+        rows[0]["publication_date"] = ""
+        rows[0]["publication_year"] = "2024"
+        rows[1]["author_names"] = "Beta Agency"
+        rows[1]["publication_date"] = ""
+        rows[1]["publication_year"] = "2023"
+        state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.service.rebuild()
+
+        response = self.client.post(
+            "/api/repository/sources/bulk-mark-ris-ready",
+            json={"source_ids": ["000001", "000002"]},
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+
+        self.assertEqual(payload["requested_sources"], 2)
+        self.assertEqual(payload["ready_sources"], 2)
+        self.assertEqual(payload["blocked_sources"], 0)
+
+        manifest = self.service.list_manifest(limit=10, offset=0, sort_by="id", sort_dir="asc")
+        rows_by_id = {row["id"]: row for row in manifest["rows"]}
+        self.assertTrue(rows_by_id["000001"]["citation_ready"])
+        self.assertTrue(rows_by_id["000002"]["citation_ready"])
+        self.assertEqual(rows_by_id["000001"]["citation_issued"], "2024")
+        self.assertEqual(rows_by_id["000002"]["citation_issued"], "2023")
+        self.assertEqual(rows_by_id["000001"]["citation_verification_status"], "verified")
+        self.assertEqual(rows_by_id["000002"]["citation_verification_status"], "verified")
+
+        catalog_payload = json.loads(
+            (self.repo_dir / "sources" / "000001" / "000001_catalog.json").read_text(encoding="utf-8")
+        )
+        self.assertTrue(catalog_payload["citation"]["ready_for_ris"])
+        self.assertIn("title", catalog_payload["citation"]["manual_override_fields"])
+        self.assertIn("authors", catalog_payload["citation"]["manual_override_fields"])
+        self.assertIn("issued", catalog_payload["citation"]["manual_override_fields"])
+
+    def test_duplicate_scan_returns_candidate_groups(self):
+        state_path = self.repo_dir / ".ra_repo" / "repository_state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        rows = state["sources"]
+        rows[0]["author_names"] = "Jane Doe"
+        rows[0]["publication_date"] = "2025-01-15"
+        rows[1]["original_url"] = "https://example.com/a?utm_source=duplicate"
+        rows[1]["final_url"] = ""
+        rows[1]["title"] = "Alpha Source"
+        rows[1]["author_names"] = "Jane Doe"
+        rows[1]["publication_date"] = "2025-01-15"
+        rows[1]["fetch_status"] = "failed"
+        state_path.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        self.service.rebuild()
+
+        response = self.client.post("/api/repository/sources/duplicate-candidates")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+
+        self.assertEqual(payload["total_groups"], 1)
+        self.assertEqual(payload["groups"][0]["match_reason"], "Matching normalized URL")
+        self.assertEqual(payload["groups"][0]["confidence"], "high")
+        self.assertEqual(
+            {row["id"] for row in payload["groups"][0]["rows"]},
+            {"000001", "000002"},
+        )
+        self.assertEqual(payload["groups"][0]["suggested_keep_id"], "000001")
+
     def test_export_source_files_flattens_names_and_suffixes_collisions(self):
         export_dir = self.tmp_path / "exports"
         export_dir.mkdir(parents=True, exist_ok=True)
@@ -186,6 +260,96 @@ class RepositorySourceManagementApiTests(unittest.TestCase):
             (export_dir / "000002 - Beta Source.md").read_text(encoding="utf-8"),
             "# External cleanup\n",
         )
+
+    def test_export_repository_bundle_downloads_zip_with_selected_rows(self):
+        self.service.update_source(
+            "000002",
+            patch={
+                "author_names": "Beta Org",
+                "publication_date": "2024",
+                "organization_name": "Beta Org",
+                "organization_type": "nonprofit",
+                "document_type": "brief",
+                "citation_title": "Beta Source",
+                "citation_authors": "Beta Org",
+                "citation_issued": "2024",
+                "citation_type": "webpage",
+                "citation_url": "https://example.com/b",
+            },
+        )
+
+        response = self.client.post(
+            "/api/repository/export-bundle",
+            json={
+                "scope": "selected",
+                "source_ids": ["000002"],
+                "file_kinds": ["rendered", "md"],
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "application/zip")
+
+        archive = zipfile.ZipFile(io.BytesIO(response.content))
+        names = set(archive.namelist())
+        self.assertIn("index.html", names)
+        self.assertIn("research-export.csv", names)
+        self.assertIn("citations.ris", names)
+        self.assertIn("Beta Org - 2024 - Beta Source.pdf", names)
+        self.assertIn("Beta Org - 2024 - Beta Source.md", names)
+        self.assertNotIn("Beta Org - 2024 - Beta Source.html", names)
+
+        viewer_html = archive.read("index.html").decode("utf-8")
+        self.assertIn("Beta Source", viewer_html)
+        self.assertNotIn("Alpha Source", viewer_html)
+
+    def test_export_repository_bundle_cloud_mode_downloads_manifest_and_storage_files(self):
+        response = self.client.post(
+            "/api/repository/export-bundle",
+            json={
+                "mode": "cloud",
+                "scope": "selected",
+                "source_ids": ["000002"],
+                "file_kinds": ["rendered", "md"],
+                "base_url": "./files",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "application/zip")
+
+        archive = zipfile.ZipFile(io.BytesIO(response.content))
+        names = set(archive.namelist())
+        self.assertIn("index.html", names)
+        self.assertIn("manifest.json", names)
+        self.assertIn("research-export.csv", names)
+        self.assertIn("citations.ris", names)
+        self.assertIn("files/000002-rendered-000002-rendered.pdf", names)
+        self.assertIn("files/external-cleanup-000002-md.md", names)
+
+        viewer_html = archive.read("index.html").decode("utf-8")
+        self.assertIn('const BASE_URL = "./files/";', viewer_html)
+        self.assertIn("Cloud Repository Browser", viewer_html)
+        self.assertIn("const label = file.label;", viewer_html)
+        self.assertIn('let lastAnchorId = "";', viewer_html)
+        self.assertIn("Boolean(event.shiftKey)", viewer_html)
+        self.assertIn("Direct file links can still open without cross-origin byte access.", viewer_html)
+        self.assertNotIn("Offline Repository Browser", viewer_html)
+        self.assertNotIn("Choose Package Folder", viewer_html)
+        self.assertNotIn("showDirectoryPicker", viewer_html)
+        self.assertNotIn("Edit BASE_URL near the top of this file after upload.", viewer_html)
+        self.assertNotIn('folderStatus.textContent = "BASE_URL "', viewer_html)
+        self.assertNotIn("Custom Columns", viewer_html)
+
+        manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+        self.assertEqual(manifest["exportMode"], "cloud")
+        self.assertEqual(
+            manifest["rows"][0]["files"]["rendered"]["storageName"],
+            "000002-rendered-000002-rendered.pdf",
+        )
+        self.assertEqual(
+            manifest["rows"][0]["files"]["md"]["storageName"],
+            "external-cleanup-000002-md.md",
+        )
+        self.assertNotIn("relativePath", manifest["rows"][0]["files"]["rendered"])
 
     def test_patch_source_updates_manifest_catalog_summary_and_rating_artifacts(self):
         response = self.client.patch(

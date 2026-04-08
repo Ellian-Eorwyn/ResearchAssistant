@@ -14,6 +14,7 @@ import {
   MatchesPage,
   OverviewPage,
   RepositoryBrowserPage,
+  SearchPage,
   SentencesPage,
   SettingsPage,
 } from "./pages/pages";
@@ -32,6 +33,7 @@ export default function App() {
         <Route element={<Navigate replace to="/browser" />} index />
 
         <Route element={<RepositoryBrowserPage />} path="browser" />
+        <Route element={<SearchPage />} path="search" />
         <Route element={<AiGuidancePage />} path="ai-guidance" />
         <Route element={<SettingsPage />} path="settings" />
 

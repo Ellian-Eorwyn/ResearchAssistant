@@ -145,8 +145,31 @@ By Jane Doe and John Roe
 
         self.assertEqual(citation.doi, "10.1234/example")
         self.assertEqual(citation.url, "https://doi.org/10.1234/example")
-        self.assertFalse(citation.ready_for_ris)
-        self.assertNotEqual(citation.verification_status, "verified")
+        self.assertTrue(citation.ready_for_ris)
+        self.assertEqual(citation.missing_fields, [])
+        self.assertEqual(citation.verification_status, "candidate")
+
+    def test_builds_citation_metadata_with_repository_reference_for_uploaded_documents(self):
+        row = SourceManifestRow(
+            id="000001",
+            source_kind="uploaded_document",
+            source_document_name="Local Report.pdf",
+            raw_file="sources/000001/Local Report.pdf",
+        )
+
+        citation = _build_citation_metadata(
+            row=row,
+            title="Local Report",
+            author_names="Jane Doe",
+            publication_date="2024",
+            document_type="report",
+            organization_name="Example Org",
+            html_metadata={},
+        )
+
+        self.assertEqual(citation.url, "repository:///sources/000001/Local%20Report.pdf")
+        self.assertTrue(citation.ready_for_ris)
+        self.assertEqual(citation.missing_fields, [])
 
     def test_normalizes_personal_and_corporate_authors(self):
         authors = normalize_citation_authors(
@@ -184,13 +207,12 @@ By Jane Doe and John Roe
         self.assertIn("VO  - ASHRAE 90.1", record)
         self.assertTrue(record.endswith("ER  -"))
 
-    def test_ris_readiness_requires_only_title_authors_publication_year_and_url(self):
+    def test_ris_readiness_requires_only_title_authors_and_publication_year(self):
         citation = CitationMetadata(
             item_type="",
             title="Minimal Citation",
             authors=normalize_citation_authors(["Jane Doe"]),
             issued="2024",
-            url="https://example.com/minimal",
             verification_status="verified",
         )
 
@@ -200,6 +222,59 @@ By Jane Doe and John Roe
         self.assertEqual(finalized.missing_fields, [])
         self.assertEqual(finalized.blocked_reasons, [])
         self.assertEqual(finalized.verification_status, "verified")
+
+    def test_ris_record_can_export_without_url_when_core_fields_exist(self):
+        citation = CitationMetadata(
+            item_type="report",
+            title="Offline Report",
+            authors=normalize_citation_authors(["Jane Doe"]),
+            issued="2024-03-15",
+            publisher="Example Org",
+            ready_for_ris=True,
+        )
+
+        record = build_ris_record(citation)
+
+        self.assertIn("TI  - Offline Report", record)
+        self.assertIn("PY  - 2024", record)
+        self.assertNotIn("UR  -", record)
+
+    def test_ris_readiness_clears_stale_missing_field_blockers_when_required_fields_exist(self):
+        citation = CitationMetadata(
+            item_type="report",
+            title="Recovered Citation",
+            authors=normalize_citation_authors(["Jane Doe"]),
+            issued="2024-03-15",
+            url="https://example.com/recovered",
+            missing_fields=["authors", "publication_year"],
+            blocked_reasons=["Missing required citation fields: authors, publication_year"],
+            verification_status="blocked",
+        )
+
+        finalized = _finalize_citation_metadata(citation)
+
+        self.assertTrue(finalized.ready_for_ris)
+        self.assertEqual(finalized.missing_fields, [])
+        self.assertEqual(finalized.blocked_reasons, [])
+        self.assertEqual(finalized.verification_status, "candidate")
+
+    def test_ris_readiness_does_not_treat_llm_skip_as_export_blocker(self):
+        citation = CitationMetadata(
+            item_type="web page",
+            title="LLM Optional Citation",
+            authors=normalize_citation_authors(["Beta Team"]),
+            issued="2024-03-15",
+            url="https://example.com/llm-optional",
+            verification_status="skipped_llm_disabled",
+            blocked_reasons=["Citation verification requires an enabled LLM backend."],
+        )
+
+        finalized = _finalize_citation_metadata(citation)
+
+        self.assertTrue(finalized.ready_for_ris)
+        self.assertEqual(finalized.missing_fields, [])
+        self.assertEqual(finalized.blocked_reasons, [])
+        self.assertEqual(finalized.verification_status, "skipped_llm_disabled")
 
     def test_finalized_citation_uses_organization_as_corporate_author_when_authors_missing(self):
         citation = CitationMetadata(

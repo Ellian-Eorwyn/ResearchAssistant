@@ -267,6 +267,33 @@ export function SettingsPage() {
       </SurfaceCard>
 
       <SurfaceCard>
+        <div className="mb-3 text-title-sm font-semibold">Search Settings</div>
+        <div className="grid gap-3 md:grid-cols-[minmax(0,260px)_minmax(0,1fr)]">
+          <InputField
+            label="SearXNG Base URL"
+            value={settingsDraft.searxng_base_url || ""}
+            onChange={(event) =>
+              setSettingsDraft((prev) => ({
+                ...prev,
+                searxng_base_url: event.target.value,
+              }))
+            }
+            placeholder="http://llms/searxng/"
+          />
+          <div className="rounded-md bg-surface-container-low p-3 text-body-md text-on-surface-variant">
+            URL of your local SearXNG instance for AI-powered web search. Leave empty to disable the
+            search feature. JSON format must be enabled on the SearXNG instance.
+          </div>
+        </div>
+
+        <div className="mt-4 flex flex-wrap gap-2">
+          <Button variant="primary" disabled={savingSettings} onClick={() => void saveRepoSettings()}>
+            {savingSettings ? "Saving..." : "Save Search Settings"}
+          </Button>
+        </div>
+      </SurfaceCard>
+
+      <SurfaceCard>
         <div className="mb-3 text-title-sm font-semibold">Repository Merging</div>
         <div className="rounded-md bg-surface-container-low p-3 text-body-md text-on-surface-variant">
           Current repository:

@@ -11,6 +11,7 @@ interface NavEntry {
 
 export const PRIMARY_NAV: NavEntry[] = [
   { label: "Browser", to: "/browser" },
+  { label: "Search", to: "/search" },
   { label: "AI Guidance", to: "/ai-guidance" },
   { label: "Settings", to: "/settings" },
 ];

@@ -423,6 +423,82 @@ class SourcesRepositorySeedApiTests(unittest.TestCase):
         self.assertEqual(response.json()["scope"], "empty_only")
         self.assertEqual([row.id for row in orchestrator.target_rows], ["000001"])
 
+    def test_empty_only_scope_selects_rows_missing_rendered_pdf_outputs(self):
+        self._update_source_row(rendered_pdf_file="")
+
+        response, orchestrator = self._start_empty_only_job(
+            run_download=True,
+            run_convert=False,
+            include_rendered_pdf=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["scope"], "empty_only")
+        self.assertEqual([row.id for row in orchestrator.target_rows], ["000001"])
+        self.assertFalse(orchestrator.run_convert)
+
+    def test_import_scope_duplicate_seed_batch_selects_existing_rows(self):
+        duplicate_import = self.service.import_source_list(
+            filename="sources-dup.csv",
+            content=("URL\nhttps://example.com/a\n").encode("utf-8"),
+        )
+        self.assertEqual(duplicate_import.accepted_new, 0)
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def fake_run(self: SourceDownloadOrchestrator):
+            started.set()
+            release.wait(timeout=2)
+
+        with patch(
+            "backend.storage.attached_repository.SourceDownloadOrchestrator.run",
+            new=fake_run,
+        ):
+            response = self.client.post(
+                "/api/repository/source-tasks",
+                json={
+                    "scope": "import",
+                    "import_id": duplicate_import.import_id,
+                    "rerun_failed_only": False,
+                    "run_download": True,
+                    "run_convert": True,
+                    "run_catalog": False,
+                    "run_citation_verify": False,
+                    "run_llm_cleanup": False,
+                    "run_llm_title": False,
+                    "run_llm_summary": False,
+                    "run_llm_rating": False,
+                    "force_redownload": False,
+                    "force_convert": False,
+                    "force_catalog": False,
+                    "force_citation_verify": False,
+                    "force_llm_cleanup": False,
+                    "force_title": False,
+                    "force_summary": False,
+                    "force_rating": False,
+                    "project_profile_name": "",
+                    "include_raw_file": True,
+                    "include_rendered_html": True,
+                    "include_rendered_pdf": True,
+                    "include_markdown": True,
+                    "source_ids": [],
+                },
+            )
+
+            self.assertEqual(response.status_code, 200)
+            job_id = response.json()["job_id"]
+            self.assertTrue(started.wait(timeout=1))
+
+            with self.app.state.source_download_lock:
+                orchestrator = self.app.state.source_download_jobs.get(job_id)
+            self.assertIsNotNone(orchestrator)
+            self.assertEqual([row.id for row in orchestrator.target_rows], ["000001"])
+
+            release.set()
+            if self.service._download_thread is not None:
+                self.service._download_thread.join(timeout=1)
+
     def test_empty_only_scope_selects_rows_missing_catalog_artifacts(self):
         self._update_source_row(catalog_file="", catalog_status="")
 
@@ -458,6 +534,36 @@ class SourcesRepositorySeedApiTests(unittest.TestCase):
 
     def test_empty_only_scope_selects_rows_missing_citation_verification(self):
         self._update_source_row(catalog_file="", catalog_status="")
+
+        response, orchestrator = self._start_empty_only_job(
+            run_citation_verify=True,
+            include_markdown=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([row.id for row in orchestrator.target_rows], ["000001"])
+
+    def test_empty_only_scope_selects_rows_with_non_ready_citation_verification(self):
+        catalog_path = self.repo_dir / "metadata" / "000001_catalog.json"
+        catalog_path.parent.mkdir(parents=True, exist_ok=True)
+        catalog_path.write_text(
+            json.dumps(
+                {
+                    "citation": {
+                        "title": "Existing Source",
+                        "issued": "2024",
+                        "url": "https://example.com/a",
+                        "verification_status": "blocked",
+                        "missing_fields": ["authors"],
+                        "ready_for_ris": False,
+                    }
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        self._update_source_row(catalog_file="metadata/000001_catalog.json", catalog_status="generated")
 
         response, orchestrator = self._start_empty_only_job(
             run_citation_verify=True,

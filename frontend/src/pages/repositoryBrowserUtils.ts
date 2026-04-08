@@ -64,6 +64,7 @@ export interface RepositoryBrowserColumnCategory {
 }
 
 export type RepositoryBrowserTaskScope = "all" | "selected" | "empty_only";
+export type RepositoryBrowserDownloadScope = "all" | "selected" | "failed_fetch";
 
 export interface RepositoryBrowserQueuedSourceTask {
   id: "convert" | "cleanup" | "title" | "catalog" | "citation_verify" | "summary" | "rating";
@@ -76,6 +77,14 @@ export interface RepositoryBrowserSourceTaskQueueInput {
   scope: RepositoryBrowserTaskScope;
   selectedSourceIds: string[];
   defaultProjectProfileName: string;
+}
+
+export interface RepositoryBrowserDownloadTaskPayloadInput {
+  draft: RepositorySourceTaskRequest;
+  scope: RepositoryBrowserDownloadScope;
+  selectedSourceIds: string[];
+  defaultProjectProfileName: string;
+  runCleanup: boolean;
 }
 
 export const REPOSITORY_BROWSER_FILE_COLUMNS: Array<{
@@ -289,17 +298,6 @@ export function buildRepositoryBrowserSourceTaskQueue({
     return tasks;
   }
 
-  tasks.push({
-    id: "convert",
-    label: "Convert Markdown",
-    payload: {
-      ...basePayload,
-      scope: "empty_only",
-      selected_phases: ["convert"],
-      run_convert: true,
-    },
-  });
-
   selectedTaskIds.forEach((taskId) => {
     if (taskId === "cleanup") {
       tasks.push({
@@ -373,6 +371,50 @@ export function buildRepositoryBrowserSourceTaskQueue({
   });
 
   return tasks;
+}
+
+export function buildRepositoryBrowserDownloadTaskPayload({
+  draft,
+  scope,
+  selectedSourceIds,
+  defaultProjectProfileName,
+  runCleanup,
+}: RepositoryBrowserDownloadTaskPayloadInput): RepositorySourceTaskRequest {
+  const normalizedSelectedIds = selectedSourceIds.map((value) => value.trim()).filter(Boolean);
+  const forceRedownload = scope !== "failed_fetch";
+  const includeMarkdown = Boolean(draft.include_markdown || runCleanup);
+  const runConvert = includeMarkdown;
+  const forceConvert = forceRedownload && runConvert;
+
+  return {
+    ...draft,
+    scope: "all",
+    import_id: "",
+    source_ids: scope === "selected" ? normalizedSelectedIds : [],
+    selected_phases: [],
+    rerun_failed_only: scope === "failed_fetch",
+    run_download: true,
+    run_convert: runConvert,
+    run_catalog: false,
+    run_citation_verify: false,
+    run_llm_cleanup: runCleanup,
+    run_llm_title: false,
+    run_llm_summary: false,
+    run_llm_rating: false,
+    force_redownload: forceRedownload,
+    force_convert: forceConvert,
+    force_catalog: false,
+    force_citation_verify: false,
+    force_llm_cleanup: false,
+    force_title: false,
+    force_summary: false,
+    force_rating: false,
+    include_raw_file: Boolean(draft.include_raw_file),
+    include_rendered_html: Boolean(draft.include_rendered_html),
+    include_rendered_pdf: Boolean(draft.include_rendered_pdf),
+    include_markdown: includeMarkdown,
+    project_profile_name: draft.project_profile_name || defaultProjectProfileName,
+  };
 }
 
 export function defaultRepositoryBrowserColumnWidth(columnKey: string): number {
@@ -658,6 +700,7 @@ export function mergeRepositoryBrowserColumns(
     kind: "builtin" as const,
     renamable: false,
     processable: false,
+    requires_llm: false,
     sort_type: "text" as const,
     instruction_prompt: "",
     output_constraint: null,

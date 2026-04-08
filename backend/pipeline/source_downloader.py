@@ -217,12 +217,11 @@ RATING_RESERVED_KEYS = {
     "summary",
 }
 
-CITATION_REQUIRED_FIELDS = ("title", "authors", "issued", "url")
+CITATION_REQUIRED_FIELDS = ("title", "authors", "issued")
 CITATION_REQUIRED_FIELD_LABELS = {
     "title": "title",
     "authors": "authors",
     "issued": "publication_year",
-    "url": "url",
 }
 CITATION_VERIFIABLE_FIELDS = (
     "item_type",
@@ -1074,7 +1073,7 @@ class SourceDownloadOrchestrator:
                     id=row.id,
                     source_document_name=row.source_document_name,
                     citation_number=row.citation_number,
-                    original_url=row.original_url or row.final_url,
+                    original_url=self._preferred_target_url(row),
                 )
                 for row in self.target_rows
             ]
@@ -1124,6 +1123,22 @@ class SourceDownloadOrchestrator:
         if not deduped_targets:
             raise RuntimeError("No citation URLs found in bibliography entries")
         return deduped_targets
+
+    def _preferred_target_url(self, row: SourceManifestRow) -> str:
+        fallback_url = row.original_url or row.final_url
+        if not row.catalog_file:
+            return fallback_url
+
+        catalog_payload = _load_manifest_json(self.output_dir, row.catalog_file)
+        citation = _coerce_citation_metadata(catalog_payload.get("citation"))
+        if "url" not in _effective_manual_override_fields(citation):
+            return fallback_url
+
+        preferred_url = clean_url_candidate(citation.url)
+        if not preferred_url:
+            return fallback_url
+        normalized_url, _ = normalize_url(preferred_url)
+        return normalized_url or preferred_url
 
     def _load_previous_rows(self) -> list[SourceManifestRow]:
         if self.target_rows:
@@ -2605,19 +2620,9 @@ class SourceDownloadOrchestrator:
         if current_citation.doi:
             doi_citation = _resolve_doi_citation_metadata(current_citation.doi)
             current_citation = _merge_citation_metadata(current_citation, doi_citation)
-        current_citation = _merge_citation_metadata(
+        current_citation = _merge_row_citation_defaults(
             current_citation,
-            {
-                "title": row.title,
-                "authors": [
-                    author.model_dump(mode="json")
-                    for author in normalize_citation_authors(row.author_names)
-                ],
-                "issued": row.publication_date,
-                "publisher": row.organization_name,
-                "item_type": row.document_type,
-                "url": row.original_url or row.final_url,
-            },
+            row,
             overwrite_existing=bool(self.force_catalog),
         )
         current_citation.verification_status = "candidate"
@@ -2629,7 +2634,7 @@ class SourceDownloadOrchestrator:
             deterministic_metadata=deterministic,
             html_metadata=extract_html_citation_metadata(
                 catalog_html_text,
-                base_url=row.original_url or row.final_url,
+                base_url=_citation_reference_url_for_row(row),
             ),
             deterministic_citation=current_citation,
             doi_registry_citation=doi_citation,
@@ -2661,6 +2666,11 @@ class SourceDownloadOrchestrator:
         source_digest = self._effective_markdown_digest(row)
         existing_catalog_payload = _load_manifest_json(self.output_dir, row.catalog_file)
         existing_citation = _coerce_citation_metadata(existing_catalog_payload.get("citation"))
+        existing_citation = _merge_row_citation_defaults(
+            existing_citation,
+            row,
+            overwrite_existing=False,
+        )
         self._begin_row_phase(
             row,
             PHASE_CITATION_VERIFY,
@@ -2714,23 +2724,18 @@ class SourceDownloadOrchestrator:
             html_text=catalog_html_text,
         )
         current_citation = _coerce_citation_metadata(deterministic.get("citation"))
+        current_citation = _merge_citation_metadata(
+            current_citation,
+            _citation_scalar_payload(existing_citation),
+            overwrite_existing=False,
+        )
         doi_citation = CitationMetadata()
         if current_citation.doi:
             doi_citation = _resolve_doi_citation_metadata(current_citation.doi)
             current_citation = _merge_citation_metadata(current_citation, doi_citation)
-        current_citation = _merge_citation_metadata(
+        current_citation = _merge_row_citation_defaults(
             current_citation,
-            {
-                "title": row.title,
-                "authors": [
-                    author.model_dump(mode="json")
-                    for author in normalize_citation_authors(row.author_names)
-                ],
-                "issued": row.publication_date,
-                "publisher": row.organization_name,
-                "item_type": row.document_type,
-                "url": row.original_url or row.final_url,
-            },
+            row,
             overwrite_existing=False,
         )
         current_citation.verification_status = "candidate"
@@ -2742,7 +2747,7 @@ class SourceDownloadOrchestrator:
             deterministic_metadata=deterministic,
             html_metadata=extract_html_citation_metadata(
                 catalog_html_text,
-                base_url=row.original_url or row.final_url,
+                base_url=_citation_reference_url_for_row(row),
             ),
             deterministic_citation=current_citation,
             doi_registry_citation=doi_citation,
@@ -2830,7 +2835,7 @@ class SourceDownloadOrchestrator:
                     {
                         "verification_status": "skipped_llm_disabled",
                         "verification_content_digest": source_digest,
-                        "blocked_reasons": ["Citation verification requires an enabled LLM backend."],
+                        "notes": ["Citation verification requires an enabled LLM backend."],
                     },
                     overwrite_existing=True,
                 ),
@@ -2844,7 +2849,7 @@ class SourceDownloadOrchestrator:
                     {
                         "verification_status": "skipped_llm_not_configured",
                         "verification_content_digest": source_digest,
-                        "blocked_reasons": ["Citation verification requires a chat-capable LLM backend."],
+                        "notes": ["Citation verification requires a chat-capable LLM backend."],
                     },
                     overwrite_existing=True,
                 ),
@@ -2859,7 +2864,7 @@ class SourceDownloadOrchestrator:
         user_prompt = SOURCE_CITATION_VERIFY_USER.format(
             research_purpose=research_purpose,
             source_kind=row.source_kind,
-            original_url=row.original_url or row.final_url or "",
+            original_url=_citation_reference_url_for_row(row),
             candidate_metadata_json=json.dumps(candidate_payload, ensure_ascii=False, indent=2),
             source_markdown=source_text,
         )
@@ -2908,7 +2913,7 @@ class SourceDownloadOrchestrator:
                 {
                     "verification_status": "failed",
                     "verification_content_digest": source_digest,
-                    "blocked_reasons": ["Citation verification failed."],
+                    "notes": ["Citation verification failed."],
                 },
                 overwrite_existing=True,
             )
@@ -4403,7 +4408,13 @@ def _finalize_citation_metadata(citation: CitationMetadata) -> CitationMetadata:
             continue
         if not str(value or "").strip():
             missing_fields.append(CITATION_REQUIRED_FIELD_LABELS.get(field_name, field_name))
-    normalized.missing_fields = _dedupe_strings([*normalized.missing_fields, *missing_fields])
+    normalized.missing_fields = _dedupe_strings(missing_fields)
+    missing_fields_reason_prefix = "Missing required citation fields:"
+    retained_blocked_reasons = [
+        reason
+        for reason in normalized.blocked_reasons
+        if not str(reason or "").strip().startswith(missing_fields_reason_prefix)
+    ]
     status = str(normalized.verification_status or "").strip().lower()
     if status == "legacy_complete":
         status = "legacy_unverified"
@@ -4411,8 +4422,10 @@ def _finalize_citation_metadata(citation: CitationMetadata) -> CitationMetadata:
         status = "verified"
     elif status == "verified" and missing_fields:
         status = "blocked"
+    elif status == "blocked" and not missing_fields:
+        status = "candidate"
     elif status not in {"verified", "skipped_llm_disabled", "skipped_llm_not_configured", "failed"}:
-        if missing_fields or normalized.blocked_reasons:
+        if missing_fields or retained_blocked_reasons:
             status = "blocked" if _citation_has_material_fields(normalized) else status
         elif not status and _citation_has_material_fields(normalized):
             status = "candidate"
@@ -4421,14 +4434,14 @@ def _finalize_citation_metadata(citation: CitationMetadata) -> CitationMetadata:
     if missing_fields:
         normalized.blocked_reasons = _dedupe_strings(
             [
-                *normalized.blocked_reasons,
+                *retained_blocked_reasons,
                 f"Missing required citation fields: {', '.join(missing_fields)}",
             ]
         )
-    elif status == "verified":
+    else:
         normalized.blocked_reasons = []
     normalized.verification_status = status
-    normalized.ready_for_ris = status == "verified" and len(missing_fields) == 0
+    normalized.ready_for_ris = len(missing_fields) == 0
     score = 0.0
     if normalized.item_type:
         score += 0.2
@@ -4494,18 +4507,78 @@ def _apply_citation_manual_overrides(
     return _finalize_citation_metadata(updated)
 
 
+def _citation_reference_url_for_row(row: SourceManifestRow) -> str:
+    direct_url = clean_url_candidate(row.original_url or row.final_url or "")
+    if direct_url:
+        return direct_url
+    if str(row.source_kind or "").strip().lower() != "uploaded_document":
+        return ""
+
+    for local_reference in (
+        str(row.raw_file or "").strip(),
+        str(row.source_document_name or "").strip(),
+        str(row.provenance_ref or "").strip(),
+    ):
+        normalized_reference = local_reference.lstrip("/")
+        if not normalized_reference:
+            continue
+        return "repository:///" + quote(normalized_reference, safe="/:@!$&'()*+,;=-._~")
+    return ""
+
+
+def _merge_row_citation_defaults(
+    citation: CitationMetadata,
+    row: SourceManifestRow,
+    *,
+    overwrite_existing: bool,
+) -> CitationMetadata:
+    return _merge_citation_metadata(
+        citation,
+        {
+            "title": row.title,
+            "authors": [
+                author.model_dump(mode="json")
+                for author in normalize_citation_authors(row.author_names)
+            ],
+            "issued": row.publication_date or row.publication_year,
+            "publisher": row.organization_name,
+            "item_type": row.document_type,
+            "url": _citation_reference_url_for_row(row),
+        },
+        overwrite_existing=overwrite_existing,
+    )
+
+
+def _citation_scalar_payload(citation: CitationMetadata) -> dict[str, Any]:
+    return {
+        "item_type": citation.item_type,
+        "title": citation.title,
+        "authors": [author.model_dump(mode="json") for author in citation.authors],
+        "issued": citation.issued,
+        "publisher": citation.publisher,
+        "container_title": citation.container_title,
+        "volume": citation.volume,
+        "issue": citation.issue,
+        "pages": citation.pages,
+        "doi": citation.doi,
+        "url": citation.url,
+        "report_number": citation.report_number,
+        "standard_number": citation.standard_number,
+        "language": citation.language,
+        "accessed": citation.accessed,
+    }
+
+
 def _citation_verification_is_current(citation: CitationMetadata, source_digest: str) -> bool:
     status = str(citation.verification_status or "").strip().lower()
     if not source_digest:
         return False
     if str(citation.verification_content_digest or "").strip() != source_digest:
         return False
-    return status in {
+    return citation.ready_for_ris and status in {
         "verified",
-        "blocked",
         "skipped_llm_disabled",
         "skipped_llm_not_configured",
-        "failed",
     }
 
 
@@ -4844,7 +4917,7 @@ def _build_citation_metadata(
     html_metadata: dict[str, Any] | None = None,
 ) -> CitationMetadata:
     html_payload = _normalize_citation_payload(html_metadata or {})
-    base_url = clean_url_candidate(row.original_url or row.final_url or "")
+    base_url = _citation_reference_url_for_row(row)
     citation = CitationMetadata(
         item_type=_normalize_citation_type(
             html_payload.item_type or document_type,
