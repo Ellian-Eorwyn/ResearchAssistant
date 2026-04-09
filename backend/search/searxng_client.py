@@ -14,7 +14,10 @@ class SearXNGClient:
     """Synchronous client for the SearXNG JSON search API."""
 
     def __init__(self, base_url: str, *, timeout: float = 30.0):
-        self.base_url = base_url.rstrip("/")
+        url = base_url.strip().rstrip("/")
+        if url.endswith("/search"):
+            url = url[: -len("/search")]
+        self.base_url = url
         self._client = httpx.Client(timeout=timeout)
 
     def close(self) -> None:
@@ -54,6 +57,8 @@ class SearXNGClient:
                 if len(results) >= target_results:
                     break
             except httpx.HTTPError as exc:
+                if page == 1:
+                    raise
                 logger.warning(
                     "SearXNG page %d for query %r failed: %s", page, query, exc
                 )

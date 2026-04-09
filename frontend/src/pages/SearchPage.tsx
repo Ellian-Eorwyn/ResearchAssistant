@@ -357,7 +357,9 @@ export function SearchPage() {
       {isCompleted && results.length === 0 && (
         <SurfaceCard>
           <div className="py-8 text-center text-body-md text-on-surface-variant">
-            No results found. Try broadening your search prompt.
+            {status?.error_message
+              ? status.error_message
+              : "No results found. Try broadening your search prompt."}
           </div>
         </SurfaceCard>
       )}

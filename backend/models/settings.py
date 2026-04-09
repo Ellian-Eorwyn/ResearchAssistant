@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class LLMBackendConfig(BaseModel):
@@ -31,6 +31,14 @@ class AppSettings(BaseModel):
     use_llm: bool = False
     searxng_base_url: str = ""
     fetch_delay: float = Field(default=2.0, ge=1.0, le=10.0)
+
+    @field_validator("searxng_base_url")
+    @classmethod
+    def normalize_searxng_url(cls, v: str) -> str:
+        v = v.strip().rstrip("/")
+        if v.endswith("/search"):
+            v = v[: -len("/search")]
+        return v
 
 
 class RepoSettings(BaseModel):

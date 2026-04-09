@@ -136,16 +136,23 @@ class SearchOrchestrator:
         pages_per_query = min(5, max(1, math.ceil(target_per_query / 20)))
 
         seen: dict[str, SearchResultItem] = {}
+        query_errors = 0
 
         for qi, query in enumerate(queries):
             if self._cancel_requested:
                 break
 
-            raw_results = searxng.search_paginated(
-                query,
-                target_results=target_per_query,
-                max_pages=pages_per_query,
-            )
+            try:
+                raw_results = searxng.search_paginated(
+                    query,
+                    target_results=target_per_query,
+                    max_pages=pages_per_query,
+                )
+            except Exception as exc:
+                logger.warning("Search query %r failed: %s", query, exc)
+                query_errors += 1
+                self.status.queries_completed = qi + 1
+                continue
 
             for r in raw_results:
                 url = (r.get("url") or "").strip()
@@ -172,6 +179,13 @@ class SearchOrchestrator:
 
         self.status.results = list(seen.values())
         self.status.results_total = len(self.status.results)
+
+        if not self.status.results and query_errors > 0:
+            self.status.error_message = (
+                f"All {query_errors} search queries failed. "
+                "Check that the SearXNG base URL is correct and the instance is reachable."
+            )
+
         logger.info(
             "Search job %s found %d unique results from %d queries",
             self.job_id,
