@@ -47,6 +47,13 @@ import type {
   SearchJobStatus,
   SourceCancelResponse,
   SourceDownloadStatus,
+  SpreadsheetColumnConfig,
+  SpreadsheetColumnPromptFixResponse,
+  SpreadsheetColumnRunStartResponse,
+  SpreadsheetColumnRunStatus,
+  SpreadsheetManifestResponse,
+  SpreadsheetSessionResponse,
+  SpreadsheetWorkspaceStatusResponse,
 } from "./types";
 
 async function parseApiResponse<T>(resp: Response): Promise<T> {
@@ -321,6 +328,88 @@ export const api = {
     apiPostDownload("repository/citations/export-ris", payload),
   exportRepositoryManifest: (payload: RepositoryManifestExportRequest) =>
     apiPostDownload("repository/manifest/export", payload),
+
+  // Spreadsheets
+  getSpreadsheetWorkspaceStatus: () =>
+    apiGet<SpreadsheetWorkspaceStatusResponse>("spreadsheets/status"),
+  uploadSpreadsheetSession: async (file: File) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    const resp = await fetch("/api/spreadsheets/upload", {
+      method: "POST",
+      body: formData,
+    });
+    return parseApiResponse<{ session: SpreadsheetSessionResponse; message: string }>(resp);
+  },
+  getSpreadsheetSession: (sessionId: string) =>
+    apiGet<SpreadsheetSessionResponse>(`spreadsheets/sessions/${encodeURIComponent(sessionId)}`),
+  activateSpreadsheetTarget: (sessionId: string, targetId: string) =>
+    apiPost<SpreadsheetSessionResponse>(
+      `spreadsheets/sessions/${encodeURIComponent(sessionId)}/activate-target`,
+      { target_id: targetId },
+    ),
+  getSpreadsheetManifest: (sessionId: string, query: URLSearchParams) =>
+    apiGet<SpreadsheetManifestResponse>(
+      `spreadsheets/sessions/${encodeURIComponent(sessionId)}/manifest?${query.toString()}`,
+    ),
+  patchSpreadsheetRow: (
+    sessionId: string,
+    rowId: string,
+    values: Record<string, unknown>,
+  ) =>
+    apiPatch<Record<string, string | number | boolean | null | undefined>>(
+      `spreadsheets/sessions/${encodeURIComponent(sessionId)}/rows/${encodeURIComponent(rowId)}`,
+      { values },
+    ),
+  createSpreadsheetColumn: (sessionId: string, label: string) =>
+    apiPost<SpreadsheetColumnConfig>(
+      `spreadsheets/sessions/${encodeURIComponent(sessionId)}/columns`,
+      { label },
+    ),
+  updateSpreadsheetColumn: (
+    sessionId: string,
+    columnId: string,
+    payload: {
+      label?: string;
+      instruction_prompt?: string;
+      output_constraint?: SpreadsheetColumnConfig["output_constraint"];
+      input_column_ids?: string[];
+    },
+  ) =>
+    apiPatch<SpreadsheetColumnConfig>(
+      `spreadsheets/sessions/${encodeURIComponent(sessionId)}/columns/${encodeURIComponent(columnId)}`,
+      payload,
+    ),
+  fixSpreadsheetColumnPrompt: (sessionId: string, columnId: string, draftPrompt: string) =>
+    apiPost<SpreadsheetColumnPromptFixResponse>(
+      `spreadsheets/sessions/${encodeURIComponent(sessionId)}/columns/${encodeURIComponent(columnId)}/fix-prompt`,
+      { draft_prompt: draftPrompt },
+    ),
+  startSpreadsheetColumnRun: (
+    sessionId: string,
+    columnId: string,
+    payload: {
+      q: string;
+      scope?: "filtered" | "all" | "empty_only" | "selected";
+      row_ids?: string[];
+      confirm_overwrite?: boolean;
+    },
+  ) =>
+    apiPost<SpreadsheetColumnRunStartResponse>(
+      `spreadsheets/sessions/${encodeURIComponent(sessionId)}/columns/${encodeURIComponent(columnId)}/run`,
+      {
+        filters: { q: payload.q },
+        scope: payload.scope || "filtered",
+        row_ids: payload.row_ids || [],
+        confirm_overwrite: Boolean(payload.confirm_overwrite),
+      },
+    ),
+  getSpreadsheetColumnRunStatus: (sessionId: string, jobId: string) =>
+    apiGet<SpreadsheetColumnRunStatus>(
+      `spreadsheets/sessions/${encodeURIComponent(sessionId)}/column-runs/${encodeURIComponent(jobId)}`,
+    ),
+  exportSpreadsheetSession: (sessionId: string) =>
+    apiPostDownload("spreadsheets/export", { session_id: sessionId }),
 
   // Search
   startSearch: (prompt: string, targetCount: number) =>

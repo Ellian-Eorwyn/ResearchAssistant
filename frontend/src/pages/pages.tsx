@@ -14,6 +14,7 @@ export { AiGuidancePage } from "./AiGuidancePage";
 export { RepositoryBrowserPage } from "./RepositoryBrowserPage";
 export { SearchPage } from "./SearchPage";
 export { SettingsPage } from "./SettingsPage";
+export { SpreadsheetsPage } from "./SpreadsheetsPage";
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;

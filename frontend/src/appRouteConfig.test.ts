@@ -4,9 +4,11 @@ import { COVERED_LEGACY_REDIRECTS } from "./appRouteConfig";
 import { LEGACY_NAV_GROUPS, PRIMARY_NAV } from "./layout/AppShell";
 
 describe("app navigation config", () => {
-  it("keeps only the three primary nav destinations at top level", () => {
+  it("keeps the primary nav destinations at top level", () => {
     expect(PRIMARY_NAV).toEqual([
       { label: "Browser", to: "/browser" },
+      { label: "Search", to: "/search" },
+      { label: "Spreadsheets", to: "/spreadsheets" },
       { label: "AI Guidance", to: "/ai-guidance" },
       { label: "Settings", to: "/settings" },
     ]);

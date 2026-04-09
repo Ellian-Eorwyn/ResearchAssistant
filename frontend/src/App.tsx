@@ -17,6 +17,7 @@ import {
   SearchPage,
   SentencesPage,
   SettingsPage,
+  SpreadsheetsPage,
 } from "./pages/pages";
 import { useAppState } from "./state/AppState";
 
@@ -38,6 +39,7 @@ export default function App() {
 
         <Route element={<RepositoryBrowserPage />} path="browser" />
         <Route element={<SearchPage />} path="search" />
+        <Route element={<SpreadsheetsPage />} path="spreadsheets" />
         <Route element={<AiGuidancePage />} path="ai-guidance" />
         <Route element={<SettingsPage />} path="settings" />
 

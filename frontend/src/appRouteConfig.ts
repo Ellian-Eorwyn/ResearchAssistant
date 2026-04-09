@@ -1,4 +1,4 @@
-export const PRIMARY_APP_ROUTES = ["/browser", "/search", "/ai-guidance", "/settings"] as const;
+export const PRIMARY_APP_ROUTES = ["/browser", "/search", "/spreadsheets", "/ai-guidance", "/settings"] as const;
 
 export const COVERED_LEGACY_REDIRECTS = [
   { from: "project/ingest", to: "/browser" },

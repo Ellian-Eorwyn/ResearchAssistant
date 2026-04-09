@@ -859,6 +859,124 @@ export interface RepositorySourcePatchRequest {
   custom_fields?: Record<string, string | null>;
 }
 
+export type SpreadsheetSourceFormat =
+  | "csv"
+  | "xlsx"
+  | "json"
+  | "jsonl"
+  | "ndjson"
+  | "parquet"
+  | "sqlite";
+
+export type SpreadsheetDataType =
+  | "string"
+  | "integer"
+  | "number"
+  | "boolean"
+  | "null"
+  | "mixed";
+
+export interface SpreadsheetTargetDescriptor {
+  id: string;
+  label: string;
+  kind: "sheet" | "table" | "json_path" | "file";
+  selector: Record<string, unknown>;
+  row_count: number;
+  column_count: number;
+}
+
+export interface SpreadsheetColumnConfig {
+  id: string;
+  source_key: string;
+  label: string;
+  kind: "source" | "custom";
+  data_type: SpreadsheetDataType;
+  ordinal: number;
+  instruction_prompt: string;
+  output_constraint: RepositoryColumnOutputConstraint | null;
+  input_column_ids: string[];
+  last_run_at: string;
+  last_run_status: string;
+}
+
+export interface SpreadsheetSessionSummary {
+  session_id: string;
+  filename: string;
+  original_filename: string;
+  source_format: SpreadsheetSourceFormat;
+  created_at: string;
+  updated_at: string;
+  active_target_id: string;
+  target_count: number;
+}
+
+export interface SpreadsheetSessionResponse {
+  session: SpreadsheetSessionSummary;
+  targets: SpreadsheetTargetDescriptor[];
+  active_target: SpreadsheetTargetDescriptor | null;
+  columns: SpreadsheetColumnConfig[];
+}
+
+export interface SpreadsheetWorkspaceStatusResponse {
+  available: boolean;
+  current_session_id: string;
+  sessions: SpreadsheetSessionSummary[];
+  current_session: SpreadsheetSessionResponse | null;
+}
+
+export interface SpreadsheetManifestResponse {
+  rows: Array<Record<string, string | number | boolean | null | undefined>>;
+  total: number;
+  limit: number;
+  offset: number;
+  sort_by: string;
+  sort_dir: "asc" | "desc" | "";
+  columns: SpreadsheetColumnConfig[];
+  filters: {
+    q: string;
+  };
+}
+
+export interface SpreadsheetColumnPromptFixResponse {
+  status: string;
+  column_id: string;
+  prompt: string;
+  output_constraint: RepositoryColumnOutputConstraint | null;
+  notes: string[];
+}
+
+export interface SpreadsheetColumnRunRowError {
+  row_id: string;
+  message: string;
+}
+
+export interface SpreadsheetColumnRunStartResponse {
+  job_id: string;
+  status: "started" | "confirmation_required";
+  column_id: string;
+  total_rows: number;
+  populated_rows: number;
+  message: string;
+}
+
+export interface SpreadsheetColumnRunStatus {
+  job_id: string;
+  session_id: string;
+  target_id: string;
+  column_id: string;
+  column_label: string;
+  state: "pending" | "running" | "completed" | "failed" | "cancelled";
+  total_rows: number;
+  processed_rows: number;
+  succeeded_rows: number;
+  failed_rows: number;
+  current_row_id: string;
+  message: string;
+  started_at: string;
+  completed_at: string;
+  row_errors: SpreadsheetColumnRunRowError[];
+}
+
 export interface RepositoryManifestFilterPayload {
   q: string;
   fetch_status: string;
