@@ -38,7 +38,7 @@ async def start_search(request: Request, payload: SearchRequest) -> SearchJobSta
     if not service.is_attached:
         raise HTTPException(status_code=400, detail="No repository attached")
 
-    settings = service.load_repo_settings()
+    settings = service.load_effective_settings()
     if not settings.use_llm:
         raise HTTPException(status_code=400, detail="LLM must be enabled in settings")
     if not settings.searxng_base_url:

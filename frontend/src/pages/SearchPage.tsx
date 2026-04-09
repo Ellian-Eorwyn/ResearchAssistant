@@ -35,7 +35,7 @@ function stateLabel(state: SearchJobStatus["state"]): string {
 }
 
 export function SearchPage() {
-  const { repoSettings } = useAppState();
+  const { appSettings } = useAppState();
 
   const [prompt, setPrompt] = useState("");
   const [targetCount, setTargetCount] = useState(DEFAULT_TARGET_COUNT);
@@ -127,8 +127,8 @@ export function SearchPage() {
   const canStart = prompt.trim().length > 0 && !isActive;
   const isCompleted = status?.state === "completed";
   const isFailed = status?.state === "failed";
-  const hasSearxng = Boolean(repoSettings.searxng_base_url);
-  const hasLlm = repoSettings.use_llm;
+  const hasSearxng = Boolean(appSettings.searxng_base_url);
+  const hasLlm = appSettings.use_llm;
 
   return (
     <div className="space-y-4">

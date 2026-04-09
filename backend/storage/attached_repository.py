@@ -91,7 +91,7 @@ from backend.models.project_profiles import (
     ProjectProfileGenerateResponse,
     ProjectProfileSaveResponse,
 )
-from backend.models.settings import RepoSettings
+from backend.models.settings import AppSettings, EffectiveSettings, RepoSettings
 from backend.models.sources import (
     SOURCE_MANIFEST_COLUMNS,
     SourceDownloadRequest,
@@ -361,31 +361,41 @@ class AttachedRepositoryService:
             encoding="utf-8",
         )
 
+    def load_effective_settings(
+        self, settings: EffectiveSettings | None = None,
+    ) -> EffectiveSettings:
+        """Merge app-level and repo-level settings into one object."""
+        if settings is not None:
+            return settings
+        app_settings = self.store.load_app_settings()
+        repo_settings = self.load_repo_settings()
+        return EffectiveSettings.from_app_and_repo(app_settings, repo_settings)
+
     def generate_project_profile(
         self,
         *,
         research_purpose: str = "",
         profile_name: str = "",
         filename: str = "",
-        settings: RepoSettings | None = None,
+        settings: EffectiveSettings | None = None,
     ) -> ProjectProfileGenerateResponse:
         if not self.is_attached:
             raise ValueError("No repository attached")
 
-        repo_settings = settings or self.load_repo_settings()
-        if not repo_settings.use_llm:
+        effective = self.load_effective_settings(settings)
+        if not effective.use_llm:
             raise ValueError("Project profile generation requires LLM features to be enabled.")
-        if not llm_backend_ready_for_chat(repo_settings.llm_backend):
+        if not llm_backend_ready_for_chat(effective.llm_backend):
             raise ValueError("Project profile generation requires a configured chat-capable LLM backend.")
 
         template_filename = (
-            repo_settings.default_project_profile_name.strip()
+            effective.default_project_profile_name.strip()
             or DEFAULT_PROJECT_PROFILE_FILENAME
         )
         template_yaml = self._load_project_profile_template(template_filename)
-        effective_research_purpose = (research_purpose or repo_settings.research_purpose or "").strip()
+        effective_research_purpose = (research_purpose or effective.research_purpose or "").strip()
 
-        client = UnifiedLLMClient(repo_settings.llm_backend)
+        client = UnifiedLLMClient(effective.llm_backend)
         try:
             raw_response = client.sync_chat_completion(
                 system_prompt=PROJECT_PROFILE_GENERATION_SYSTEM,
@@ -613,7 +623,7 @@ class AttachedRepositoryService:
         if not normalized_prompt:
             raise ValueError("draft_prompt is required")
 
-        repo_settings = self.load_repo_settings()
+        repo_settings = self.load_effective_settings()
         if not repo_settings.use_llm or not llm_backend_ready_for_chat(repo_settings.llm_backend):
             raise ValueError("Prompt fix requires an enabled chat-capable LLM backend.")
 
@@ -679,7 +689,7 @@ class AttachedRepositoryService:
         if not self.is_attached:
             raise ValueError("No repository attached")
 
-        repo_settings = self.load_repo_settings()
+        repo_settings = self.load_effective_settings()
 
         with self._writer_lock():
             if self._download_thread and self._download_thread.is_alive():
@@ -867,7 +877,7 @@ class AttachedRepositoryService:
         job_id: str,
         column_id: str,
         source_ids: list[str],
-        repo_settings: RepoSettings,
+        repo_settings: EffectiveSettings,
     ) -> None:
         job_store = self.job_store_for(job_id)
         raw_status = job_store.get_source_status(job_id) or {}
@@ -992,7 +1002,7 @@ class AttachedRepositoryService:
         config: RepositoryColumnConfig,
         row: SourceManifestRow,
         manifest_record: dict[str, str | int | float | bool],
-        repo_settings: RepoSettings,
+        repo_settings: EffectiveSettings,
     ) -> str:
         instruction_prompt = _effective_column_instruction_prompt(config)
         output_constraint = _effective_column_output_constraint(config) or RepositoryColumnOutputConstraint(
@@ -2123,7 +2133,38 @@ class AttachedRepositoryService:
             self._download_state = "idle"
             self._download_message = "Repository attached"
 
+        # One-time migration: if app-level settings have default LLM config
+        # but this repo has real config from the old per-repo format, adopt it.
+        self._maybe_migrate_repo_settings_to_app()
+
         return self.get_status()
+
+    def _maybe_migrate_repo_settings_to_app(self) -> None:
+        """Copy infrastructure settings from repo to app level if app has defaults."""
+        settings_path = self._internal_dir() / REPO_SETTINGS_FILE_NAME
+        if not settings_path.exists():
+            return
+        try:
+            raw = json.loads(settings_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return
+        # Only migrate if the repo file has old-style infrastructure fields
+        if "llm_backend" not in raw:
+            return
+        app_settings = self.store.load_app_settings()
+        # Only adopt if the app-level LLM config is still at defaults
+        if app_settings.llm_backend.model:
+            return
+        try:
+            from backend.models.settings import LLMBackendConfig
+            llm_config = LLMBackendConfig(**raw.get("llm_backend", {}))
+        except Exception:
+            return
+        app_settings.llm_backend = llm_config
+        app_settings.use_llm = raw.get("use_llm", app_settings.use_llm)
+        app_settings.fetch_delay = raw.get("fetch_delay", app_settings.fetch_delay)
+        app_settings.searxng_base_url = raw.get("searxng_base_url", app_settings.searxng_base_url)
+        self.store.save_app_settings(app_settings)
 
     def get_status(self) -> RepositoryStatusResponse:
         if not self.is_attached:
@@ -4063,7 +4104,7 @@ class AttachedRepositoryService:
     def import_document(self, filename: str, content: bytes) -> RepositoryImportResponse:
         if not self.is_attached:
             raise ValueError("Attach a repository before importing")
-        settings = self.load_repo_settings()
+        settings = self.load_effective_settings()
 
         ext = Path(filename or "").suffix.lower()
         if ext not in SUPPORTED_DOCUMENT_IMPORT_EXTENSIONS:
@@ -4149,13 +4190,13 @@ class AttachedRepositoryService:
     def process_documents(
         self,
         files: list[tuple[str, bytes]],
-        settings: RepoSettings | None = None,
+        settings: EffectiveSettings | None = None,
         profile_override: str = "",
     ) -> RepositoryProcessDocumentsResponse:
         if not self.is_attached:
             raise ValueError("Attach a repository before processing documents")
 
-        repo_settings = settings or self.load_repo_settings()
+        repo_settings = self.load_effective_settings(settings)
         selected_profile_id = self._validate_profile_override(profile_override)
         import_id = uuid.uuid4().hex[:12]
         documents_dir = self.documents_dir / import_id
@@ -4247,7 +4288,7 @@ class AttachedRepositoryService:
     def reprocess_documents(
         self,
         target_import_ids: list[str],
-        settings: RepoSettings | None = None,
+        settings: EffectiveSettings | None = None,
         profile_override: str = "",
     ) -> RepositoryReprocessDocumentsResponse:
         if not self.is_attached:
@@ -4259,7 +4300,7 @@ class AttachedRepositoryService:
         if not normalized_import_ids:
             raise ValueError("Select at least one prior document import to reprocess.")
 
-        repo_settings = settings or self.load_repo_settings()
+        repo_settings = self.load_effective_settings(settings)
         selected_profile_id = self._validate_profile_override(profile_override)
         reprocess_id = uuid.uuid4().hex[:12]
         job_store = self.repo_job_store()
@@ -4387,7 +4428,7 @@ class AttachedRepositoryService:
         self,
         job_id: str,
         import_id: str,
-        settings: RepoSettings,
+        settings: EffectiveSettings,
         documents: list[dict[str, str]],
         profile_override: str = "",
     ) -> None:
@@ -4469,7 +4510,7 @@ class AttachedRepositoryService:
         job_id: str,
         reprocess_id: str,
         target_import_ids: list[str],
-        settings: RepoSettings,
+        settings: EffectiveSettings,
         documents: list[dict[str, str]],
         profile_override: str = "",
     ) -> None:
@@ -4552,7 +4593,7 @@ class AttachedRepositoryService:
         job_id: str,
         import_id: str,
         documents: list[dict[str, str]],
-        settings: RepoSettings | None = None,
+        settings: EffectiveSettings | None = None,
         profile_override: str = "",
     ) -> dict[str, Any]:
         if not self.is_attached:
@@ -4563,7 +4604,7 @@ class AttachedRepositoryService:
         bibliography_raw = job_store.load_artifact(job_id, "03_bibliography") or {}
         export_raw = job_store.load_artifact(job_id, "05_export") or {}
         export_rows = _load_citation_rows(export_raw.get("rows", []))
-        repo_settings = settings or self.load_repo_settings()
+        repo_settings = self.load_effective_settings(settings)
         imported_at = _utc_now_iso()
         prepared_documents, normalization_outputs = self._resolve_document_normalization_outputs(
             job_id=job_id,
@@ -4784,7 +4825,7 @@ class AttachedRepositoryService:
         reprocess_id: str,
         target_import_ids: list[str],
         documents: list[dict[str, str]],
-        settings: RepoSettings | None = None,
+        settings: EffectiveSettings | None = None,
         profile_override: str = "",
     ) -> dict[str, Any]:
         if not self.is_attached:
@@ -4795,7 +4836,7 @@ class AttachedRepositoryService:
         bibliography_raw = job_store.load_artifact(job_id, "03_bibliography") or {}
         export_raw = job_store.load_artifact(job_id, "05_export") or {}
         export_rows = _load_citation_rows(export_raw.get("rows", []))
-        repo_settings = settings or self.load_repo_settings()
+        repo_settings = self.load_effective_settings(settings)
         imported_at = _utc_now_iso()
         prepared_documents, normalization_outputs = self._resolve_document_normalization_outputs(
             job_id=job_id,
@@ -5182,7 +5223,7 @@ class AttachedRepositoryService:
     def _build_standardized_output_for_document(
         self,
         document_record: dict[str, Any],
-        settings: RepoSettings,
+        settings: EffectiveSettings,
         builtin_profiles: list[IngestionProfile],
         custom_profiles: list[IngestionProfile],
         profile_override: str = "",
@@ -5328,7 +5369,7 @@ class AttachedRepositoryService:
         self,
         job_id: str,
         documents: list[dict[str, str]],
-        settings: RepoSettings,
+        settings: EffectiveSettings,
         profile_override: str = "",
     ) -> tuple[list[dict[str, str]], list[NormalizedDocumentOutput]]:
         job_store = self.job_store_for(job_id)
@@ -5466,7 +5507,7 @@ class AttachedRepositoryService:
         ingested_documents: dict[str, IngestedDocument],
         bibliography_entries_by_filename: dict[str, list[BibliographyEntry]],
         bibliography_sections_by_filename: dict[str, ReferencesSection],
-        settings: RepoSettings,
+        settings: EffectiveSettings,
         profile_override: str = "",
     ) -> tuple[list[dict[str, str]], list[NormalizedDocumentOutput]]:
         preprocess_raw = self.job_store_for(job_id).load_artifact(job_id, "00_repository_preprocess") or {}
@@ -5509,7 +5550,7 @@ class AttachedRepositoryService:
         ingested_documents: dict[str, IngestedDocument],
         bibliography_entries_by_filename: dict[str, list[BibliographyEntry]],
         bibliography_sections_by_filename: dict[str, ReferencesSection],
-        settings: RepoSettings,
+        settings: EffectiveSettings,
         profile_override: str = "",
     ) -> list[NormalizedDocumentOutput]:
         outputs: list[NormalizedDocumentOutput] = []
@@ -5713,7 +5754,7 @@ class AttachedRepositoryService:
     def start_source_tasks(
         self,
         payload: RepositorySourceTaskRequest,
-        settings: RepoSettings | None = None,
+        settings: EffectiveSettings | None = None,
         live_jobs: dict[str, SourceDownloadOrchestrator] | None = None,
         live_jobs_lock: threading.Lock | None = None,
     ) -> RepositorySourceTaskResponse:
@@ -5748,7 +5789,7 @@ class AttachedRepositoryService:
         ):
             raise ValueError("Select at least one download output type.")
 
-        repo_settings = settings or self.load_repo_settings()
+        repo_settings = self.load_effective_settings(settings)
         normalized_scope = str(payload.scope or "queued").strip().lower()
         normalized_source_ids = _normalize_source_ids(payload.source_ids)
         requested_limit = payload.limit
@@ -5959,7 +6000,7 @@ class AttachedRepositoryService:
             )
             self._rebuild_outputs_locked(rows, citations)
 
-    def start_download(self, settings: RepoSettings) -> RepositoryActionResponse:
+    def start_download(self, settings: EffectiveSettings) -> RepositoryActionResponse:
         if not self.is_attached:
             raise ValueError("Attach a repository before downloading")
 
@@ -7313,7 +7354,7 @@ class AttachedRepositoryService:
         except Exception:
             return {"sources": [], "citations": [], "imports": []}
 
-    def _download_worker(self, queued_ids: list[str], settings: RepoSettings) -> None:
+    def _download_worker(self, queued_ids: list[str], settings: EffectiveSettings) -> None:
         try:
             with self._writer_lock():
                 state = self._load_state_locked()

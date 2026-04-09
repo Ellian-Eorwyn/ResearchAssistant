@@ -729,6 +729,8 @@ export function CitationExtractionPage() {
     warnings,
     settingsDraft,
     setSettingsDraft,
+    appSettingsDraft,
+    setAppSettingsDraft,
     ingestionProfiles,
     defaultIngestionProfileId,
     selectedIngestionProfileId,
@@ -879,9 +881,9 @@ export function CitationExtractionPage() {
             </div>
             <label className="mb-2 flex items-center gap-2 text-body-md">
               <input
-                checked={settingsDraft.use_llm}
+                checked={appSettingsDraft.use_llm}
                 onChange={(event) =>
-                  setSettingsDraft((prev) => ({
+                  setAppSettingsDraft((prev) => ({
                     ...prev,
                     use_llm: event.target.checked,
                   }))
@@ -2230,19 +2232,19 @@ export function IngestionProfilesPage() {
 
 
 export function LlmBackendPage() {
-  const { settingsDraft, setSettingsDraft, models, loadModels, loadingModels, saveRepoSettings, savingSettings } = useAppState();
+  const { appSettingsDraft, setAppSettingsDraft, models, loadModels, loadingModels, saveAppSettings, savingSettings } = useAppState();
 
   return (
     <div>
-      <SectionHeader title="LLM Backend" description="Configure per-repository LLM backend settings." />
+      <SectionHeader title="LLM Backend" description="Configure app-level LLM backend settings." />
 
       <SurfaceCard>
         <div className="grid gap-3 md:grid-cols-2">
           <SelectField
             label="Backend Type"
-            value={settingsDraft.llm_backend.kind}
+            value={appSettingsDraft.llm_backend.kind}
             onChange={(event) =>
-              setSettingsDraft((prev) => ({
+              setAppSettingsDraft((prev) => ({
                 ...prev,
                 llm_backend: { ...prev.llm_backend, kind: event.target.value },
               }))
@@ -2254,9 +2256,9 @@ export function LlmBackendPage() {
 
           <InputField
             label="Base URL"
-            value={settingsDraft.llm_backend.base_url}
+            value={appSettingsDraft.llm_backend.base_url}
             onChange={(event) =>
-              setSettingsDraft((prev) => ({
+              setAppSettingsDraft((prev) => ({
                 ...prev,
                 llm_backend: { ...prev.llm_backend, base_url: event.target.value },
               }))
@@ -2266,9 +2268,9 @@ export function LlmBackendPage() {
           <InputField
             label="API Key"
             type="password"
-            value={settingsDraft.llm_backend.api_key}
+            value={appSettingsDraft.llm_backend.api_key}
             onChange={(event) =>
-              setSettingsDraft((prev) => ({
+              setAppSettingsDraft((prev) => ({
                 ...prev,
                 llm_backend: { ...prev.llm_backend, api_key: event.target.value },
               }))
@@ -2280,9 +2282,9 @@ export function LlmBackendPage() {
             <div className="flex gap-2">
               <select
                 className="min-w-0 flex-1 rounded-md border border-outline-variant bg-surface-container-lowest px-3 py-2 text-body-md"
-                value={settingsDraft.llm_backend.model}
+                value={appSettingsDraft.llm_backend.model}
                 onChange={(event) =>
-                  setSettingsDraft((prev) => ({
+                  setAppSettingsDraft((prev) => ({
                     ...prev,
                     llm_backend: { ...prev.llm_backend, model: event.target.value },
                   }))
@@ -2303,9 +2305,9 @@ export function LlmBackendPage() {
             step="0.1"
             min={0}
             max={2}
-            value={String(settingsDraft.llm_backend.temperature)}
+            value={String(appSettingsDraft.llm_backend.temperature)}
             onChange={(event) =>
-              setSettingsDraft((prev) => ({
+              setAppSettingsDraft((prev) => ({
                 ...prev,
                 llm_backend: {
                   ...prev.llm_backend,
@@ -2317,9 +2319,9 @@ export function LlmBackendPage() {
 
           <SelectField
             label="Think Mode"
-            value={settingsDraft.llm_backend.think_mode}
+            value={appSettingsDraft.llm_backend.think_mode}
             onChange={(event) =>
-              setSettingsDraft((prev) => ({
+              setAppSettingsDraft((prev) => ({
                 ...prev,
                 llm_backend: {
                   ...prev.llm_backend,
@@ -2339,9 +2341,9 @@ export function LlmBackendPage() {
             min={2048}
             max={131072}
             step={1024}
-            value={String(settingsDraft.llm_backend.num_ctx)}
+            value={String(appSettingsDraft.llm_backend.num_ctx)}
             onChange={(event) =>
-              setSettingsDraft((prev) => ({
+              setAppSettingsDraft((prev) => ({
                 ...prev,
                 llm_backend: {
                   ...prev.llm_backend,
@@ -2357,9 +2359,9 @@ export function LlmBackendPage() {
             min={0}
             max={120000}
             step={1000}
-            value={String(settingsDraft.llm_backend.max_source_chars)}
+            value={String(appSettingsDraft.llm_backend.max_source_chars)}
             onChange={(event) =>
-              setSettingsDraft((prev) => ({
+              setAppSettingsDraft((prev) => ({
                 ...prev,
                 llm_backend: {
                   ...prev.llm_backend,
@@ -2375,9 +2377,9 @@ export function LlmBackendPage() {
             min={30}
             max={1800}
             step={30}
-            value={String(settingsDraft.llm_backend.llm_timeout)}
+            value={String(appSettingsDraft.llm_backend.llm_timeout)}
             onChange={(event) =>
-              setSettingsDraft((prev) => ({
+              setAppSettingsDraft((prev) => ({
                 ...prev,
                 llm_backend: {
                   ...prev.llm_backend,
@@ -2390,14 +2392,14 @@ export function LlmBackendPage() {
 
         <label className="mt-3 flex items-center gap-2 text-body-md">
           <input
-            checked={settingsDraft.use_llm}
+            checked={appSettingsDraft.use_llm}
             type="checkbox"
-            onChange={(event) => setSettingsDraft((prev) => ({ ...prev, use_llm: event.target.checked }))}
+            onChange={(event) => setAppSettingsDraft((prev) => ({ ...prev, use_llm: event.target.checked }))}
           />
           Use LLM-assisted features by default
         </label>
 
-        <Button className="mt-3" variant="primary" disabled={savingSettings} onClick={() => saveRepoSettings()}>
+        <Button className="mt-3" variant="primary" disabled={savingSettings} onClick={() => saveAppSettings()}>
           {savingSettings ? "Saving..." : "Save Backend Settings"}
         </Button>
       </SurfaceCard>
@@ -2406,7 +2408,7 @@ export function LlmBackendPage() {
 }
 
 export function RepositorySettingsPage() {
-  const { settingsDraft, setSettingsDraft, saveRepoSettings, savingSettings, repositoryStatus } = useAppState();
+  const { appSettingsDraft, setAppSettingsDraft, saveAppSettings, savingSettings, repositoryStatus } = useAppState();
 
   return (
     <div>
@@ -2419,9 +2421,9 @@ export function RepositorySettingsPage() {
           min={1}
           max={10}
           step={0.5}
-          value={String(settingsDraft.fetch_delay)}
+          value={String(appSettingsDraft.fetch_delay)}
           onChange={(event) =>
-            setSettingsDraft((prev) => ({
+            setAppSettingsDraft((prev) => ({
               ...prev,
               fetch_delay: parseFloat(event.target.value || "2"),
             }))
@@ -2435,7 +2437,7 @@ export function RepositorySettingsPage() {
           Schema Version: <span className="font-mono">{repositoryStatus?.schema_version || "-"}</span>
         </div>
 
-        <Button className="mt-3" variant="primary" disabled={savingSettings} onClick={() => saveRepoSettings()}>
+        <Button className="mt-3" variant="primary" disabled={savingSettings} onClick={() => saveAppSettings()}>
           {savingSettings ? "Saving..." : "Save Repository Settings"}
         </Button>
       </SurfaceCard>
@@ -2444,7 +2446,7 @@ export function RepositorySettingsPage() {
 }
 
 export function AdvancedSettingsPage() {
-  const { settingsDraft, sourceTaskDraft, repositoryStatus } = useAppState();
+  const { settingsDraft, appSettingsDraft, sourceTaskDraft, repositoryStatus } = useAppState();
 
   return (
     <div>
@@ -2455,7 +2457,12 @@ export function AdvancedSettingsPage() {
           {JSON.stringify(repositoryStatus, null, 2)}
         </pre>
 
-        <div className="mb-2 mt-4 text-label-sm uppercase tracking-[0.08em] text-on-surface-variant">Settings Draft</div>
+        <div className="mb-2 mt-4 text-label-sm uppercase tracking-[0.08em] text-on-surface-variant">App Settings Draft</div>
+        <pre className="thin-scrollbar max-h-[24vh] overflow-auto rounded-md bg-surface-container-low p-3 text-label-sm">
+          {JSON.stringify(appSettingsDraft, null, 2)}
+        </pre>
+
+        <div className="mb-2 mt-4 text-label-sm uppercase tracking-[0.08em] text-on-surface-variant">Repo Settings Draft</div>
         <pre className="thin-scrollbar max-h-[24vh] overflow-auto rounded-md bg-surface-container-low p-3 text-label-sm">
           {JSON.stringify(settingsDraft, null, 2)}
         </pre>

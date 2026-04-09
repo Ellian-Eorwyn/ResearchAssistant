@@ -37,6 +37,7 @@ export function AiGuidancePage() {
     profiles,
     settingsDraft,
     setSettingsDraft,
+    appSettingsDraft,
     saveRepoSettings,
     savingSettings,
     loadProfiles,
@@ -54,14 +55,14 @@ export function AiGuidancePage() {
   const generationReason = useMemo(
     () =>
       generationBlockReason(
-        settingsDraft.use_llm,
-        settingsDraft.llm_backend.base_url,
-        settingsDraft.llm_backend.model,
+        appSettingsDraft.use_llm,
+        appSettingsDraft.llm_backend.base_url,
+        appSettingsDraft.llm_backend.model,
       ),
     [
-      settingsDraft.llm_backend.base_url,
-      settingsDraft.llm_backend.model,
-      settingsDraft.use_llm,
+      appSettingsDraft.llm_backend.base_url,
+      appSettingsDraft.llm_backend.model,
+      appSettingsDraft.use_llm,
     ],
   );
 

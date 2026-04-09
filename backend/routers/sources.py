@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 
 from backend.models.bibliography import BibliographyArtifact
 from backend.models.common import PipelineStage
-from backend.models.settings import RepoSettings
+from backend.models.settings import EffectiveSettings
 from backend.models.sources import (
     SourceDownloadRequest,
     SourceDownloadStatus,
@@ -236,11 +236,11 @@ async def start_source_download(
             detail="No existing output run found. Run download phase first.",
         )
 
-    # Load per-repo settings
+    # Load effective settings (app-level + repo-level merged)
     if repo_service.is_attached:
-        settings = repo_service.load_repo_settings()
+        settings = repo_service.load_effective_settings()
     else:
-        settings = RepoSettings()
+        settings = EffectiveSettings()
 
     # Load project profile YAML if rating is requested
     project_profile_name = ""

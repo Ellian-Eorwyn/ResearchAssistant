@@ -309,7 +309,7 @@ async def run_agent_source_phases(
         return auth_error
 
     service = request.app.state.repository_service
-    settings = service.load_repo_settings()
+    settings = service.load_effective_settings()
     try:
         fingerprint = _agent_request_fingerprint(payload)
         existing_run_id = service.resolve_agent_idempotency(payload.idempotency_key, fingerprint)

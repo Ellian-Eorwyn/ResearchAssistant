@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from backend.models.common import PipelineStage, StageStatus
+from backend.models.settings import AppSettings
 from backend.storage.project_profiles import (
     list_project_profiles_in_dir,
     resolve_project_profile_yaml,
@@ -147,6 +148,16 @@ class FileStore:
 
     def delete_settings(self) -> None:
         self.settings_path.unlink(missing_ok=True)
+
+    def load_app_settings(self) -> AppSettings:
+        raw = self.load_settings()
+        try:
+            return AppSettings(**raw)
+        except Exception:
+            return AppSettings()
+
+    def save_app_settings(self, settings: AppSettings) -> None:
+        self.save_settings(settings.model_dump(mode="json"))
 
     def get_job_status(self, job_id: str) -> dict | None:
         path = self.artifacts_dir / job_id / "_status.json"

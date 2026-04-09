@@ -5,15 +5,15 @@ import { useAppState } from "../state/AppState";
 
 export function SettingsPage() {
   const {
+    appSettingsDraft,
+    setAppSettingsDraft,
+    saveAppSettings,
     mergeRepositories,
     pickRepositoryDirectory,
     repoError,
     repoMessage,
     repositoryStatus,
-    saveRepoSettings,
     savingSettings,
-    settingsDraft,
-    setSettingsDraft,
     models,
     loadModels,
     loadingModels,
@@ -38,7 +38,7 @@ export function SettingsPage() {
     <div className="space-y-4">
       <SectionHeader
         title="Settings"
-        description="Configure the attached repository's language model backend, fetch pacing, and merge operations."
+        description="Configure the language model backend, fetch pacing, search, and merge operations. LLM, fetch, and search settings apply across all repositories."
       />
 
       {(repoMessage || repoError) && (
@@ -54,9 +54,9 @@ export function SettingsPage() {
         <div className="grid gap-3 md:grid-cols-2">
           <SelectField
             label="Backend Type"
-            value={settingsDraft.llm_backend.kind}
+            value={appSettingsDraft.llm_backend.kind}
             onChange={(event) =>
-              setSettingsDraft((prev) => ({
+              setAppSettingsDraft((prev) => ({
                 ...prev,
                 llm_backend: {
                   ...prev.llm_backend,
@@ -71,9 +71,9 @@ export function SettingsPage() {
 
           <InputField
             label="Base URL"
-            value={settingsDraft.llm_backend.base_url}
+            value={appSettingsDraft.llm_backend.base_url}
             onChange={(event) =>
-              setSettingsDraft((prev) => ({
+              setAppSettingsDraft((prev) => ({
                 ...prev,
                 llm_backend: {
                   ...prev.llm_backend,
@@ -86,9 +86,9 @@ export function SettingsPage() {
           <InputField
             label="API Key"
             type="password"
-            value={settingsDraft.llm_backend.api_key}
+            value={appSettingsDraft.llm_backend.api_key}
             onChange={(event) =>
-              setSettingsDraft((prev) => ({
+              setAppSettingsDraft((prev) => ({
                 ...prev,
                 llm_backend: {
                   ...prev.llm_backend,
@@ -103,9 +103,9 @@ export function SettingsPage() {
             <div className="flex gap-2">
               <select
                 className="min-w-0 flex-1 rounded-md border border-outline-variant bg-surface-container-lowest px-3 py-2 text-body-md text-on-surface focus:border-primary focus:outline-none"
-                value={settingsDraft.llm_backend.model}
+                value={appSettingsDraft.llm_backend.model}
                 onChange={(event) =>
-                  setSettingsDraft((prev) => ({
+                  setAppSettingsDraft((prev) => ({
                     ...prev,
                     llm_backend: {
                       ...prev.llm_backend,
@@ -133,9 +133,9 @@ export function SettingsPage() {
             min={0}
             max={2}
             step={0.1}
-            value={String(settingsDraft.llm_backend.temperature)}
+            value={String(appSettingsDraft.llm_backend.temperature)}
             onChange={(event) =>
-              setSettingsDraft((prev) => ({
+              setAppSettingsDraft((prev) => ({
                 ...prev,
                 llm_backend: {
                   ...prev.llm_backend,
@@ -147,9 +147,9 @@ export function SettingsPage() {
 
           <SelectField
             label="Think Mode"
-            value={settingsDraft.llm_backend.think_mode}
+            value={appSettingsDraft.llm_backend.think_mode}
             onChange={(event) =>
-              setSettingsDraft((prev) => ({
+              setAppSettingsDraft((prev) => ({
                 ...prev,
                 llm_backend: {
                   ...prev.llm_backend,
@@ -168,9 +168,9 @@ export function SettingsPage() {
             type="number"
             min={2048}
             step={1024}
-            value={String(settingsDraft.llm_backend.num_ctx)}
+            value={String(appSettingsDraft.llm_backend.num_ctx)}
             onChange={(event) =>
-              setSettingsDraft((prev) => ({
+              setAppSettingsDraft((prev) => ({
                 ...prev,
                 llm_backend: {
                   ...prev.llm_backend,
@@ -185,9 +185,9 @@ export function SettingsPage() {
             type="number"
             min={0}
             step={1000}
-            value={String(settingsDraft.llm_backend.max_source_chars)}
+            value={String(appSettingsDraft.llm_backend.max_source_chars)}
             onChange={(event) =>
-              setSettingsDraft((prev) => ({
+              setAppSettingsDraft((prev) => ({
                 ...prev,
                 llm_backend: {
                   ...prev.llm_backend,
@@ -202,9 +202,9 @@ export function SettingsPage() {
             type="number"
             min={30}
             step={30}
-            value={String(settingsDraft.llm_backend.llm_timeout)}
+            value={String(appSettingsDraft.llm_backend.llm_timeout)}
             onChange={(event) =>
-              setSettingsDraft((prev) => ({
+              setAppSettingsDraft((prev) => ({
                 ...prev,
                 llm_backend: {
                   ...prev.llm_backend,
@@ -217,10 +217,10 @@ export function SettingsPage() {
 
         <label className="mt-3 flex items-center gap-2 text-body-md text-on-surface">
           <input
-            checked={settingsDraft.use_llm}
+            checked={appSettingsDraft.use_llm}
             type="checkbox"
             onChange={(event) =>
-              setSettingsDraft((prev) => ({
+              setAppSettingsDraft((prev) => ({
                 ...prev,
                 use_llm: event.target.checked,
               }))
@@ -230,7 +230,7 @@ export function SettingsPage() {
         </label>
 
         <div className="mt-4 flex flex-wrap gap-2">
-          <Button variant="primary" disabled={savingSettings} onClick={() => void saveRepoSettings()}>
+          <Button variant="primary" disabled={savingSettings} onClick={() => void saveAppSettings()}>
             {savingSettings ? "Saving..." : "Save LLM Backend Settings"}
           </Button>
         </div>
@@ -245,9 +245,9 @@ export function SettingsPage() {
             min={0}
             max={30}
             step={0.5}
-            value={String(settingsDraft.fetch_delay)}
+            value={String(appSettingsDraft.fetch_delay)}
             onChange={(event) =>
-              setSettingsDraft((prev) => ({
+              setAppSettingsDraft((prev) => ({
                 ...prev,
                 fetch_delay: Number.parseFloat(event.target.value || "2"),
               }))
@@ -260,7 +260,7 @@ export function SettingsPage() {
         </div>
 
         <div className="mt-4 flex flex-wrap gap-2">
-          <Button variant="primary" disabled={savingSettings} onClick={() => void saveRepoSettings()}>
+          <Button variant="primary" disabled={savingSettings} onClick={() => void saveAppSettings()}>
             {savingSettings ? "Saving..." : "Save Fetch Delay"}
           </Button>
         </div>
@@ -271,9 +271,9 @@ export function SettingsPage() {
         <div className="grid gap-3 md:grid-cols-[minmax(0,260px)_minmax(0,1fr)]">
           <InputField
             label="SearXNG Base URL"
-            value={settingsDraft.searxng_base_url || ""}
+            value={appSettingsDraft.searxng_base_url || ""}
             onChange={(event) =>
-              setSettingsDraft((prev) => ({
+              setAppSettingsDraft((prev) => ({
                 ...prev,
                 searxng_base_url: event.target.value,
               }))
@@ -287,7 +287,7 @@ export function SettingsPage() {
         </div>
 
         <div className="mt-4 flex flex-wrap gap-2">
-          <Button variant="primary" disabled={savingSettings} onClick={() => void saveRepoSettings()}>
+          <Button variant="primary" disabled={savingSettings} onClick={() => void saveAppSettings()}>
             {savingSettings ? "Saving..." : "Save Search Settings"}
           </Button>
         </div>

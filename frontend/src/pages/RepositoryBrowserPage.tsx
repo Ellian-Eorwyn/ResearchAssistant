@@ -2075,6 +2075,7 @@ export function RepositoryBrowserPage() {
     saveRepoSettings,
     settingsDraft,
     setSettingsDraft,
+    appSettingsDraft,
     sourceRunning,
     sourceTaskDraft,
     setSourceTaskDraft,
@@ -2264,9 +2265,9 @@ export function RepositoryBrowserPage() {
   const rows = manifestQuery.data?.rows || [];
   const totalRows = manifestQuery.data?.total || 0;
   const llmReady = Boolean(
-    settingsDraft.use_llm &&
-      settingsDraft.llm_backend.base_url.trim() &&
-      settingsDraft.llm_backend.model.trim(),
+    appSettingsDraft.use_llm &&
+      appSettingsDraft.llm_backend.base_url.trim() &&
+      appSettingsDraft.llm_backend.model.trim(),
   );
   const activeColumnRun =
     columnRunQuery.data &&

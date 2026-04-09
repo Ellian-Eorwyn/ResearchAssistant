@@ -12,7 +12,9 @@ import {
 import { useQuery } from "@tanstack/react-query";
 
 import { api } from "../api/client";
+import { DirectoryBrowserModal } from "../components/DirectoryBrowserModal";
 import type {
+  AppSettings,
   BibliographyResult,
   IngestionProfile,
   IngestionProfileSuggestion,
@@ -32,7 +34,8 @@ import type {
 
 import { createContext } from "react";
 
-const DEFAULT_SETTINGS: RepoSettings = {
+const DEFAULT_APP_SETTINGS: AppSettings = {
+  last_repository_path: "",
   llm_backend: {
     kind: "ollama",
     base_url: "http://localhost:11434",
@@ -45,10 +48,13 @@ const DEFAULT_SETTINGS: RepoSettings = {
     llm_timeout: 300,
   },
   use_llm: false,
-  research_purpose: "",
-  default_project_profile_name: "",
   fetch_delay: 2,
   searxng_base_url: "",
+};
+
+const DEFAULT_REPO_SETTINGS: RepoSettings = {
+  research_purpose: "",
+  default_project_profile_name: "",
 };
 
 const DEFAULT_SOURCE_TASKS: RepositorySourceTaskRequest = {
@@ -103,6 +109,10 @@ interface AppStateValue {
   repoSettings: RepoSettings;
   settingsDraft: RepoSettings;
   setSettingsDraft: Dispatch<SetStateAction<RepoSettings>>;
+  appSettings: AppSettings;
+  appSettingsDraft: AppSettings;
+  setAppSettingsDraft: Dispatch<SetStateAction<AppSettings>>;
+  saveAppSettings: (nextSettings?: AppSettings) => Promise<void>;
   sourceTaskDraft: RepositorySourceTaskRequest;
   setSourceTaskDraft: Dispatch<SetStateAction<RepositorySourceTaskRequest>>;
   processingJobId: string | null;
@@ -136,6 +146,13 @@ interface AppStateValue {
   sourceTaskQueueActiveLabel: string;
   sourceTaskQueueCompletedCount: number;
   sourceTaskQueueTotalCount: number;
+  directoryBrowserState: {
+    mode: "open" | "create" | "export";
+    initialPath: string;
+    resolve: (path: string) => void;
+  } | null;
+  onDirectoryBrowserSelect: (path: string) => void;
+  onDirectoryBrowserCancel: () => void;
   pickRepositoryDirectory: (mode: "open" | "create" | "export", initialPath?: string) => Promise<string>;
   openRepository: (path: string) => Promise<boolean>;
   createRepository: (path: string) => Promise<boolean>;
@@ -192,7 +209,7 @@ function normalizeThinkMode(value: string): "default" | "think" | "no_think" {
   return "default";
 }
 
-function normalizeRepoSettingsDraft(settings: RepoSettings): RepoSettings {
+function normalizeAppSettingsDraft(settings: AppSettings): AppSettings {
   return {
     ...settings,
     llm_backend: {
@@ -276,8 +293,10 @@ export function AppStateProvider({ children }: PropsWithChildren) {
   const [repoLoaded, setRepoLoaded] = useState(false);
   const [repositoryStatus, setRepositoryStatus] = useState<RepositoryStatusResponse | null>(null);
   const [dashboard, setDashboard] = useState<RepositoryDashboardResponse | null>(null);
-  const [repoSettings, setRepoSettings] = useState<RepoSettings>(DEFAULT_SETTINGS);
-  const [settingsDraft, setSettingsDraft] = useState<RepoSettings>(DEFAULT_SETTINGS);
+  const [repoSettings, setRepoSettings] = useState<RepoSettings>(DEFAULT_REPO_SETTINGS);
+  const [settingsDraft, setSettingsDraft] = useState<RepoSettings>(DEFAULT_REPO_SETTINGS);
+  const [appSettings, setAppSettings] = useState<AppSettings>(DEFAULT_APP_SETTINGS);
+  const [appSettingsDraft, setAppSettingsDraft] = useState<AppSettings>(DEFAULT_APP_SETTINGS);
   const [sourceTaskDraft, setSourceTaskDraft] =
     useState<RepositorySourceTaskRequest>(DEFAULT_SOURCE_TASKS);
   const [models, setModels] = useState<string[]>([]);
@@ -291,6 +310,11 @@ export function AppStateProvider({ children }: PropsWithChildren) {
   const [selectedIngestionProfileId, setSelectedIngestionProfileId] = useState("");
   const [selectedReprocessImportIds, setSelectedReprocessImportIds] = useState<string[]>([]);
   const [lastRepositoryPath, setLastRepositoryPath] = useState("");
+  const [directoryBrowserState, setDirectoryBrowserState] = useState<{
+    mode: "open" | "create" | "export";
+    initialPath: string;
+    resolve: (path: string) => void;
+  } | null>(null);
 
   const [processingJobId, setProcessingJobId] = useState<string | null>(null);
   const [sourceTaskJobId, setSourceTaskJobId] = useState<string | null>(null);
@@ -391,9 +415,6 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       setSettingsDraft(settings);
       setSourceTaskDraft((prev) => ({
         ...prev,
-        run_catalog: Boolean(settings.use_llm) || prev.run_catalog,
-        run_citation_verify: Boolean(settings.use_llm) || prev.run_citation_verify,
-        run_llm_summary: Boolean(settings.use_llm),
         project_profile_name:
           settings.default_project_profile_name.trim() || prev.project_profile_name,
       }));
@@ -614,16 +635,21 @@ export function AppStateProvider({ children }: PropsWithChildren) {
   // On mount, check if the backend already has a repo attached (survives page refresh).
   useEffect(() => {
     let cancelled = false;
-    api
-      .getRepoStatus()
-      .then(async (status) => {
-        if (!cancelled && status.attached) {
-          await onRepoLoaded(status);
+    Promise.all([
+      api.getAppSettings().catch(() => null),
+      api.getRepoStatus().catch(() => null),
+    ])
+      .then(async ([appSettingsResult, statusResult]) => {
+        if (cancelled) return;
+        if (appSettingsResult) {
+          setAppSettings(appSettingsResult);
+          setAppSettingsDraft(appSettingsResult);
+        }
+        if (statusResult?.attached) {
+          await onRepoLoaded(statusResult);
         }
       })
-      .catch(() => {
-        // Backend not ready or no repo attached — show landing page.
-      })
+      .catch(() => {})
       .finally(() => {
         if (!cancelled) setInitializing(false);
       });
@@ -680,25 +706,28 @@ export function AppStateProvider({ children }: PropsWithChildren) {
   );
 
   const pickRepositoryDirectory = useCallback(
-    async (mode: "open" | "create" | "export", initialPath = ""): Promise<string> => {
-      setGateError("");
-      setRepoError("");
-      const seed = initialPath.trim() || lastRepositoryPath.trim();
-      try {
-        const result = await api.pickRepositoryDirectory(mode, seed);
-        return (result.path || "").trim();
-      } catch (error) {
-        const message = String((error as Error).message || "Folder picker unavailable");
-        if (repoLoaded) {
-          setRepoError(message);
-        } else {
-          setGateError(message);
-        }
-        return "";
-      }
+    (mode: "open" | "create" | "export", initialPath = ""): Promise<string> => {
+      return new Promise((resolve) => {
+        const seed = initialPath.trim() || lastRepositoryPath.trim();
+        setDirectoryBrowserState({ mode, initialPath: seed, resolve });
+      });
     },
-    [lastRepositoryPath, repoLoaded],
+    [lastRepositoryPath],
   );
+
+  const onDirectoryBrowserSelect = useCallback((path: string) => {
+    if (directoryBrowserState?.resolve) {
+      directoryBrowserState.resolve(path);
+    }
+    setDirectoryBrowserState(null);
+  }, [directoryBrowserState]);
+
+  const onDirectoryBrowserCancel = useCallback(() => {
+    if (directoryBrowserState?.resolve) {
+      directoryBrowserState.resolve("");
+    }
+    setDirectoryBrowserState(null);
+  }, [directoryBrowserState]);
 
   const switchRepository = useCallback(() => {
     setRepoLoaded(false);
@@ -717,8 +746,8 @@ export function AppStateProvider({ children }: PropsWithChildren) {
     setRepoError("");
     setGateError("");
     setGateMessage("");
-    setRepoSettings(DEFAULT_SETTINGS);
-    setSettingsDraft(DEFAULT_SETTINGS);
+    setRepoSettings(DEFAULT_REPO_SETTINGS);
+    setSettingsDraft(DEFAULT_REPO_SETTINGS);
     setSourceTaskDraft(DEFAULT_SOURCE_TASKS);
     resetJobScopedState();
   }, [resetJobScopedState]);
@@ -975,11 +1004,9 @@ export function AppStateProvider({ children }: PropsWithChildren) {
     setProcessingError("");
     setSourceError("");
     try {
-      const savedSettings = await api.saveRepoSettings(
-        normalizeRepoSettingsDraft(settingsDraft),
-      );
-      setRepoSettings(savedSettings);
-      setSettingsDraft(savedSettings);
+      const savedAppSettings = await api.saveAppSettings(normalizeAppSettingsDraft(appSettingsDraft));
+      setAppSettings(savedAppSettings);
+      setAppSettingsDraft(savedAppSettings);
       const response = await api.processRepositoryDocuments(files, selectedIngestionProfileId);
       setProcessingJobId(response.job_id);
       setHasSourceUrls(true);
@@ -999,7 +1026,7 @@ export function AppStateProvider({ children }: PropsWithChildren) {
     } catch (error) {
       setProcessingError(String((error as Error).message || "Failed to start extraction"));
     }
-  }, [files, refreshDashboard, selectedIngestionProfileId, settingsDraft]);
+  }, [appSettingsDraft, files, refreshDashboard, selectedIngestionProfileId]);
 
   const reprocessStoredDocuments = useCallback(async () => {
     if (selectedReprocessImportIds.length === 0) {
@@ -1010,11 +1037,9 @@ export function AppStateProvider({ children }: PropsWithChildren) {
     setProcessingError("");
     setSourceError("");
     try {
-      const savedSettings = await api.saveRepoSettings(
-        normalizeRepoSettingsDraft(settingsDraft),
-      );
-      setRepoSettings(savedSettings);
-      setSettingsDraft(savedSettings);
+      const savedAppSettings = await api.saveAppSettings(normalizeAppSettingsDraft(appSettingsDraft));
+      setAppSettings(savedAppSettings);
+      setAppSettingsDraft(savedAppSettings);
       const response = await api.reprocessRepositoryDocuments({
         target_import_ids: selectedReprocessImportIds,
         profile_override: selectedIngestionProfileId,
@@ -1031,7 +1056,7 @@ export function AppStateProvider({ children }: PropsWithChildren) {
     } catch (error) {
       setProcessingError(String((error as Error).message || "Failed to start reprocessing"));
     }
-  }, [refreshDashboard, selectedIngestionProfileId, selectedReprocessImportIds, settingsDraft]);
+  }, [appSettingsDraft, refreshDashboard, selectedIngestionProfileId, selectedReprocessImportIds]);
 
   const runSourceTasks = useCallback(
     async (rerunFailedOnly: boolean) => {
@@ -1181,7 +1206,7 @@ export function AppStateProvider({ children }: PropsWithChildren) {
     setSavingSettings(true);
     setRepoError("");
     try {
-      const payload = normalizeRepoSettingsDraft(nextSettings ?? settingsDraft);
+      const payload = nextSettings ?? settingsDraft;
       const saved = await api.saveRepoSettings(payload);
       setRepoSettings(saved);
       setSettingsDraft(saved);
@@ -1199,14 +1224,30 @@ export function AppStateProvider({ children }: PropsWithChildren) {
     }
   }, [refreshDashboard, repoLoaded, settingsDraft]);
 
+  const saveAppSettings = useCallback(async (nextSettings?: AppSettings) => {
+    setSavingSettings(true);
+    setRepoError("");
+    try {
+      const payload = normalizeAppSettingsDraft(nextSettings ?? appSettingsDraft);
+      const saved = await api.saveAppSettings(payload);
+      setAppSettings(saved);
+      setAppSettingsDraft(saved);
+      setRepoMessage("Settings saved.");
+    } catch (error) {
+      setRepoError(String((error as Error).message || "Failed to save settings"));
+    } finally {
+      setSavingSettings(false);
+    }
+  }, [appSettingsDraft]);
+
   const loadModels = useCallback(async () => {
     setLoadingModels(true);
     setRepoError("");
     try {
       const query = new URLSearchParams({
-        backend_kind: settingsDraft.llm_backend.kind,
-        base_url: settingsDraft.llm_backend.base_url,
-        api_key: settingsDraft.llm_backend.api_key,
+        backend_kind: appSettingsDraft.llm_backend.kind,
+        base_url: appSettingsDraft.llm_backend.base_url,
+        api_key: appSettingsDraft.llm_backend.api_key,
       });
       const response: ModelsResponse = await api.getModels(query);
       setModels(response.models || []);
@@ -1218,7 +1259,7 @@ export function AppStateProvider({ children }: PropsWithChildren) {
     } finally {
       setLoadingModels(false);
     }
-  }, [settingsDraft.llm_backend.api_key, settingsDraft.llm_backend.base_url, settingsDraft.llm_backend.kind]);
+  }, [appSettingsDraft.llm_backend.api_key, appSettingsDraft.llm_backend.base_url, appSettingsDraft.llm_backend.kind]);
 
   const uploadProfile = useCallback(
     async (file: File | null) => {
@@ -1384,19 +1425,6 @@ export function AppStateProvider({ children }: PropsWithChildren) {
     startSingleSourceTaskJob,
   ]);
 
-  useEffect(() => {
-    const loadLastRepoPath = async () => {
-      try {
-        const appSettings = await api.getAppSettings();
-        setLastRepositoryPath((appSettings.last_repository_path || "").trim());
-      } catch {
-        // Keep landing page visible and let user choose.
-      }
-    };
-    loadLastRepoPath().catch(() => {
-      // ignored
-    });
-  }, []);
 
   const warnings = useMemo(() => {
     const items: Array<{ type: "warning" | "error"; stage: string; message: string }> = [];
@@ -1428,6 +1456,10 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       repoSettings,
       settingsDraft,
       setSettingsDraft,
+      appSettings,
+      appSettingsDraft,
+      setAppSettingsDraft,
+      saveAppSettings,
       sourceTaskDraft,
       setSourceTaskDraft,
       processingJobId,
@@ -1461,6 +1493,9 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       sourceTaskQueueActiveLabel,
       sourceTaskQueueCompletedCount,
       sourceTaskQueueTotalCount,
+      directoryBrowserState,
+      onDirectoryBrowserSelect,
+      onDirectoryBrowserCancel,
       pickRepositoryDirectory,
       openRepository,
       createRepository,
@@ -1504,6 +1539,9 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       dashboard,
       repoSettings,
       settingsDraft,
+      appSettings,
+      appSettingsDraft,
+      saveAppSettings,
       sourceTaskDraft,
       processingJobId,
       sourceTaskJobId,
@@ -1534,6 +1572,9 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       sourceTaskQueueActiveLabel,
       sourceTaskQueueCompletedCount,
       sourceTaskQueueTotalCount,
+      directoryBrowserState,
+      onDirectoryBrowserSelect,
+      onDirectoryBrowserCancel,
       pickRepositoryDirectory,
       openRepository,
       createRepository,
@@ -1555,6 +1596,7 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       trackSourceTaskJob,
       cancelSourceTasks,
       saveRepoSettings,
+      saveAppSettings,
       loadModels,
       loadProfiles,
       loadDocumentImports,
@@ -1572,7 +1614,19 @@ export function AppStateProvider({ children }: PropsWithChildren) {
     ],
   );
 
-  return <AppStateContext.Provider value={value}>{children}</AppStateContext.Provider>;
+  return (
+    <AppStateContext.Provider value={value}>
+      {children}
+      {directoryBrowserState && (
+        <DirectoryBrowserModal
+          mode={directoryBrowserState.mode}
+          initialPath={directoryBrowserState.initialPath}
+          onSelect={onDirectoryBrowserSelect}
+          onCancel={onDirectoryBrowserCancel}
+        />
+      )}
+    </AppStateContext.Provider>
+  );
 }
 
 export function useAppState(): AppStateValue {

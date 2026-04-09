@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from backend.models.settings import LLMBackendConfig, RepoSettings
+from backend.models.settings import AppSettings, LLMBackendConfig, RepoSettings
 from backend.routers import agent, pipeline, repository, results, search, settings, sources, upload
 from backend.storage.attached_repository import AttachedRepositoryService
 from backend.storage.file_store import FileStore
@@ -24,6 +24,13 @@ def _migrate_old_settings(store: FileStore, raw: dict) -> None:
     """
     repo_path = (raw.get("repository_path") or "").strip()
 
+    # Parse LLM config early -- needed for AppSettings regardless of repo_path
+    llm_raw = raw.get("llm_backend", {})
+    try:
+        llm_config = LLMBackendConfig(**llm_raw)
+    except Exception:
+        llm_config = LLMBackendConfig()
+
     # Build RepoSettings from old fields and write into the repo if it exists
     if repo_path:
         resolved = Path(repo_path).expanduser().resolve()
@@ -31,18 +38,8 @@ def _migrate_old_settings(store: FileStore, raw: dict) -> None:
             internal = resolved / ".ra_repo"
             internal.mkdir(parents=True, exist_ok=True)
 
-            # Write repo settings
-            llm_raw = raw.get("llm_backend", {})
-            try:
-                llm_config = LLMBackendConfig(**llm_raw)
-            except Exception:
-                llm_config = LLMBackendConfig()
-
             repo_settings = RepoSettings(
-                llm_backend=llm_config,
-                use_llm=raw.get("use_llm", False),
                 research_purpose=raw.get("research_purpose", ""),
-                fetch_delay=raw.get("fetch_delay", 2.0),
             )
             settings_path = internal / "settings.json"
             if not settings_path.exists():
@@ -61,8 +58,16 @@ def _migrate_old_settings(store: FileStore, raw: dict) -> None:
             for copied_name in sorted(after - before):
                 logger.info("Copied profile %s to repo", copied_name)
 
-    store.delete_settings()
-    logger.info("Removed legacy app settings after repo-scoped migration")
+    # Persist infrastructure settings at the app level
+    app_settings = AppSettings(
+        last_repository_path=repo_path,
+        llm_backend=llm_config,
+        use_llm=raw.get("use_llm", False),
+        fetch_delay=raw.get("fetch_delay", 2.0),
+        searxng_base_url=raw.get("searxng_base_url", ""),
+    )
+    store.save_app_settings(app_settings)
+    logger.info("Migrated app-level settings to data/settings.json")
 
 
 def create_app() -> FastAPI:
@@ -84,9 +89,11 @@ def create_app() -> FastAPI:
     app.state.search_jobs_lock = threading.Lock()
 
     raw_settings = store.load_settings()
-    if raw_settings and "llm_backend" in raw_settings:
+    if raw_settings and "llm_backend" in raw_settings and "last_repository_path" not in raw_settings:
+        # Very old format: migrate to both per-repo and app-level settings
         _migrate_old_settings(store, raw_settings)
-    elif raw_settings:
+    elif raw_settings and not raw_settings.get("llm_backend"):
+        # Legacy format without LLM config — clean up
         store.delete_settings()
         logger.info("Removed persisted app settings; repository paths are no longer stored")
 

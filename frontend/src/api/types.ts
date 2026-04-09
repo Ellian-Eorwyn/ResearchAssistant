@@ -273,16 +273,29 @@ export interface LLMBackendConfig {
 }
 
 export interface RepoSettings {
-  llm_backend: LLMBackendConfig;
-  use_llm: boolean;
   research_purpose: string;
   default_project_profile_name: string;
-  fetch_delay: number;
-  searxng_base_url: string;
 }
 
 export interface AppSettings {
   last_repository_path: string;
+  llm_backend: LLMBackendConfig;
+  use_llm: boolean;
+  searxng_base_url: string;
+  fetch_delay: number;
+}
+
+export interface DirectoryEntry {
+  name: string;
+  path: string;
+  is_ra_repo: boolean;
+}
+
+export interface DirectoryListingResponse {
+  current_path: string;
+  parent_path: string;
+  entries: DirectoryEntry[];
+  error: string;
 }
 
 export interface ModelsResponse {

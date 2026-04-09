@@ -1,5 +1,6 @@
 import type {
   AppSettings,
+  DirectoryListingResponse,
   IngestionProfile,
   IngestionProfileActionResponse,
   IngestionProfileListResponse,
@@ -158,6 +159,12 @@ async function apiPostFiles<T>(path: string, files: File[], fieldName = "files")
 
 export const api = {
   getAppSettings: () => apiGet<AppSettings>("settings"),
+  saveAppSettings: (settings: Partial<AppSettings>) =>
+    apiPut<AppSettings>("settings", settings),
+  browseDirectory: (path: string, showHidden = false) =>
+    apiGet<DirectoryListingResponse>(
+      `repository/browse-directory?path=${encodeURIComponent(path)}&show_hidden=${showHidden}`,
+    ),
   getRepoStatus: () => apiGet<RepositoryStatusResponse>("repository/status"),
   createRepository: (path: string) =>
     apiPost<RepositoryStatusResponse>("repository/create", { path }),

@@ -143,6 +143,60 @@ def _pick_directory_dialog_macos(title: str, initialdir: str) -> str:
     return str(result.stdout or "").strip()
 
 
+# ---- Browse directories (web-based picker) ----
+
+@router.get("/repository/browse-directory")
+async def browse_directory(
+    path: str = Query(""),
+    show_hidden: bool = Query(False),
+) -> dict:
+    """List subdirectories at *path* for the web-based folder browser."""
+    from pathlib import Path as _Path
+
+    target = (path or "").strip()
+    if not target:
+        target = os.path.expanduser("~")
+    resolved = _Path(target).resolve()
+
+    if not resolved.is_dir():
+        return {
+            "current_path": str(resolved),
+            "parent_path": str(resolved.parent),
+            "entries": [],
+            "error": f"Not a directory: {resolved}",
+        }
+
+    entries: list[dict] = []
+    try:
+        for item in sorted(resolved.iterdir(), key=lambda p: p.name.lower()):
+            if not item.is_dir():
+                continue
+            if not show_hidden and item.name.startswith("."):
+                continue
+            entries.append({
+                "name": item.name,
+                "path": str(item),
+                "is_ra_repo": (item / ".ra_repo").is_dir(),
+            })
+    except PermissionError:
+        return {
+            "current_path": str(resolved),
+            "parent_path": str(resolved.parent),
+            "entries": [],
+            "error": f"Permission denied: {resolved}",
+        }
+
+    # Sort: .ra_repo directories first, then alphabetical
+    entries.sort(key=lambda e: (not e["is_ra_repo"], e["name"].lower()))
+
+    return {
+        "current_path": str(resolved),
+        "parent_path": str(resolved.parent) if resolved.parent != resolved else "",
+        "entries": entries,
+        "error": "",
+    }
+
+
 # ---- Create / Open ----
 
 @router.post("/repository/create", response_model=RepositoryStatusResponse)
@@ -506,7 +560,7 @@ async def process_repository_documents(
     profile_override: str = Form(default=""),
 ) -> RepositoryProcessDocumentsResponse:
     service = request.app.state.repository_service
-    settings = service.load_repo_settings()
+    settings = service.load_effective_settings()
 
     prepared_files: list[tuple[str, bytes]] = []
     for file in files:
@@ -531,7 +585,7 @@ async def reprocess_repository_documents(
     payload: RepositoryReprocessDocumentsRequest,
 ) -> RepositoryReprocessDocumentsResponse:
     service = request.app.state.repository_service
-    settings = service.load_repo_settings()
+    settings = service.load_effective_settings()
     try:
         return service.reprocess_documents(
             target_import_ids=payload.target_import_ids,
@@ -547,7 +601,7 @@ async def reprocess_repository_documents(
 @router.post("/repository/download", response_model=RepositoryActionResponse)
 async def start_repository_download(request: Request) -> RepositoryActionResponse:
     service = request.app.state.repository_service
-    settings = service.load_repo_settings()
+    settings = service.load_effective_settings()
     try:
         return service.start_download(settings=settings)
     except ValueError as exc:
@@ -587,7 +641,7 @@ async def run_repository_source_tasks(
     payload: RepositorySourceTaskRequest,
 ) -> RepositorySourceTaskResponse:
     service = request.app.state.repository_service
-    settings = service.load_repo_settings()
+    settings = service.load_effective_settings()
     jobs = request.app.state.source_download_jobs
     jobs_lock = request.app.state.source_download_lock
     try:

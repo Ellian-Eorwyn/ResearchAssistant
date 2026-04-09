@@ -12,10 +12,12 @@ router = APIRouter()
 
 @router.get("/settings", response_model=AppSettings)
 async def get_settings(request: Request) -> AppSettings:
+    store = request.app.state.file_store
     service = request.app.state.repository_service
+    settings = store.load_app_settings()
     if service.is_attached:
-        return AppSettings(last_repository_path=str(service.path))
-    return AppSettings()
+        settings.last_repository_path = str(service.path)
+    return settings
 
 
 @router.put("/settings", response_model=AppSettings)
@@ -23,10 +25,14 @@ async def save_settings(
     request: Request,
     payload: dict = Body(...),
 ) -> AppSettings:
+    store = request.app.state.file_store
     service = request.app.state.repository_service
+    current = store.load_app_settings()
+    merged = current.model_copy(update=payload)
     if service.is_attached:
-        return AppSettings(last_repository_path=str(service.path))
-    return AppSettings(**(payload or {}))
+        merged.last_repository_path = str(service.path)
+    store.save_app_settings(merged)
+    return merged
 
 
 @router.get("/models", response_model=ModelsResponse)
