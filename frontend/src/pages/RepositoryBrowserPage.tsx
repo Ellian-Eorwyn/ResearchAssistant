@@ -354,6 +354,7 @@ function createSourceDetailsDraft(row: RepositoryManifestRow): SourceDetailsDraf
 function buildSourcePatch(
   row: RepositoryManifestRow | null,
   draft: SourceDetailsDraft | null,
+  baseline: SourceDetailsDraft | null,
 ): RepositorySourcePatchRequest | null {
   if (!row || !draft) return null;
   const patch: RepositorySourcePatchRequest = {};
@@ -387,6 +388,7 @@ function buildSourcePatch(
 
   textFields.forEach((field) => {
     const nextValue = draft[field];
+    if (baseline && nextValue === baseline[field]) return;
     const currentValue = String((row as Record<string, unknown>)[field] || "");
     if (nextValue !== currentValue) {
       (patch as Record<string, unknown>)[field] = nextValue;
@@ -411,6 +413,7 @@ function buildSourcePatch(
   numericFields.forEach(({ draftKey, rowKey }) => {
     const nextValue = parseScoreDraft(draft[draftKey]);
     if (nextValue === undefined) return;
+    if (baseline && draft[draftKey] === baseline[draftKey]) return;
     const currentRaw = row[rowKey];
     const currentValue =
       currentRaw === null || currentRaw === undefined || currentRaw === ""
@@ -424,6 +427,7 @@ function buildSourcePatch(
   const changedCitationOverrideFields: string[] = [];
   CITATION_EDIT_FIELDS.forEach(({ draftKey, rowKey, overrideField }) => {
     const nextValue = draft[draftKey];
+    if (baseline && nextValue === (baseline as Record<string, unknown>)[draftKey]) return;
     const currentValue = String(row[rowKey] || "");
     if (nextValue !== currentValue) {
       (patch as Record<string, unknown>)[draftKey] = nextValue;
@@ -2132,6 +2136,7 @@ export function RepositoryBrowserPage() {
   const [repositoryExportPending, setRepositoryExportPending] = useState(false);
   const [activeRowId, setActiveRowId] = useState<string | null>(null);
   const [detailDraft, setDetailDraft] = useState<SourceDetailsDraft | null>(null);
+  const [detailBaseline, setDetailBaseline] = useState<SourceDetailsDraft | null>(null);
   const [detailSaveState, setDetailSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [detailSaveError, setDetailSaveError] = useState("");
   const [detailPaneWidth, setDetailPaneWidth] = useState(REPOSITORY_BROWSER_DETAILS_PANE_DEFAULT_WIDTH);
@@ -2375,6 +2380,7 @@ export function RepositoryBrowserPage() {
     setLastAnchorId(null);
     setActiveRowId(null);
     setDetailDraft(null);
+    setDetailBaseline(null);
     setActionMessage("");
     setActionError("");
     setColumnPromptDraft(null);
@@ -2424,10 +2430,12 @@ export function RepositoryBrowserPage() {
   useEffect(() => {
     if (!activeRowId) {
       setDetailDraft(null);
+      setDetailBaseline(null);
       setDetailSaveState("idle");
       setDetailSaveError("");
     } else {
       setDetailDraft(null);
+      setDetailBaseline(null);
       setDetailSaveState("idle");
       setDetailSaveError("");
     }
@@ -2435,7 +2443,9 @@ export function RepositoryBrowserPage() {
 
   useEffect(() => {
     if (!activeRow || detailDraft) return;
-    setDetailDraft(createSourceDetailsDraft(activeRow));
+    const draft = createSourceDetailsDraft(activeRow);
+    setDetailDraft(draft);
+    setDetailBaseline(draft);
   }, [activeRow, detailDraft]);
 
   useEffect(() => {
@@ -2445,8 +2455,8 @@ export function RepositoryBrowserPage() {
   }, [activeRowId, rows]);
 
   const detailPatch = useMemo(
-    () => buildSourcePatch(activeRow, detailDraft),
-    [activeRow, detailDraft],
+    () => buildSourcePatch(activeRow, detailDraft, detailBaseline),
+    [activeRow, detailDraft, detailBaseline],
   );
 
   const persistSourceDetailsPatch = async (
@@ -2477,7 +2487,9 @@ export function RepositoryBrowserPage() {
       try {
         const updatedRow = await persistSourceDetailsPatch(activeRowIdSnapshot, detailPatch);
         if (updatedRow.id === activeRowIdSnapshot) {
-          setDetailDraft(createSourceDetailsDraft(updatedRow));
+          const newDraft = createSourceDetailsDraft(updatedRow);
+          setDetailDraft(newDraft);
+          setDetailBaseline(newDraft);
         }
         setDetailSaveState("saved");
         setDetailSaveError("");
@@ -2497,7 +2509,9 @@ export function RepositoryBrowserPage() {
     try {
       const updatedRow = await persistSourceDetailsPatch(activeRow.id, detailPatch);
       if (updatedRow.id === activeRow.id) {
-        setDetailDraft(createSourceDetailsDraft(updatedRow));
+        const newDraft = createSourceDetailsDraft(updatedRow);
+        setDetailDraft(newDraft);
+        setDetailBaseline(newDraft);
       }
       setDetailSaveState("saved");
       setDetailSaveError("");
@@ -3333,6 +3347,7 @@ export function RepositoryBrowserPage() {
       const response = await api.bulkMarkRepositorySourcesRisReady(ids);
       if (activeRowId && ids.includes(activeRowId)) {
         setDetailDraft(null);
+        setDetailBaseline(null);
         setDetailSaveState("idle");
         setDetailSaveError("");
       }
