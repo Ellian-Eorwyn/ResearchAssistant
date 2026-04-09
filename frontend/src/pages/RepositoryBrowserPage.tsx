@@ -427,7 +427,7 @@ function buildSourcePatch(
   const changedCitationOverrideFields: string[] = [];
   CITATION_EDIT_FIELDS.forEach(({ draftKey, rowKey, overrideField }) => {
     const nextValue = draft[draftKey];
-    if (baseline && nextValue === (baseline as Record<string, unknown>)[draftKey]) return;
+    if (baseline && nextValue === baseline[draftKey]) return;
     const currentValue = String(row[rowKey] || "");
     if (nextValue !== currentValue) {
       (patch as Record<string, unknown>)[draftKey] = nextValue;
