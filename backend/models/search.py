@@ -10,6 +10,28 @@ from pydantic import BaseModel, Field
 class SearchRequest(BaseModel):
     prompt: str
     target_count: int = Field(default=200, ge=50, le=500)
+    categories: list[str] = Field(default_factory=list)
+    language: str = ""
+    time_range: Literal["", "day", "month", "year"] = ""
+
+
+class SearchLanguageOption(BaseModel):
+    value: str = ""
+    label: str = ""
+
+
+class SearchOptionsDefaults(BaseModel):
+    categories: list[str] = Field(default_factory=lambda: ["general"])
+    language: str = "auto"
+    time_range: Literal["", "day", "month", "year"] = ""
+
+
+class SearchOptionsResponse(BaseModel):
+    categories: list[str] = Field(default_factory=list)
+    languages: list[SearchLanguageOption] = Field(default_factory=list)
+    time_ranges: list[Literal["day", "month", "year"]] = Field(default_factory=list)
+    supports_oa_doi_helper: bool = False
+    defaults: SearchOptionsDefaults = Field(default_factory=SearchOptionsDefaults)
 
 
 class SearchResultItem(BaseModel):
@@ -18,6 +40,10 @@ class SearchResultItem(BaseModel):
     snippet: str = ""
     engine: str = ""
     engines: list[str] = Field(default_factory=list)
+    authors: list[str] = Field(default_factory=list)
+    doi: str = ""
+    html_url: str = ""
+    pdf_url: str = ""
     searxng_score: float = 0.0
     category: str = ""
     published_date: str = ""
@@ -36,6 +62,9 @@ class SearchJobStatus(BaseModel):
         "failed",
     ] = "pending"
     prompt: str = ""
+    categories: list[str] = Field(default_factory=list)
+    language: str = ""
+    time_range: Literal["", "day", "month", "year"] = ""
     generated_queries: list[str] = Field(default_factory=list)
     queries_completed: int = 0
     total_queries: int = 0

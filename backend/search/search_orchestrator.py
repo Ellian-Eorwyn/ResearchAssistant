@@ -45,6 +45,9 @@ class SearchOrchestrator:
         searxng_base_url: str,
         llm_config: LLMBackendConfig,
         target_count: int = 200,
+        categories: list[str] | None = None,
+        language: str = "",
+        time_range: str = "",
     ) -> None:
         self.job_id = job_id
         self.prompt = prompt
@@ -52,8 +55,17 @@ class SearchOrchestrator:
         self.searxng_base_url = searxng_base_url
         self.llm_config = llm_config
         self.target_count = target_count
+        self.categories = [str(value).strip() for value in (categories or []) if str(value).strip()]
+        self.language = str(language or "").strip()
+        self.time_range = str(time_range or "").strip()
 
-        self.status = SearchJobStatus(job_id=job_id, prompt=prompt)
+        self.status = SearchJobStatus(
+            job_id=job_id,
+            prompt=prompt,
+            categories=list(self.categories),
+            language=self.language,
+            time_range=self.time_range,
+        )
         self._cancel_requested = False
 
     def cancel(self) -> None:
@@ -103,6 +115,17 @@ class SearchOrchestrator:
             search_prompt=self.prompt,
             query_count=query_count,
         )
+        filter_context: list[str] = []
+        if self.categories:
+            filter_context.append(
+                f"Preferred search categories: {', '.join(self.categories)}."
+            )
+        if self.language:
+            filter_context.append(f"Preferred search language: {self.language}.")
+        if self.time_range:
+            filter_context.append(f"Preferred time range: {self.time_range}.")
+        if filter_context:
+            user_prompt = f"{user_prompt}\n\nSearch filters:\n" + "\n".join(filter_context)
 
         raw = llm.sync_chat_completion(
             SEARCH_QUERY_GENERATION_SYSTEM, user_prompt, response_format="json"
@@ -147,6 +170,9 @@ class SearchOrchestrator:
                     query,
                     target_results=target_per_query,
                     max_pages=pages_per_query,
+                    categories=self.categories,
+                    language=self.language,
+                    time_range=self.time_range,
                 )
             except Exception as exc:
                 logger.warning("Search query %r failed: %s", query, exc)
@@ -169,6 +195,10 @@ class SearchOrchestrator:
                         snippet=(r.get("content") or "").strip(),
                         engine=str(r.get("engine") or ""),
                         engines=r.get("engines") or [],
+                        authors=r.get("authors") or [],
+                        doi=str(r.get("doi") or ""),
+                        html_url=str(r.get("html_url") or ""),
+                        pdf_url=str(r.get("pdf_url") or ""),
                         searxng_score=score,
                         category=str(r.get("category") or ""),
                         published_date=str(r.get("published_date") or ""),

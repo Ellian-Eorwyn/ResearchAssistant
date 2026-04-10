@@ -275,6 +275,7 @@ async def start_source_download(
         use_llm=settings.use_llm,
         llm_backend=settings.llm_backend,
         research_purpose=settings.research_purpose,
+        searxng_base_url=settings.searxng_base_url,
         fetch_delay=settings.fetch_delay,
         run_download=run_download,
         run_convert=run_convert,

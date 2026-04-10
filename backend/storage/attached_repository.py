@@ -5868,6 +5868,7 @@ class AttachedRepositoryService:
                 use_llm=repo_settings.use_llm,
                 llm_backend=repo_settings.llm_backend,
                 research_purpose=repo_settings.research_purpose,
+                searxng_base_url=repo_settings.searxng_base_url,
                 fetch_delay=repo_settings.fetch_delay,
                 run_download=run_download,
                 run_convert=run_convert,
@@ -7047,6 +7048,32 @@ class AttachedRepositoryService:
         )
         row.metadata_file = metadata_rel.as_posix()
 
+    def _apply_seed_entry_hints(
+        self,
+        row: SourceManifestRow,
+        entry: BibliographyEntry,
+    ) -> None:
+        title = str(entry.title or "").strip()
+        if title and not str(row.title or "").strip():
+            row.title = title
+            row.title_status = row.title_status or "existing"
+
+        author_names = "; ".join(
+            str(author or "").strip()
+            for author in entry.authors
+            if str(author or "").strip()
+        )
+        if author_names and not str(row.author_names or "").strip():
+            row.author_names = author_names
+
+        publication_year = str(entry.year or "").strip()
+        if publication_year and not str(row.publication_year or "").strip():
+            row.publication_year = publication_year
+
+        doi = str(entry.doi or "").strip()
+        if doi and not str(row.seed_doi or "").strip():
+            row.seed_doi = doi
+
     def _normalize_repository_source_storage_locked(
         self,
         rows: list[SourceManifestRow],
@@ -7404,6 +7431,7 @@ class AttachedRepositoryService:
                 use_llm=settings.use_llm,
                 llm_backend=settings.llm_backend,
                 research_purpose=settings.research_purpose,
+                searxng_base_url=settings.searxng_base_url,
             )
             orchestrator.run()
 
@@ -7570,8 +7598,7 @@ class AttachedRepositoryService:
                 if existing:
                     duplicates += 1
                     touched_source_ids.append(existing.id)
-                    if not existing.title and entry.title:
-                        existing.title = entry.title
+                    self._apply_seed_entry_hints(existing, entry)
                     if write_placeholder_citations:
                         citations.append(
                             self._placeholder_citation_row(
@@ -7598,10 +7625,10 @@ class AttachedRepositoryService:
                     source_document_name=entry.source_document_name or default_source_document,
                     citation_number=str(entry.ref_number or ""),
                     original_url=url,
-                    title=entry.title,
                     fetch_status="queued",
                     notes="queued_for_download",
                 )
+                self._apply_seed_entry_hints(row, entry)
                 rows.append(row)
                 by_key[dedupe_key] = row
                 accepted_new += 1

@@ -40,6 +40,7 @@ class SourceManifestRow(BaseModel):
     author_names: str = ""
     publication_date: str = ""
     publication_year: str = ""
+    seed_doi: str = ""
     document_type: str = ""
     organization_name: str = ""
     organization_type: str = ""

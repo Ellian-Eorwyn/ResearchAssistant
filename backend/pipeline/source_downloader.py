@@ -56,6 +56,7 @@ from backend.models.sources import (
     SourcePhaseMetadata,
 )
 from backend.pipeline.standardized_markdown import extract_markdown_title_candidate
+from backend.search.searxng_client import SearXNGClient
 from backend.storage.file_store import FileStore
 
 try:
@@ -615,6 +616,7 @@ class SourceDownloadOrchestrator:
         use_llm: bool = False,
         llm_backend: LLMBackendConfig | None = None,
         research_purpose: str = "",
+        searxng_base_url: str = "",
         fetch_delay: float = 2.0,
         run_download: bool = True,
         run_convert: bool = False,
@@ -650,6 +652,7 @@ class SourceDownloadOrchestrator:
         self.use_llm = use_llm
         self.llm_backend = llm_backend or LLMBackendConfig()
         self.research_purpose = (research_purpose or "").strip()
+        self.searxng_base_url = str(searxng_base_url or "").strip()
         self.fetch_delay = max(1.0, min(10.0, fetch_delay))
         self.force_redownload = bool(force_redownload)
         self.force_convert = bool(force_convert)
@@ -2619,7 +2622,15 @@ class SourceDownloadOrchestrator:
         doi_citation = CitationMetadata()
         if current_citation.doi:
             doi_citation = _resolve_doi_citation_metadata(current_citation.doi)
+            doi_citation = _apply_oa_citation_helper(
+                doi_citation,
+                _resolve_searxng_oa_citation_metadata(
+                    current_citation.doi,
+                    self.searxng_base_url,
+                ),
+            )
             current_citation = _merge_citation_metadata(current_citation, doi_citation)
+            current_citation = _apply_oa_citation_helper(current_citation, doi_citation)
         current_citation = _merge_row_citation_defaults(
             current_citation,
             row,
@@ -2732,7 +2743,15 @@ class SourceDownloadOrchestrator:
         doi_citation = CitationMetadata()
         if current_citation.doi:
             doi_citation = _resolve_doi_citation_metadata(current_citation.doi)
+            doi_citation = _apply_oa_citation_helper(
+                doi_citation,
+                _resolve_searxng_oa_citation_metadata(
+                    current_citation.doi,
+                    self.searxng_base_url,
+                ),
+            )
             current_citation = _merge_citation_metadata(current_citation, doi_citation)
+            current_citation = _apply_oa_citation_helper(current_citation, doi_citation)
         current_citation = _merge_row_citation_defaults(
             current_citation,
             row,
@@ -4906,6 +4925,16 @@ def _extract_doi_from_text_sources(*values: str) -> str:
     return ""
 
 
+def _normalized_author_names_text(value: str) -> str:
+    if not str(value or "").strip():
+        return ""
+    return "; ".join(
+        _dedupe_strings(
+            [item.strip() for item in re.split(r"[;|,]", str(value or "")) if item.strip()]
+        )
+    )
+
+
 def _build_citation_metadata(
     *,
     row: SourceManifestRow,
@@ -4933,7 +4962,8 @@ def _build_citation_metadata(
         volume=html_payload.volume,
         issue=html_payload.issue,
         pages=html_payload.pages,
-        doi=html_payload.doi or _extract_doi_from_text_sources(base_url, row.notes, row.title),
+        doi=html_payload.doi
+        or _extract_doi_from_text_sources(row.seed_doi, base_url, row.notes, row.title),
         url=html_payload.url or base_url,
         report_number=html_payload.report_number or _first_pattern_match(REPORT_NUMBER_PATTERN, title),
         standard_number=html_payload.standard_number or _first_pattern_match(STANDARD_NUMBER_PATTERN, title),
@@ -5088,6 +5118,132 @@ def _resolve_doi_citation_metadata(doi: str) -> CitationMetadata:
         if candidate.ready_for_ris or candidate.confidence >= 0.85:
             return candidate
     return CitationMetadata(doi=cleaned)
+
+
+def _citation_url_uses_doi_resolver(url: str) -> bool:
+    candidate = clean_url_candidate(url)
+    if not candidate:
+        return False
+    try:
+        host = (urlsplit(candidate).hostname or "").lower()
+    except Exception:
+        return False
+    return host in {
+        "doi.org",
+        "dx.doi.org",
+        "www.doi.org",
+        "oadoi.org",
+        "api.crossref.org",
+        "api.datacite.org",
+    }
+
+
+def _result_matches_doi(doi: str, result: dict[str, Any]) -> bool:
+    cleaned = _clean_doi_candidate(doi)
+    if not cleaned:
+        return False
+    if _clean_doi_candidate(_stringify_manifest_value(result.get("doi"))) == cleaned:
+        return True
+    needle = cleaned.lower()
+    for key in ("url", "html_url", "pdf_url"):
+        value = unquote(_stringify_manifest_value(result.get(key))).lower()
+        if needle in value:
+            return True
+    return False
+
+
+def _is_pdf_like_url(url: str) -> bool:
+    candidate = clean_url_candidate(url).lower()
+    return candidate.endswith(".pdf")
+
+
+def _select_best_searxng_result_url(result: dict[str, Any]) -> str:
+    html_url = clean_url_candidate(_stringify_manifest_value(result.get("html_url")))
+    direct_url = clean_url_candidate(_stringify_manifest_value(result.get("url")))
+    pdf_url = clean_url_candidate(_stringify_manifest_value(result.get("pdf_url")))
+    candidates = [
+        html_url,
+        direct_url if direct_url and not _citation_url_uses_doi_resolver(direct_url) and not _is_pdf_like_url(direct_url) else "",
+        pdf_url,
+        direct_url if direct_url and not _citation_url_uses_doi_resolver(direct_url) else "",
+    ]
+    for candidate in candidates:
+        if candidate:
+            return candidate
+    return ""
+
+
+def _resolve_searxng_oa_citation_metadata(
+    doi: str,
+    searxng_base_url: str,
+) -> CitationMetadata:
+    cleaned = _clean_doi_candidate(doi)
+    base_url = str(searxng_base_url or "").strip()
+    if not cleaned or not base_url:
+        return CitationMetadata(doi=cleaned)
+
+    client = SearXNGClient(base_url)
+    try:
+        config = client.get_config()
+        available_categories = set(config.get("categories") or [])
+        categories = [
+            category
+            for category in ("science", "scientific publications")
+            if category in available_categories
+        ] or ["science"]
+        enabled_plugins = ["oa_doi_rewrite"] if "oa_doi_rewrite" in set(config.get("plugins") or []) else []
+        results = client.search_paginated(
+            cleaned,
+            target_results=10,
+            max_pages=1,
+            categories=categories,
+            enabled_plugins=enabled_plugins,
+        )
+    except Exception as exc:
+        logger.debug("SearXNG OA DOI helper failed for %s: %s", cleaned, exc)
+        return CitationMetadata(doi=cleaned)
+    finally:
+        client.close()
+
+    for result in results:
+        if not _result_matches_doi(cleaned, result):
+            continue
+        candidate_url = _select_best_searxng_result_url(result)
+        if not candidate_url:
+            continue
+        evidence = _dedupe_strings(
+            [
+                _stringify_manifest_value(result.get("title")),
+                _stringify_manifest_value(result.get("engine")),
+                candidate_url,
+                cleaned,
+            ]
+        )[:8]
+        return CitationMetadata(
+            doi=cleaned,
+            url=candidate_url,
+            evidence=evidence,
+        )
+
+    return CitationMetadata(doi=cleaned)
+
+
+def _apply_oa_citation_helper(
+    citation: CitationMetadata,
+    helper: CitationMetadata,
+) -> CitationMetadata:
+    if not helper.url and not helper.evidence:
+        return citation
+
+    updated = citation.model_copy(deep=True)
+    helper_url = clean_url_candidate(helper.url)
+    if helper_url and (
+        not clean_url_candidate(updated.url)
+        or _citation_url_uses_doi_resolver(updated.url)
+    ):
+        updated.url = helper_url
+    updated.evidence = _dedupe_strings([*updated.evidence, *helper.evidence])
+    return _finalize_citation_metadata(updated)
 
 
 def _citation_from_agency_payload(doi: str, payload: Any) -> CitationMetadata:
@@ -5481,10 +5637,17 @@ def _build_deterministic_catalog_metadata(
 ) -> dict[str, Any]:
     front_matter = _parse_markdown_front_matter(markdown_text)
     lines = [line.strip() for line in markdown_text.splitlines() if line.strip()]
-    title_candidate = extract_markdown_title_candidate(markdown_text) or _stringify_manifest_value(
-        front_matter.get("title")
+    html_metadata = extract_html_citation_metadata(html_text, base_url=row.original_url or row.final_url)
+    title_candidate = (
+        extract_markdown_title_candidate(markdown_text)
+        or _stringify_manifest_value(front_matter.get("title"))
+        or _stringify_manifest_value(row.title)
     )
     author_names = _front_matter_list(front_matter, ("authors", "author", "byline"))
+    if html_metadata.get("authors") and not author_names:
+        author_names = _citation_author_names(_normalize_citation_payload(html_metadata))
+    if not author_names:
+        author_names = _normalized_author_names_text(row.author_names)
     if not author_names:
         author_names = _extract_byline_authors(lines[:10])
 
@@ -5492,6 +5655,12 @@ def _build_deterministic_catalog_metadata(
         front_matter,
         ("date", "published", "publication_date", "updated"),
     )
+    if html_metadata.get("issued") and not publication_date:
+        publication_date = _normalize_date_string(
+            _stringify_manifest_value(html_metadata.get("issued"))
+        )
+    if not publication_date:
+        publication_date = _normalize_date_string(_stringify_manifest_value(row.publication_date))
     if not publication_date:
         publication_date = _extract_publication_date(lines[:30])
 
@@ -5501,23 +5670,22 @@ def _build_deterministic_catalog_metadata(
         if match:
             publication_year = match.group(0)
     if not publication_year:
+        publication_year = _stringify_manifest_value(row.publication_year)
+    if not publication_year:
         publication_year = _extract_publication_year(markdown_text)
 
     organization_name = _front_matter_scalar(
         front_matter,
         ("organization", "publisher", "site_name", "institution", "company"),
     )
+    if html_metadata.get("publisher") and not organization_name:
+        organization_name = _stringify_manifest_value(html_metadata.get("publisher"))
+    if not organization_name:
+        organization_name = _stringify_manifest_value(row.organization_name)
     if not organization_name:
         organization_name = _organization_name_from_url(row.original_url or row.final_url)
 
     document_type = _infer_document_type(row=row, markdown_text=markdown_text)
-    html_metadata = extract_html_citation_metadata(html_text, base_url=row.original_url or row.final_url)
-    if html_metadata.get("authors") and not author_names:
-        author_names = _citation_author_names(_normalize_citation_payload(html_metadata))
-    if html_metadata.get("issued") and not publication_date:
-        publication_date = _normalize_date_string(_stringify_manifest_value(html_metadata.get("issued")))
-    if html_metadata.get("publisher") and not organization_name:
-        organization_name = _stringify_manifest_value(html_metadata.get("publisher"))
     if html_metadata.get("item_type"):
         document_type = _normalize_citation_type(
             _stringify_manifest_value(html_metadata.get("item_type")),
@@ -5549,6 +5717,11 @@ def _build_deterministic_catalog_metadata(
             _stringify_manifest_value(front_matter.get("title")),
             _stringify_manifest_value(front_matter.get("authors")),
             _stringify_manifest_value(front_matter.get("date")),
+            _stringify_manifest_value(row.title),
+            _stringify_manifest_value(row.author_names),
+            _stringify_manifest_value(row.publication_date),
+            _stringify_manifest_value(row.publication_year),
+            _stringify_manifest_value(row.seed_doi),
             *(html_metadata.get("evidence") or []),
             *(lines[:3]),
         ]

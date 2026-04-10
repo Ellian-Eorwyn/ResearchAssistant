@@ -1,9 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { api } from "../api/client";
-import type { SearchJobStatus, SearchImportResponse } from "../api/types";
-import { Button, SectionHeader, SurfaceCard, TextAreaField } from "../components/primitives";
+import type { SearchJobStatus, SearchImportResponse, SearchOptionsResponse } from "../api/types";
+import { Button, SectionHeader, SelectField, SurfaceCard, TextAreaField } from "../components/primitives";
 import { useAppState } from "../state/AppState";
+import {
+  buildSearchResultMetaTokens,
+  buildSearchStartPayload,
+  createFallbackSearchOptions,
+  CURATED_SEARCH_CATEGORIES,
+  formatSearchCategoryLabel,
+  toggleSearchCategory,
+} from "./searchPageUtils";
 
 const POLL_INTERVAL_MS = 2000;
 const DEFAULT_TARGET_COUNT = 200;
@@ -36,16 +44,24 @@ function stateLabel(state: SearchJobStatus["state"]): string {
 
 export function SearchPage() {
   const { appSettings } = useAppState();
+  const fallbackOptions = useMemo(() => createFallbackSearchOptions(), []);
 
   const [prompt, setPrompt] = useState("");
   const [targetCount, setTargetCount] = useState(DEFAULT_TARGET_COUNT);
   const [jobId, setJobId] = useState<string | null>(null);
   const [status, setStatus] = useState<SearchJobStatus | null>(null);
+  const [searchOptions, setSearchOptions] = useState<SearchOptionsResponse | null>(null);
+  const [selectedCategories, setSelectedCategories] = useState<string[]>(["general"]);
+  const [language, setLanguage] = useState("");
+  const [timeRange, setTimeRange] = useState<"" | "day" | "month" | "year">("");
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const [threshold, setThreshold] = useState(DEFAULT_THRESHOLD);
   const [importResult, setImportResult] = useState<SearchImportResponse | null>(null);
   const [importing, setImporting] = useState(false);
+  const [optionsError, setOptionsError] = useState("");
   const [error, setError] = useState("");
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const initializedFiltersRef = useRef(false);
 
   const isActive =
     status != null &&
@@ -80,13 +96,65 @@ export function SearchPage() {
     return stopPolling;
   }, [jobId, isActive, stopPolling]);
 
+  useEffect(() => {
+    if (!appSettings.searxng_base_url) {
+      setSearchOptions(null);
+      setOptionsError("");
+      return;
+    }
+
+    let cancelled = false;
+    const loadOptions = async () => {
+      try {
+        const nextOptions = await api.getSearchOptions();
+        if (cancelled) return;
+        setSearchOptions(nextOptions);
+        setOptionsError("");
+        if (!initializedFiltersRef.current) {
+          setSelectedCategories(
+            nextOptions.defaults.categories.length
+              ? nextOptions.defaults.categories
+              : fallbackOptions.defaults.categories,
+          );
+          setLanguage(nextOptions.defaults.language || "");
+          setTimeRange(nextOptions.defaults.time_range || "");
+          initializedFiltersRef.current = true;
+        }
+      } catch (err) {
+        if (cancelled) return;
+        setSearchOptions(null);
+        setOptionsError(err instanceof Error ? err.message : String(err));
+        if (!initializedFiltersRef.current) {
+          setSelectedCategories(fallbackOptions.defaults.categories);
+          setLanguage(fallbackOptions.defaults.language);
+          setTimeRange(fallbackOptions.defaults.time_range);
+          initializedFiltersRef.current = true;
+        }
+      }
+    };
+
+    void loadOptions();
+    return () => {
+      cancelled = true;
+    };
+  }, [appSettings.searxng_base_url, fallbackOptions]);
+
   // ---- Actions ----
   const handleStart = async () => {
     setError("");
     setImportResult(null);
     setStatus(null);
     try {
-      const s = await api.startSearch(prompt.trim(), targetCount);
+      const s = await api.startSearch(
+        buildSearchStartPayload({
+          prompt,
+          targetCount,
+          categories: selectedCategories,
+          language,
+          timeRange,
+          defaults: (searchOptions ?? fallbackOptions).defaults,
+        }),
+      );
       setJobId(s.job_id);
       setStatus(s);
     } catch (err) {
@@ -129,6 +197,12 @@ export function SearchPage() {
   const isFailed = status?.state === "failed";
   const hasSearxng = Boolean(appSettings.searxng_base_url);
   const hasLlm = appSettings.use_llm;
+  const effectiveOptions = searchOptions ?? fallbackOptions;
+  const hasAdvancedControls =
+    searchOptions !== null &&
+    (effectiveOptions.categories.length > CURATED_SEARCH_CATEGORIES.length ||
+      effectiveOptions.languages.length > 0 ||
+      effectiveOptions.time_ranges.length > 0);
 
   return (
     <div className="space-y-4">
@@ -153,6 +227,14 @@ export function SearchPage() {
         </SurfaceCard>
       )}
 
+      {optionsError && hasSearxng && (
+        <SurfaceCard className="border border-warning/30 bg-warning/10">
+          <div className="text-body-md text-warning">
+            Search options could not be loaded. Using fallback category controls.
+          </div>
+        </SurfaceCard>
+      )}
+
       {/* Input Section */}
       <SurfaceCard>
         <div className="mb-3 text-title-sm font-semibold">Research Prompt</div>
@@ -163,6 +245,94 @@ export function SearchPage() {
           placeholder="Describe what you're looking for, e.g. 'Recent studies on the environmental impact of lithium mining in South America'"
           rows={3}
         />
+
+        <div className="mt-4">
+          <div className="mb-2 text-label-sm text-on-surface-variant">Search categories</div>
+          <div className="flex flex-wrap gap-2">
+            {CURATED_SEARCH_CATEGORIES.map((category) => {
+              const active = selectedCategories.includes(category);
+              return (
+                <button
+                  key={category}
+                  type="button"
+                  className={[
+                    "rounded-full px-3 py-1.5 text-label-sm font-semibold transition",
+                    active
+                      ? "bg-primary-gradient text-surface"
+                      : "bg-surface-variant text-on-surface hover:bg-surface-container-highest",
+                  ].join(" ")}
+                  onClick={() => setSelectedCategories((prev) => toggleSearchCategory(prev, category))}
+                >
+                  {formatSearchCategoryLabel(category)}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {hasAdvancedControls && (
+          <div className="mt-4">
+            <Button variant="ghost" onClick={() => setShowAdvanced((prev) => !prev)}>
+              {showAdvanced ? "Hide Advanced Search" : "Show Advanced Search"}
+            </Button>
+          </div>
+        )}
+
+        {showAdvanced && hasAdvancedControls && (
+          <div className="mt-4 grid gap-4 rounded-lg bg-surface-container-low p-4 md:grid-cols-2">
+            <div className="md:col-span-2">
+              <div className="mb-2 text-label-sm text-on-surface-variant">All available categories</div>
+              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                {effectiveOptions.categories.map((category) => (
+                  <label
+                    key={category}
+                    className="flex items-center gap-2 rounded-md bg-surface-container px-3 py-2 text-body-sm text-on-surface"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={selectedCategories.includes(category)}
+                      onChange={() =>
+                        setSelectedCategories((prev) => toggleSearchCategory(prev, category))
+                      }
+                      className="accent-primary"
+                    />
+                    <span>{formatSearchCategoryLabel(category)}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            {effectiveOptions.languages.length > 0 && (
+              <SelectField
+                label="Language"
+                value={language}
+                onChange={(e) => setLanguage(e.target.value)}
+              >
+                <option value="">Default</option>
+                {effectiveOptions.languages.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </SelectField>
+            )}
+
+            {effectiveOptions.time_ranges.length > 0 && (
+              <SelectField
+                label="Time Range"
+                value={timeRange}
+                onChange={(e) => setTimeRange(e.target.value as "" | "day" | "month" | "year")}
+              >
+                <option value="">Any time</option>
+                {effectiveOptions.time_ranges.map((option) => (
+                  <option key={option} value={option}>
+                    {formatSearchCategoryLabel(option)}
+                  </option>
+                ))}
+              </SelectField>
+            )}
+          </div>
+        )}
 
         <div className="mt-3 flex items-end gap-4">
           <div className="flex flex-col gap-1">
@@ -193,6 +363,14 @@ export function SearchPage() {
       {status && isActive && (
         <SurfaceCard>
           <div className="mb-2 text-title-sm font-semibold">{stateLabel(status.state)}</div>
+
+          {(status.categories.length > 0 || status.language || status.time_range) && (
+            <div className="mb-3 text-body-sm text-on-surface-variant">
+              Filters: {status.categories.join(", ") || "default"}
+              {status.language ? ` | ${status.language}` : ""}
+              {status.time_range ? ` | ${status.time_range}` : ""}
+            </div>
+          )}
 
           {status.generated_queries.length > 0 && (
             <div className="mb-3">
@@ -318,6 +496,7 @@ export function SearchPage() {
                 <tbody>
                   {results.map((r, i) => {
                     const below = r.relevance_score < threshold;
+                    const metaTokens = buildSearchResultMetaTokens(r);
                     return (
                       <tr
                         key={i}
@@ -336,13 +515,18 @@ export function SearchPage() {
                           >
                             {r.title || r.url}
                           </a>
+                          {metaTokens.length > 0 && (
+                            <div className="mt-1 text-xs text-on-surface-variant">
+                              {metaTokens.join(" | ")}
+                            </div>
+                          )}
                         </td>
                         <td className="hidden max-w-xs truncate text-on-surface-variant md:table-cell">
                           {r.snippet}
                         </td>
                         <td className="text-on-surface-variant">{r.engine}</td>
                         <td className="hidden text-on-surface-variant lg:table-cell">
-                          {r.published_date || "-"}
+                          {r.published_date ? r.published_date.slice(0, 10) : "-"}
                         </td>
                       </tr>
                     );

@@ -1054,6 +1054,10 @@ export interface SearchResultItem {
   snippet: string;
   engine: string;
   engines: string[];
+  authors: string[];
+  doi: string;
+  html_url: string;
+  pdf_url: string;
   searxng_score: number;
   category: string;
   published_date: string;
@@ -1061,10 +1065,32 @@ export interface SearchResultItem {
   relevance_scored: boolean;
 }
 
+export interface SearchLanguageOption {
+  value: string;
+  label: string;
+}
+
+export interface SearchOptionsDefaults {
+  categories: string[];
+  language: "" | "auto" | "all" | string;
+  time_range: "" | "day" | "month" | "year";
+}
+
+export interface SearchOptionsResponse {
+  categories: string[];
+  languages: SearchLanguageOption[];
+  time_ranges: Array<"day" | "month" | "year">;
+  supports_oa_doi_helper: boolean;
+  defaults: SearchOptionsDefaults;
+}
+
 export interface SearchJobStatus {
   job_id: string;
   state: "pending" | "generating_queries" | "searching" | "scoring" | "completed" | "failed";
   prompt: string;
+  categories: string[];
+  language: string;
+  time_range: "" | "day" | "month" | "year";
   generated_queries: string[];
   queries_completed: number;
   total_queries: number;

@@ -45,6 +45,7 @@ import type {
   RepositoryStatusResponse,
   SearchImportResponse,
   SearchJobStatus,
+  SearchOptionsResponse,
   SourceCancelResponse,
   SourceDownloadStatus,
   SpreadsheetColumnConfig,
@@ -412,8 +413,16 @@ export const api = {
     apiPostDownload("spreadsheets/export", { session_id: sessionId }),
 
   // Search
-  startSearch: (prompt: string, targetCount: number) =>
-    apiPost<SearchJobStatus>("search/start", { prompt, target_count: targetCount }),
+  getSearchOptions: () => apiGet<SearchOptionsResponse>("search/options"),
+  startSearch: (
+    payload: {
+      prompt: string;
+      target_count: number;
+      categories: string[];
+      language: string;
+      time_range: "" | "day" | "month" | "year";
+    },
+  ) => apiPost<SearchJobStatus>("search/start", payload),
   getSearchStatus: (jobId: string) =>
     apiGet<SearchJobStatus>(`search/${encodeURIComponent(jobId)}/status`),
   cancelSearch: (jobId: string) =>

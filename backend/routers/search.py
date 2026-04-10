@@ -2,23 +2,68 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import logging
+import re
 import threading
 import uuid
+from urllib.parse import urlparse
 
+import httpx
 from fastapi import APIRouter, HTTPException, Request
 
 from backend.models.search import (
     SearchImportRequest,
     SearchImportResponse,
     SearchJobStatus,
+    SearchOptionsResponse,
     SearchRequest,
 )
+from backend.search.searxng_client import SearXNGClient
 from backend.search.search_orchestrator import SearchOrchestrator
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+DOI_URL_HOSTS = {"doi.org", "dx.doi.org", "www.doi.org", "oadoi.org"}
+
+
+def _is_doi_url(url: str) -> bool:
+    candidate = str(url or "").strip()
+    if not candidate:
+        return False
+    try:
+        host = (urlparse(candidate).hostname or "").lower()
+    except Exception:
+        return False
+    return host in DOI_URL_HOSTS
+
+
+def _is_pdf_url(url: str) -> bool:
+    candidate = str(url or "").strip().lower()
+    return candidate.endswith(".pdf")
+
+
+def _search_result_import_url(result) -> str:
+    candidates = [
+        str(result.html_url or "").strip(),
+        str(result.url or "").strip(),
+        str(result.pdf_url or "").strip(),
+    ]
+    for candidate in candidates:
+        if candidate and not _is_doi_url(candidate) and not _is_pdf_url(candidate):
+            return candidate
+    for candidate in candidates:
+        if candidate and not _is_doi_url(candidate):
+            return candidate
+    return str(result.url or "").strip()
+
+
+def _extract_year_from_published_date(value: str) -> str:
+    match = re.search(r"\b(19|20)\d{2}\b", str(value or ""))
+    return match.group(0) if match else ""
 
 
 def _search_worker(orchestrator: SearchOrchestrator) -> None:
@@ -29,6 +74,34 @@ def _search_worker(orchestrator: SearchOrchestrator) -> None:
         orchestrator.status.state = "failed"
         orchestrator.status.error_message = "Unexpected error in search worker"
         logger.exception("Search worker crashed for job %s", orchestrator.job_id)
+
+
+@router.get("/search/options", response_model=SearchOptionsResponse)
+async def get_search_options(request: Request) -> SearchOptionsResponse:
+    """Return normalized live SearXNG capabilities for the search UI."""
+    service = request.app.state.repository_service
+    settings = service.load_effective_settings()
+    if not settings.searxng_base_url:
+        raise HTTPException(
+            status_code=400,
+            detail="SearXNG base URL must be configured in settings",
+        )
+
+    client = SearXNGClient(settings.searxng_base_url)
+    try:
+        return SearchOptionsResponse.model_validate(client.get_config())
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to load SearXNG config: {exc}",
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to normalize SearXNG config: {exc}",
+        ) from exc
+    finally:
+        client.close()
 
 
 @router.post("/search/start", response_model=SearchJobStatus)
@@ -55,6 +128,9 @@ async def start_search(request: Request, payload: SearchRequest) -> SearchJobSta
         searxng_base_url=settings.searxng_base_url,
         llm_config=settings.llm_backend,
         target_count=payload.target_count,
+        categories=payload.categories,
+        language=payload.language,
+        time_range=payload.time_range,
     )
 
     lock: threading.Lock = request.app.state.search_jobs_lock
@@ -119,10 +195,20 @@ async def import_search_results(
     if not passing:
         return SearchImportResponse(message="No results above the relevance threshold")
 
-    csv_lines = ["url"]
-    for r in passing:
-        csv_lines.append(r.url)
-    csv_content = "\n".join(csv_lines).encode("utf-8")
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=["URL", "Title", "Authors", "Year", "DOI"])
+    writer.writeheader()
+    for result in passing:
+        writer.writerow(
+            {
+                "URL": _search_result_import_url(result),
+                "Title": result.title,
+                "Authors": "; ".join(result.authors),
+                "Year": _extract_year_from_published_date(result.published_date),
+                "DOI": result.doi,
+            }
+        )
+    csv_content = output.getvalue().encode("utf-8")
 
     try:
         result = service.import_source_list(
