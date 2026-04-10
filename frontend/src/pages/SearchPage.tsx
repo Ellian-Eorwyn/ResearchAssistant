@@ -9,13 +9,16 @@ import {
   buildSearchStartPayload,
   createFallbackSearchOptions,
   CURATED_SEARCH_CATEGORIES,
+  describeSearchOptionsError,
   formatSearchCategoryLabel,
+  shouldRetrySearchOptionsLoad,
   toggleSearchCategory,
 } from "./searchPageUtils";
 
 const POLL_INTERVAL_MS = 2000;
 const DEFAULT_TARGET_COUNT = 200;
 const DEFAULT_THRESHOLD = 0.40;
+const SEARCH_OPTIONS_RETRY_DELAY_MS = 800;
 
 function relevanceBadge(score: number): string {
   if (score >= 0.7) return "text-green-400";
@@ -105,30 +108,41 @@ export function SearchPage() {
 
     let cancelled = false;
     const loadOptions = async () => {
-      try {
-        const nextOptions = await api.getSearchOptions();
-        if (cancelled) return;
-        setSearchOptions(nextOptions);
-        setOptionsError("");
-        if (!initializedFiltersRef.current) {
-          setSelectedCategories(
-            nextOptions.defaults.categories.length
-              ? nextOptions.defaults.categories
-              : fallbackOptions.defaults.categories,
-          );
-          setLanguage(nextOptions.defaults.language || "");
-          setTimeRange(nextOptions.defaults.time_range || "");
-          initializedFiltersRef.current = true;
-        }
-      } catch (err) {
-        if (cancelled) return;
-        setSearchOptions(null);
-        setOptionsError(err instanceof Error ? err.message : String(err));
-        if (!initializedFiltersRef.current) {
-          setSelectedCategories(fallbackOptions.defaults.categories);
-          setLanguage(fallbackOptions.defaults.language);
-          setTimeRange(fallbackOptions.defaults.time_range);
-          initializedFiltersRef.current = true;
+      let attempt = 0;
+      for (;;) {
+        try {
+          const nextOptions = await api.getSearchOptions();
+          if (cancelled) return;
+          setSearchOptions(nextOptions);
+          setOptionsError("");
+          if (!initializedFiltersRef.current) {
+            setSelectedCategories(
+              nextOptions.defaults.categories.length
+                ? nextOptions.defaults.categories
+                : fallbackOptions.defaults.categories,
+            );
+            setLanguage(nextOptions.defaults.language || "");
+            setTimeRange(nextOptions.defaults.time_range || "");
+            initializedFiltersRef.current = true;
+          }
+          return;
+        } catch (err) {
+          if (cancelled) return;
+          if (attempt === 0 && shouldRetrySearchOptionsLoad(err)) {
+            attempt += 1;
+            await new Promise((resolve) => window.setTimeout(resolve, SEARCH_OPTIONS_RETRY_DELAY_MS));
+            if (cancelled) return;
+            continue;
+          }
+          setSearchOptions(null);
+          setOptionsError(describeSearchOptionsError(err));
+          if (!initializedFiltersRef.current) {
+            setSelectedCategories(fallbackOptions.defaults.categories);
+            setLanguage(fallbackOptions.defaults.language);
+            setTimeRange(fallbackOptions.defaults.time_range);
+            initializedFiltersRef.current = true;
+          }
+          return;
         }
       }
     };
@@ -229,9 +243,7 @@ export function SearchPage() {
 
       {optionsError && hasSearxng && (
         <SurfaceCard className="border border-warning/30 bg-warning/10">
-          <div className="text-body-md text-warning">
-            Search options could not be loaded. Using fallback category controls.
-          </div>
+          <div className="text-body-md text-warning">{optionsError}</div>
         </SurfaceCard>
       )}
 

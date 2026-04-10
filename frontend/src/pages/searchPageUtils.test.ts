@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 
+import { ApiError } from "../api/client";
 import type { SearchResultItem } from "../api/types";
 import {
   buildSearchResultMetaTokens,
   buildSearchStartPayload,
   createFallbackSearchOptions,
+  describeSearchOptionsError,
+  shouldRetrySearchOptionsLoad,
   toggleSearchCategory,
 } from "./searchPageUtils";
 
@@ -75,5 +78,17 @@ describe("searchPageUtils", () => {
       "10.1234/example",
       "2026-04-10",
     ]);
+  });
+
+  it("describes stale backend search options errors clearly", () => {
+    expect(describeSearchOptionsError(new ApiError(404, "API error: 404"))).toContain(
+      "Restart the backend if you just updated.",
+    );
+  });
+
+  it("retries transient search options failures", () => {
+    expect(shouldRetrySearchOptionsLoad(new ApiError(502, "bad gateway"))).toBe(true);
+    expect(shouldRetrySearchOptionsLoad(new TypeError("Failed to fetch"))).toBe(true);
+    expect(shouldRetrySearchOptionsLoad(new ApiError(400, "bad request"))).toBe(false);
   });
 });

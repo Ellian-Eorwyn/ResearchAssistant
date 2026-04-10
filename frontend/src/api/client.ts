@@ -57,6 +57,18 @@ import type {
   SpreadsheetWorkspaceStatusResponse,
 } from "./types";
 
+export class ApiError extends Error {
+  status: number;
+  detail: string;
+
+  constructor(status: number, detail: string) {
+    super(detail);
+    this.name = "ApiError";
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
 async function parseApiResponse<T>(resp: Response): Promise<T> {
   let body: unknown = null;
   try {
@@ -69,7 +81,7 @@ async function parseApiResponse<T>(resp: Response): Promise<T> {
       (body as { detail?: string; message?: string } | null)?.detail ||
       (body as { detail?: string; message?: string } | null)?.message ||
       `API error: ${resp.status}`;
-    throw new Error(detail);
+    throw new ApiError(resp.status, detail);
   }
   return body as T;
 }

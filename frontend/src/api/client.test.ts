@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { api } from "./client";
+import { ApiError, api } from "./client";
 
 describe("api client", () => {
   afterEach(() => {
@@ -84,5 +84,18 @@ describe("api client", () => {
       language: "en-US",
       time_range: "month",
     });
+  });
+
+  it("preserves HTTP status on API errors", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ detail: "Not found" }), { status: 404 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(api.getSearchOptions()).rejects.toMatchObject({
+      name: "ApiError",
+      status: 404,
+      detail: "Not found",
+    } satisfies Partial<ApiError>);
   });
 });
