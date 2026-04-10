@@ -13,6 +13,7 @@ app = create_app()
 
 HOST = os.environ.get("RA_HOST", "0.0.0.0")
 PORT = int(os.environ.get("RA_PORT", "7995"))
+OPEN_BROWSER = os.environ.get("RA_OPEN_BROWSER", "1").strip().lower() not in {"0", "false", "no"}
 
 
 def open_browser():
@@ -21,5 +22,6 @@ def open_browser():
 
 
 if __name__ == "__main__":
-    threading.Thread(target=open_browser, daemon=True).start()
+    if OPEN_BROWSER:
+        threading.Thread(target=open_browser, daemon=True).start()
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")

@@ -3,6 +3,7 @@
 /data/exports/
 /data/uploads/
 /data/settings.json
+/.run/
 
 # Attached repository artifacts
 /.ra_repo/

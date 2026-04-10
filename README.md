@@ -143,12 +143,18 @@ To pull the latest version from GitHub and rebuild:
 ./scripts/update.sh
 ```
 
-Then restart the server. The script:
+The script:
 
 - pulls latest changes with `git pull --ff-only`
 - reinstalls Python dependencies (in case `requirements.txt` changed)
 - updates Playwright
 - reinstalls and rebuilds the frontend
+- restarts the app server automatically on the configured `RA_HOST` / `RA_PORT`
+
+Runtime details:
+
+- restart logs are written to `.run/server.log`
+- the restarted background server PID is stored in `.run/server.pid`
 
 If you have uncommitted local changes, the pull will fail safely — commit or stash them first.
 
