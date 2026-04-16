@@ -2639,6 +2639,22 @@ class SourceDownloadOrchestrator:
         current_citation.verification_status = "candidate"
         current_citation.verification_content_digest = source_digest
         current_citation = _finalize_citation_metadata(current_citation)
+        if _citation_can_auto_verify_from_doi(current_citation, doi_citation):
+            current_citation = _merge_citation_metadata(
+                current_citation,
+                doi_citation,
+                overwrite_existing=True,
+            )
+            current_citation = _apply_oa_citation_helper(current_citation, doi_citation)
+            current_citation = _auto_verify_citation_from_doi(
+                current_citation,
+                source_digest=source_digest,
+            )
+            _merge_catalog_payload_into_row(
+                row,
+                _citation_payload_to_catalog_fields(current_citation),
+                overwrite_existing=True,
+            )
 
         candidate_payload = self._build_citation_candidate_payload(
             row=row,
@@ -2653,6 +2669,8 @@ class SourceDownloadOrchestrator:
         catalog_payload = self._base_catalog_payload(row, existing_catalog_payload)
         catalog_payload["evidence_snippets"] = deterministic.get("evidence_snippets", [])
         catalog_payload["citation_candidates"] = candidate_payload
+        if _citation_can_auto_verify_from_doi(current_citation, doi_citation):
+            catalog_payload["citation"] = current_citation.model_dump(mode="json")
         existing_citation = existing_catalog_payload.get("citation")
         if existing_citation:
             catalog_payload["citation"] = existing_citation
@@ -2760,6 +2778,22 @@ class SourceDownloadOrchestrator:
         current_citation.verification_status = "candidate"
         current_citation.verification_content_digest = source_digest
         current_citation = _finalize_citation_metadata(current_citation)
+        if _citation_can_auto_verify_from_doi(current_citation, doi_citation):
+            current_citation = _merge_citation_metadata(
+                current_citation,
+                doi_citation,
+                overwrite_existing=True,
+            )
+            current_citation = _apply_oa_citation_helper(current_citation, doi_citation)
+            current_citation = _auto_verify_citation_from_doi(
+                current_citation,
+                source_digest=source_digest,
+            )
+            _merge_catalog_payload_into_row(
+                row,
+                _citation_payload_to_catalog_fields(current_citation),
+                overwrite_existing=True,
+            )
 
         candidate_payload = self._build_citation_candidate_payload(
             row=row,
@@ -2771,13 +2805,18 @@ class SourceDownloadOrchestrator:
             deterministic_citation=current_citation,
             doi_registry_citation=doi_citation,
         )
-        verified_citation, llm_used, llm_error = self._verify_citation_with_llm(
-            row=row,
-            markdown_text=markdown_text,
-            source_digest=source_digest,
-            candidate_payload=candidate_payload,
-            base_citation=current_citation,
-        )
+        if _citation_needs_llm_review(current_citation):
+            verified_citation, llm_used, llm_error = self._verify_citation_with_llm(
+                row=row,
+                markdown_text=markdown_text,
+                source_digest=source_digest,
+                candidate_payload=candidate_payload,
+                base_citation=current_citation,
+            )
+        else:
+            verified_citation = current_citation
+            llm_used = False
+            llm_error = ""
         verified_citation = _apply_citation_manual_overrides(verified_citation, existing_citation)
         if verified_citation.ready_for_ris and not verified_citation.verified_at:
             verified_citation.verified_at = _utc_now_iso()
@@ -4987,6 +5026,41 @@ def _citation_needs_llm_review(citation: CitationMetadata) -> bool:
         str(citation.verification_status or "").strip().lower() != "verified"
         or citation.verification_confidence < 0.75
     )
+
+
+def _citation_can_auto_verify_from_doi(
+    citation: CitationMetadata,
+    doi_registry_citation: CitationMetadata,
+) -> bool:
+    registry_confidence = max(
+        float(doi_registry_citation.verification_confidence or 0.0),
+        float(doi_registry_citation.confidence or 0.0),
+    )
+    return bool(
+        citation.doi
+        and doi_registry_citation.doi
+        and citation.ready_for_ris
+        and doi_registry_citation.ready_for_ris
+        and registry_confidence >= 0.85
+    )
+
+
+def _auto_verify_citation_from_doi(
+    citation: CitationMetadata,
+    *,
+    source_digest: str,
+) -> CitationMetadata:
+    updated = citation.model_copy(deep=True)
+    updated.verification_status = "verified"
+    updated.verification_confidence = max(
+        float(updated.verification_confidence or 0.0),
+        float(updated.confidence or 0.0),
+        0.85,
+    )
+    updated.verification_content_digest = source_digest
+    updated.verified_at = updated.verified_at or _utc_now_iso()
+    updated.notes = _dedupe_strings([*updated.notes, "trusted_doi_registry_metadata"])
+    return _finalize_citation_metadata(updated)
 
 
 def _enrich_citation_from_csl_json(citation: CitationMetadata, payload: dict[str, Any]) -> CitationMetadata:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import tempfile
 import threading
 import unittest
@@ -17,6 +18,7 @@ from backend.models.sources import SourceManifestRow
 from backend.pipeline.source_downloader import (
     _apply_oa_citation_helper,
     _build_citation_metadata,
+    SourceDownloadOrchestrator,
 )
 from backend.routers import search
 from backend.search.searxng_client import SearXNGClient
@@ -300,6 +302,137 @@ class SearchImportAndCitationHintTests(unittest.TestCase):
         )
         self.assertEqual(preserved.url, "https://publisher.example/original")
         self.assertEqual(preserved.title, "Authoritative Title")
+
+
+class SourceDownloaderDoiAutoVerifyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory(prefix="source-downloader-doi-test-")
+        root = Path(self.temp_dir.name)
+        self.store = FileStore(base_dir=root / "data", sync_project_profiles=False)
+        self.output_dir = root / "output"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _write_markdown(self, row: SourceManifestRow, text: str) -> None:
+        path = self.output_dir / row.markdown_file
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def _build_orchestrator(
+        self,
+        row: SourceManifestRow,
+        *,
+        use_llm: bool = False,
+        run_catalog: bool = False,
+        run_citation_verify: bool = False,
+    ) -> SourceDownloadOrchestrator:
+        return SourceDownloadOrchestrator(
+            job_id="job-001",
+            store=self.store,
+            use_llm=use_llm,
+            llm_backend=LLMBackendConfig(model="demo"),
+            run_download=False,
+            run_convert=False,
+            run_catalog=run_catalog,
+            run_citation_verify=run_citation_verify,
+            run_llm_cleanup=False,
+            run_llm_title=False,
+            run_llm_summary=False,
+            run_llm_rating=False,
+            target_rows=[row],
+            output_dir=self.output_dir,
+        )
+
+    def test_catalog_persists_authoritative_doi_metadata_without_waiting_for_llm(self) -> None:
+        row = SourceManifestRow(
+            id="000001",
+            repository_source_id="000001",
+            source_kind="url",
+            original_url="https://example.com/article",
+            seed_doi="10.1234/example",
+            markdown_file="sources/000001/000001.md",
+        )
+        self._write_markdown(row, "# Placeholder title\n\nBody text.")
+        orchestrator = self._build_orchestrator(row, run_catalog=True)
+        doi_citation = CitationMetadata(
+            doi="10.1234/example",
+            title="Authoritative DOI Title",
+            authors=[{"literal": "Ada Lovelace"}, {"literal": "Grace Hopper"}],
+            issued="2024-03-01",
+            publisher="OpenAI Press",
+            url="https://publisher.example/article",
+            confidence=0.95,
+            ready_for_ris=True,
+        )
+
+        with patch(
+            "backend.pipeline.source_downloader._resolve_doi_citation_metadata",
+            return_value=doi_citation,
+        ):
+            with patch(
+                "backend.pipeline.source_downloader._resolve_searxng_oa_citation_metadata",
+                return_value=CitationMetadata(doi="10.1234/example"),
+            ):
+                orchestrator._generate_source_catalog(row, notes=[])
+
+        self.assertEqual(row.title, "Authoritative DOI Title")
+        self.assertEqual(row.author_names, "Ada Lovelace; Grace Hopper")
+        self.assertEqual(row.publication_date, "2024-03-01")
+        self.assertTrue(row.catalog_file)
+
+        payload = json.loads((self.output_dir / row.catalog_file).read_text(encoding="utf-8"))
+        self.assertEqual(payload["title"], "Authoritative DOI Title")
+        self.assertEqual(payload["author_names"], "Ada Lovelace; Grace Hopper")
+        self.assertEqual(payload["publication_date"], "2024-03-01")
+        self.assertEqual(payload["citation"]["title"], "Authoritative DOI Title")
+        self.assertEqual(payload["citation"]["verification_status"], "verified")
+
+    def test_citation_verification_skips_llm_for_authoritative_doi_metadata(self) -> None:
+        row = SourceManifestRow(
+            id="000001",
+            repository_source_id="000001",
+            source_kind="url",
+            original_url="https://example.com/article",
+            seed_doi="10.1234/example",
+            markdown_file="sources/000001/000001.md",
+        )
+        self._write_markdown(row, "# Placeholder title\n\nBody text.")
+        orchestrator = self._build_orchestrator(
+            row,
+            use_llm=True,
+            run_citation_verify=True,
+        )
+        doi_citation = CitationMetadata(
+            doi="10.1234/example",
+            title="Authoritative DOI Title",
+            authors=[{"literal": "Ada Lovelace"}, {"literal": "Grace Hopper"}],
+            issued="2024-03-01",
+            publisher="OpenAI Press",
+            url="https://publisher.example/article",
+            confidence=0.95,
+            ready_for_ris=True,
+        )
+
+        with patch(
+            "backend.pipeline.source_downloader._resolve_doi_citation_metadata",
+            return_value=doi_citation,
+        ):
+            with patch(
+                "backend.pipeline.source_downloader._resolve_searxng_oa_citation_metadata",
+                return_value=CitationMetadata(doi="10.1234/example"),
+            ):
+                with patch.object(
+                    orchestrator,
+                    "_verify_citation_with_llm",
+                    side_effect=AssertionError("LLM verification should be skipped"),
+                ):
+                    orchestrator._generate_source_citation_verification(row, notes=[])
+
+        payload = json.loads((self.output_dir / row.catalog_file).read_text(encoding="utf-8"))
+        self.assertEqual(payload["citation"]["verification_status"], "verified")
+        self.assertIn("trusted_doi_registry_metadata", payload["citation"]["notes"])
 
 
 if __name__ == "__main__":
