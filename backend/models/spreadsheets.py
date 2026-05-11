@@ -140,6 +140,19 @@ class SpreadsheetColumnRunRequest(BaseModel):
     confirm_overwrite: bool = False
 
 
+class SpreadsheetColumnClearRequest(BaseModel):
+    filters: SpreadsheetFilterRequest = Field(default_factory=SpreadsheetFilterRequest)
+    scope: Literal["filtered", "all", "selected"] = "filtered"
+    row_ids: list[str] = Field(default_factory=list)
+
+
+class SpreadsheetColumnClearResponse(BaseModel):
+    status: str = "completed"
+    column_id: str
+    cleared_rows: int = 0
+    message: str = ""
+
+
 class SpreadsheetColumnRunStartResponse(BaseModel):
     job_id: str = ""
     status: Literal["started", "confirmation_required"] = "started"
@@ -169,4 +182,3 @@ class SpreadsheetColumnRunStatus(BaseModel):
 
 class SpreadsheetExportRequest(BaseModel):
     session_id: str = ""
-

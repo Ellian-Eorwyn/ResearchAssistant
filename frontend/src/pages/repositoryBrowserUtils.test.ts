@@ -253,6 +253,48 @@ describe("repositoryBrowserUtils", () => {
     expect(queue[0].payload.run_convert).toBe(false);
   });
 
+  it("sets force flags for isolated enrichment tasks when overwrite is enabled", () => {
+    const queue = buildRepositoryBrowserSourceTaskQueue({
+      draft: {
+        rerun_failed_only: false,
+        run_download: false,
+        run_convert: false,
+        run_catalog: true,
+        run_citation_verify: true,
+        run_llm_cleanup: true,
+        run_llm_title: true,
+        run_llm_summary: true,
+        run_llm_rating: true,
+        force_redownload: false,
+        force_convert: false,
+        force_catalog: false,
+        force_citation_verify: false,
+        force_llm_cleanup: false,
+        force_title: false,
+        force_summary: false,
+        force_rating: false,
+        project_profile_name: "",
+        include_raw_file: true,
+        include_rendered_html: true,
+        include_rendered_pdf: true,
+        include_markdown: true,
+        scope: "empty_only",
+        import_id: "",
+      },
+      scope: "all",
+      selectedSourceIds: [],
+      defaultProjectProfileName: "default.yaml",
+      overwriteExisting: true,
+    });
+
+    expect(queue.find((item) => item.id === "cleanup")?.payload.force_llm_cleanup).toBe(true);
+    expect(queue.find((item) => item.id === "title")?.payload.force_title).toBe(true);
+    expect(queue.find((item) => item.id === "catalog")?.payload.force_catalog).toBe(true);
+    expect(queue.find((item) => item.id === "citation_verify")?.payload.force_citation_verify).toBe(true);
+    expect(queue.find((item) => item.id === "summary")?.payload.force_summary).toBe(true);
+    expect(queue.find((item) => item.id === "rating")?.payload.force_rating).toBe(true);
+  });
+
   it("builds download payloads for all, checked, and failed-fetch scopes", () => {
     const draft = {
       rerun_failed_only: false,

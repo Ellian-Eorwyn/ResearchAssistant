@@ -14,7 +14,7 @@ class LLMBackendConfig(BaseModel):
     model: str = ""
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     think_mode: Literal["default", "think", "no_think"] = "default"
-    num_ctx: int = Field(default=8192, ge=2048, le=131072)
+    num_ctx: int = Field(default=8192, ge=2048, le=262144)
     max_source_chars: int = Field(default=0, ge=0, le=120000)
     llm_timeout: float = Field(default=300.0, ge=30.0, le=1800.0)
 

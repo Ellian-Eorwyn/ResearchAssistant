@@ -42,11 +42,13 @@ interface ColumnPromptDraftState {
 }
 
 type ColumnRunScope = "all" | "empty_only" | "selected";
+type ColumnClearScope = "all" | "filtered" | "selected";
 
 interface ColumnRunScopeDraftState {
   columnId: string;
   label: string;
   scope: ColumnRunScope;
+  confirmOverwrite: boolean;
 }
 
 interface EditingCellState {
@@ -204,6 +206,7 @@ function ColumnRunScopeModal({
   startPending,
   onCancel,
   onChangeScope,
+  onChangeOverwrite,
   onConfirm,
 }: {
   draft: ColumnRunScopeDraftState;
@@ -211,6 +214,7 @@ function ColumnRunScopeModal({
   startPending: boolean;
   onCancel: () => void;
   onChangeScope: (scope: ColumnRunScope) => void;
+  onChangeOverwrite: (confirmOverwrite: boolean) => void;
   onConfirm: () => void;
 }) {
   const selectedDisabled = selectedCount === 0;
@@ -276,6 +280,23 @@ function ColumnRunScopeModal({
           ))}
         </div>
 
+        {draft.scope !== "empty_only" && (
+          <label className="mt-4 flex items-start gap-2 rounded-md bg-surface-container-low p-3 text-body-md text-on-surface">
+            <input
+              checked={draft.confirmOverwrite}
+              disabled={startPending}
+              type="checkbox"
+              onChange={(event) => onChangeOverwrite(event.target.checked)}
+            />
+            <span>
+              Overwrite cells that already have values
+              <span className="mt-1 block text-on-surface-variant">
+                Use this after changing the column prompt, selected input columns, or model settings.
+              </span>
+            </span>
+          </label>
+        )}
+
         <div className="mt-5 flex justify-end gap-2">
           <Button disabled={startPending} onClick={onCancel}>
             Cancel
@@ -318,6 +339,7 @@ export function SpreadsheetsPage() {
   const [runStarting, setRunStarting] = useState(false);
   const [columnRunJobId, setColumnRunJobId] = useState<string | null>(null);
   const [activeColumnRun, setActiveColumnRun] = useState<SpreadsheetColumnRunStatus | null>(null);
+  const [columnClearPendingId, setColumnClearPendingId] = useState("");
   const [exporting, setExporting] = useState(false);
 
   const llmReady = Boolean(appSettings.use_llm && appSettings.llm_backend.model.trim());
@@ -590,15 +612,10 @@ export function SpreadsheetsPage() {
         q: filters.q,
         scope: draft.scope,
         row_ids: draft.scope === "selected" ? Array.from(selectedRowIds) : [],
-        confirm_overwrite: confirmOverwrite,
+        confirm_overwrite: confirmOverwrite || draft.confirmOverwrite,
       });
       if (response.status === "confirmation_required") {
-        const confirmed = window.confirm(
-          response.message || `Overwrite ${response.populated_rows} populated cell(s)?`,
-        );
-        if (confirmed) {
-          await handleRunColumn(draft, true);
-        }
+        setActionError(response.message || `Enable overwrite to replace ${response.populated_rows} populated cell(s).`);
         return;
       }
       setColumnRunJobId(response.job_id);
@@ -608,6 +625,40 @@ export function SpreadsheetsPage() {
       setActionError(String((error as Error).message || "Failed to start spreadsheet column run"));
     } finally {
       setRunStarting(false);
+    }
+  };
+
+  const clearScopeForColumn = (): ColumnClearScope => {
+    if (selectedRowIds.size > 0) return "selected";
+    return filters.q.trim() ? "filtered" : "all";
+  };
+
+  const handleClearColumn = async (column: SpreadsheetColumnConfig) => {
+    if (!selectedSessionId || columnClearPendingId) return;
+    const scope = clearScopeForColumn();
+    const scopeLabel =
+      scope === "selected"
+        ? `${selectedRowIds.size} selected row${selectedRowIds.size === 1 ? "" : "s"}`
+        : scope === "filtered"
+          ? "the current filtered rows"
+          : "the whole table";
+    const confirmed = window.confirm(`Clear ${column.label} for ${scopeLabel}?`);
+    if (!confirmed) return;
+    setColumnClearPendingId(column.id);
+    setActionError("");
+    setActionMessage("");
+    try {
+      const response = await api.clearSpreadsheetColumn(selectedSessionId, column.id, {
+        q: filters.q,
+        scope,
+        row_ids: scope === "selected" ? Array.from(selectedRowIds) : [],
+      });
+      await manifestQuery.refetch();
+      setActionMessage(response.message || `Cleared ${column.label}.`);
+    } catch (error) {
+      setActionError(String((error as Error).message || "Failed to clear spreadsheet column"));
+    } finally {
+      setColumnClearPendingId("");
     }
   };
 
@@ -905,11 +956,20 @@ export function SpreadsheetsPage() {
                                     columnId: column.id,
                                     label: column.label,
                                     scope: selectedRowIds.size > 0 ? "selected" : "empty_only",
+                                    confirmOverwrite: false,
                                   })
                                 }
                                 type="button"
                               >
                                 Run
+                              </button>
+                              <button
+                                className="rounded-md bg-surface px-2 py-1 text-label-sm text-primary hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+                                disabled={Boolean(columnClearPendingId)}
+                                onClick={() => void handleClearColumn(column)}
+                                type="button"
+                              >
+                                {columnClearPendingId === column.id ? "Clearing" : "Clear"}
                               </button>
                               {column.kind === "custom" && (
                                 <button
@@ -1090,6 +1150,9 @@ export function SpreadsheetsPage() {
             setRunDraft(null);
           }}
           onChangeScope={(scope) => setRunDraft((prev) => (prev ? { ...prev, scope } : prev))}
+          onChangeOverwrite={(confirmOverwrite) =>
+            setRunDraft((prev) => (prev ? { ...prev, confirmOverwrite } : prev))
+          }
           onConfirm={() => void handleRunColumn(runDraft)}
         />
       )}

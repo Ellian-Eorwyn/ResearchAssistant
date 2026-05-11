@@ -216,7 +216,7 @@ function normalizeAppSettingsDraft(settings: AppSettings): AppSettings {
       ...settings.llm_backend,
       temperature: normalizeTemperature(settings.llm_backend.temperature),
       think_mode: normalizeThinkMode(settings.llm_backend.think_mode),
-      num_ctx: Math.max(2048, Math.min(131072, settings.llm_backend.num_ctx)),
+      num_ctx: Math.max(2048, Math.min(262144, settings.llm_backend.num_ctx)),
       max_source_chars: Math.max(0, Math.min(120000, settings.llm_backend.max_source_chars)),
       llm_timeout: Math.max(30, Math.min(1800, settings.llm_backend.llm_timeout)),
     },

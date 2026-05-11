@@ -57,6 +57,8 @@ from backend.models.repository import (
     RepositoryBundleExportRequest,
     RepositoryCitationRisExportRequest,
     RepositoryColumnConfig,
+    RepositoryColumnClearRequest,
+    RepositoryColumnClearResponse,
     RepositoryColumnCreateRequest,
     RepositoryColumnOutputConstraint,
     RepositoryColumnPromptFixResponse,
@@ -129,6 +131,8 @@ from backend.pipeline.source_downloader import (
     PHASE_SUMMARY,
     PHASE_TITLE,
     _apply_citation_manual_overrides,
+    _citation_author_names,
+    _citation_publication_year,
     _coerce_citation_metadata,
     _effective_manual_override_fields,
     _finalize_citation_metadata,
@@ -488,7 +492,10 @@ class AttachedRepositoryService:
             ):
                 return config.model_copy(deep=True), index
 
-        if create_builtin and normalized_id in PROCESSABLE_BUILTIN_COLUMNS:
+        if create_builtin and (
+            normalized_id in PROCESSABLE_BUILTIN_COLUMNS
+            or normalized_id in CLEARABLE_BUILTIN_COLUMNS
+        ):
             return (
                 RepositoryColumnConfig(
                     id=normalized_id,
@@ -872,6 +879,98 @@ class AttachedRepositoryService:
             raise ValueError("Column run status not found.")
         return RepositoryColumnRunStatus.model_validate(raw_status)
 
+    def clear_column(
+        self,
+        column_id: str,
+        *,
+        payload: RepositoryColumnClearRequest,
+    ) -> RepositoryColumnClearResponse:
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+
+        with self._writer_lock():
+            if self._download_thread and self._download_thread.is_alive():
+                raise ValueError("A repository operation is already running")
+
+            state = self._load_state_locked()
+            rows = _load_source_rows(state.get("sources", []))
+            citations = _load_citation_rows(state.get("citations", []))
+            column_configs = _load_column_configs(state.get("column_configs", []))
+            config, _ = self._resolve_column_config_locked(
+                column_id,
+                column_configs,
+                create_builtin=True,
+            )
+            target_key = str(config.builtin_key or config.id or column_id).strip()
+            if not _manifest_column_clearable(config, target_key):
+                raise ValueError(f"{config.label or target_key} cannot be cleared from the browser.")
+
+            records = [
+                build_manifest_record(row, base_dir=self.path, column_configs=column_configs)
+                for row in rows
+            ]
+            columns = _build_manifest_column_metadata(records, column_configs)
+            row_by_id = {row.id: row for row in rows}
+            normalized_scope = str(payload.scope or "filtered").strip().lower()
+            if normalized_scope == "filtered":
+                base_records, _, _ = self._filter_manifest_records(
+                    records,
+                    columns,
+                    **payload.filters.model_dump(mode="json"),
+                    sort_by="",
+                    sort_dir="",
+                )
+            elif normalized_scope == "selected":
+                selected_ids = {
+                    str(source_id or "").strip()
+                    for source_id in payload.source_ids
+                    if str(source_id or "").strip() in row_by_id
+                }
+                base_records = [
+                    record for record in records if str(record.get("id") or "") in selected_ids
+                ]
+            elif normalized_scope == "all":
+                base_records = list(records)
+            else:
+                raise ValueError(f"Unsupported column clear scope: {normalized_scope}")
+
+            target_ids = [
+                str(record.get("id") or "")
+                for record in base_records
+                if str(record.get("id") or "") in row_by_id
+                and _manifest_record_has_column_value(record, target_key)
+            ]
+            if not target_ids:
+                if normalized_scope == "selected":
+                    raise ValueError("No selected repository rows have values to clear.")
+                raise ValueError(f"No values found in {config.label or target_key} for the selected scope.")
+
+            for source_id in target_ids:
+                self._clear_source_column_value(row_by_id[source_id], config, target_key)
+
+            rows = self._sort_rows(list(row_by_id.values()))
+            self._save_state_locked(
+                sources=rows,
+                citations=citations,
+                imports=state.get("imports", []),
+                column_configs=column_configs,
+            )
+            self._save_meta_locked(
+                {
+                    **self._load_meta_locked(),
+                    "next_source_id": _next_source_id_from_rows(rows),
+                    "updated_at": _utc_now_iso(),
+                }
+            )
+            self._rebuild_outputs_locked(rows, citations)
+            normalized_column_id = str(config.builtin_key or config.id or column_id).strip()
+            return RepositoryColumnClearResponse(
+                status="completed",
+                column_id=normalized_column_id,
+                cleared_rows=len(target_ids),
+                message=f"Cleared {config.label or normalized_column_id} for {len(target_ids)} row(s).",
+            )
+
     def _repository_column_run_worker(
         self,
         job_id: str,
@@ -1109,6 +1208,83 @@ class AttachedRepositoryService:
             self.refresh_source_citation_readiness(source_id)
             return
         raise ValueError(f"Unsupported non-LLM column: {target_key}")
+
+    def _clear_source_column_value(
+        self,
+        row: SourceManifestRow,
+        config: RepositoryColumnConfig,
+        target_key: str,
+    ) -> None:
+        if config.kind == "custom":
+            next_custom_fields = dict(row.custom_fields or {})
+            next_custom_fields.pop(config.id, None)
+            row.custom_fields = next_custom_fields
+            self._write_repository_source_metadata(row)
+            return
+
+        if target_key in METADATA_CLEAR_FIELDS:
+            setattr(row, target_key, "")
+            if target_key == "publication_date":
+                row.publication_date = ""
+            self._write_catalog_patch(row)
+            self._write_repository_source_metadata(row)
+            return
+
+        if target_key == "summary_text":
+            self._write_summary_patch(row, "")
+            self._write_repository_source_metadata(row)
+            return
+
+        if target_key == "rating_raw_json":
+            self._delete_repository_artifact(row, "rating_file")
+            row.rating_status = ""
+            self._write_repository_source_metadata(row)
+            return
+
+        if target_key == "rating_confidence":
+            rating_payload = self._load_repository_json_artifact(row, "rating_file")
+            rating_payload.pop("confidence", None)
+            rating_payload.pop("rating_confidence", None)
+            if rating_payload:
+                rating_rel = self._source_rating_rel(row)
+                self._write_repository_json_file(rating_rel, rating_payload)
+                row.rating_file = rating_rel.as_posix()
+                row.rating_status = "existing"
+            else:
+                self._delete_repository_artifact(row, "rating_file")
+                row.rating_status = ""
+            self._write_repository_source_metadata(row)
+            return
+
+        if target_key in RATING_CLEAR_FIELD_MAP:
+            self._write_rating_patch(row, patch={RATING_CLEAR_FIELD_MAP[target_key]: ""})
+            self._write_repository_source_metadata(row)
+            return
+
+        citation_field = CITATION_CLEAR_FIELD_MAP.get(target_key)
+        if citation_field:
+            catalog_payload = self._load_repository_json_artifact(row, "catalog_file")
+            citation = _coerce_citation_metadata(catalog_payload.get("citation"))
+            if citation_field == "authors":
+                citation.authors = []
+            else:
+                setattr(citation, citation_field, "")
+            citation.manual_override_fields = [
+                field
+                for field in citation.manual_override_fields
+                if field != citation_field
+            ]
+            citation.field_evidence.pop(citation_field, None)
+            citation = _finalize_citation_metadata(citation)
+            self._write_catalog_citation_payload(
+                row,
+                catalog_payload=catalog_payload,
+                citation=citation,
+            )
+            self._write_repository_source_metadata(row)
+            return
+
+        raise ValueError(f"{target_key} cannot be cleared from the browser.")
 
     def update_source(
         self,
@@ -1521,6 +1697,7 @@ class AttachedRepositoryService:
         catalog_payload: dict[str, Any],
         citation: CitationMetadata,
     ) -> None:
+        self._apply_citation_to_empty_row_fields(row, citation)
         catalog_payload.update(
             {
                 "title": row.title,
@@ -1540,6 +1717,29 @@ class AttachedRepositoryService:
         row.catalog_file = catalog_rel.as_posix()
         row.catalog_status = "existing"
         row.title_status = "existing" if row.title else row.title_status
+
+    def _apply_citation_to_empty_row_fields(
+        self,
+        row: SourceManifestRow,
+        citation: CitationMetadata,
+    ) -> None:
+        if citation.title and not str(row.title or "").strip():
+            row.title = citation.title
+            row.title_status = row.title_status or "existing"
+        authors = _citation_author_names(citation)
+        if authors and not str(row.author_names or "").strip():
+            row.author_names = authors
+        if citation.issued:
+            if not str(row.publication_date or "").strip():
+                row.publication_date = citation.issued
+            if not str(row.publication_year or "").strip():
+                row.publication_year = _citation_publication_year(citation)
+        if citation.item_type and not str(row.document_type or "").strip():
+            row.document_type = citation.item_type
+        if citation.publisher and not str(row.organization_name or "").strip():
+            row.organization_name = citation.publisher
+        if citation.doi and not str(row.seed_doi or "").strip():
+            row.seed_doi = citation.doi
 
     def _write_citation_patch(
         self,
@@ -9021,6 +9221,81 @@ NON_LLM_PROCESSABLE_BUILTIN_COLUMNS = {
     "citation_ready",
 }
 
+CLEARABLE_BUILTIN_COLUMNS = {
+    "title",
+    "author_names",
+    "publication_date",
+    "publication_year",
+    "document_type",
+    "organization_name",
+    "organization_type",
+    "tags_text",
+    "notes",
+    "summary_text",
+    "rating_overall",
+    "rating_overall_relevance",
+    "rating_depth_score",
+    "rating_relevant_detail_score",
+    "rating_rationale",
+    "relevant_sections",
+    "rating_confidence",
+    "rating_raw_json",
+    "citation_title",
+    "citation_authors",
+    "citation_issued",
+    "citation_type",
+    "citation_url",
+    "citation_publisher",
+    "citation_container_title",
+    "citation_volume",
+    "citation_issue",
+    "citation_pages",
+    "citation_doi",
+    "citation_report_number",
+    "citation_standard_number",
+    "citation_language",
+    "citation_accessed",
+}
+
+METADATA_CLEAR_FIELDS = {
+    "title",
+    "author_names",
+    "publication_date",
+    "publication_year",
+    "document_type",
+    "organization_name",
+    "organization_type",
+    "tags_text",
+    "notes",
+}
+
+CITATION_CLEAR_FIELD_MAP = {
+    "citation_title": "title",
+    "citation_authors": "authors",
+    "citation_issued": "issued",
+    "citation_type": "item_type",
+    "citation_url": "url",
+    "citation_publisher": "publisher",
+    "citation_container_title": "container_title",
+    "citation_volume": "volume",
+    "citation_issue": "issue",
+    "citation_pages": "pages",
+    "citation_doi": "doi",
+    "citation_report_number": "report_number",
+    "citation_standard_number": "standard_number",
+    "citation_language": "language",
+    "citation_accessed": "accessed",
+}
+
+RATING_CLEAR_FIELD_MAP = {
+    "rating_overall": "overall_relevance",
+    "rating_overall_relevance": "overall_relevance",
+    "rating_depth_score": "depth_score",
+    "rating_relevant_detail_score": "relevant_detail_score",
+    "rating_rationale": "rating_rationale",
+    "relevant_sections": "relevant_sections",
+}
+
 DEFAULT_BUILTIN_COLUMN_PROMPTS: dict[str, str] = {
     "title": (
         "Resolve the source title using document front matter, headings, or clearly labeled metadata. "
@@ -9269,6 +9544,15 @@ def _manifest_column_processable(
     if config is not None and config.kind == "custom":
         return True
     return field_name in PROCESSABLE_BUILTIN_COLUMNS
+
+
+def _manifest_column_clearable(
+    config: RepositoryColumnConfig,
+    field_name: str,
+) -> bool:
+    if config.kind == "custom":
+        return True
+    return str(field_name or "").strip() in CLEARABLE_BUILTIN_COLUMNS
 
 
 def _manifest_record_has_column_value(

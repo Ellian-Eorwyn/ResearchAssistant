@@ -306,6 +306,22 @@ export const api = {
         confirm_overwrite: Boolean(payload.confirm_overwrite),
       },
     ),
+  clearRepositoryColumn: (
+    columnId: string,
+    payload: {
+      filters: RepositoryManifestFilterPayload;
+      scope?: "filtered" | "all" | "selected";
+      source_ids?: string[];
+    },
+  ) =>
+    apiPost<{ status: string; column_id: string; cleared_rows: number; message: string }>(
+      `repository/columns/${encodeURIComponent(columnId)}/clear`,
+      {
+        filters: payload.filters,
+        scope: payload.scope || "filtered",
+        source_ids: payload.source_ids || [],
+      },
+    ),
   getRepositoryColumnRunStatus: (jobId: string) =>
     apiGet<RepositoryColumnRunStatus>(`repository/column-runs/${encodeURIComponent(jobId)}`),
   patchRepositorySource: (sourceId: string, payload: RepositorySourcePatchRequest) =>
@@ -415,6 +431,23 @@ export const api = {
         scope: payload.scope || "filtered",
         row_ids: payload.row_ids || [],
         confirm_overwrite: Boolean(payload.confirm_overwrite),
+      },
+    ),
+  clearSpreadsheetColumn: (
+    sessionId: string,
+    columnId: string,
+    payload: {
+      q: string;
+      scope?: "filtered" | "all" | "selected";
+      row_ids?: string[];
+    },
+  ) =>
+    apiPost<{ status: string; column_id: string; cleared_rows: number; message: string }>(
+      `spreadsheets/sessions/${encodeURIComponent(sessionId)}/columns/${encodeURIComponent(columnId)}/clear`,
+      {
+        filters: { q: payload.q },
+        scope: payload.scope || "filtered",
+        row_ids: payload.row_ids || [],
       },
     ),
   getSpreadsheetColumnRunStatus: (sessionId: string, jobId: string) =>

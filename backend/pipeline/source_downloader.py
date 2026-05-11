@@ -2823,6 +2823,11 @@ class SourceDownloadOrchestrator:
         if not verified_citation.verification_content_digest:
             verified_citation.verification_content_digest = source_digest
         verified_citation = _finalize_citation_metadata(verified_citation)
+        _merge_catalog_payload_into_row(
+            row,
+            _citation_payload_to_catalog_fields(verified_citation),
+            overwrite_existing=False,
+        )
 
         catalog_payload = self._base_catalog_payload(row, existing_catalog_payload)
         if "evidence_snippets" not in catalog_payload:
@@ -3711,12 +3716,22 @@ def _derive_manifest_fields(
     )
 
     base: dict[str, str | int | float | bool] = {
-        "title": row.title or _stringify_manifest_value(catalog_payload.get("title")),
-        "author_names": row.author_names or _stringify_manifest_value(catalog_payload.get("author_names")),
-        "publication_date": row.publication_date or _stringify_manifest_value(catalog_payload.get("publication_date")),
-        "publication_year": row.publication_year or _stringify_manifest_value(catalog_payload.get("publication_year")),
-        "document_type": row.document_type or _stringify_manifest_value(catalog_payload.get("document_type")),
-        "organization_name": row.organization_name or _stringify_manifest_value(catalog_payload.get("organization_name")),
+        "title": row.title or _stringify_manifest_value(catalog_payload.get("title")) or citation.title,
+        "author_names": row.author_names
+        or _stringify_manifest_value(catalog_payload.get("author_names"))
+        or _citation_author_names(citation),
+        "publication_date": row.publication_date
+        or _stringify_manifest_value(catalog_payload.get("publication_date"))
+        or citation.issued,
+        "publication_year": row.publication_year
+        or _stringify_manifest_value(catalog_payload.get("publication_year"))
+        or _citation_publication_year(citation),
+        "document_type": row.document_type
+        or _stringify_manifest_value(catalog_payload.get("document_type"))
+        or citation.item_type,
+        "organization_name": row.organization_name
+        or _stringify_manifest_value(catalog_payload.get("organization_name"))
+        or citation.publisher,
         "organization_type": row.organization_type or _stringify_manifest_value(catalog_payload.get("organization_type")),
         "tags_text": tags_text,
         "summary_text": summary_text,

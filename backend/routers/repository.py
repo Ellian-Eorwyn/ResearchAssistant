@@ -23,6 +23,8 @@ from backend.models.repository import (
     RepositoryActionResponse,
     RepositoryBundleExportRequest,
     RepositoryColumnConfig,
+    RepositoryColumnClearRequest,
+    RepositoryColumnClearResponse,
     RepositoryColumnCreateRequest,
     RepositoryColumnPromptFixRequest,
     RepositoryColumnPromptFixResponse,
@@ -758,6 +760,24 @@ async def start_repository_column_run(
         if "already running" in detail.lower():
             raise HTTPException(status_code=409, detail=detail) from exc
         raise HTTPException(status_code=400, detail=detail) from exc
+
+
+@router.post(
+    "/repository/columns/{column_id}/clear",
+    response_model=RepositoryColumnClearResponse,
+)
+async def clear_repository_column(
+    column_id: str,
+    request: Request,
+    payload: RepositoryColumnClearRequest,
+) -> RepositoryColumnClearResponse:
+    service = request.app.state.repository_service
+    try:
+        return service.clear_column(column_id, payload=payload)
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 404 if "unknown" in detail.lower() else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
 
 
 @router.get(

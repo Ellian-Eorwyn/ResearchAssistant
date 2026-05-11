@@ -167,6 +167,7 @@ export function SettingsPage() {
             label="Context Window"
             type="number"
             min={2048}
+            max={262144}
             step={1024}
             value={String(appSettingsDraft.llm_backend.num_ctx)}
             onChange={(event) =>

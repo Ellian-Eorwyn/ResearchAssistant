@@ -77,6 +77,7 @@ export interface RepositoryBrowserSourceTaskQueueInput {
   scope: RepositoryBrowserTaskScope;
   selectedSourceIds: string[];
   defaultProjectProfileName: string;
+  overwriteExisting?: boolean;
 }
 
 export interface RepositoryBrowserDownloadTaskPayloadInput {
@@ -251,6 +252,7 @@ export function buildRepositoryBrowserSourceTaskQueue({
   scope,
   selectedSourceIds,
   defaultProjectProfileName,
+  overwriteExisting = false,
 }: RepositoryBrowserSourceTaskQueueInput): RepositoryBrowserQueuedSourceTask[] {
   const selectedRows = scope === "selected" ? selectedSourceIds.map((value) => value.trim()).filter(Boolean) : [];
   const taskScope = scope === "selected" ? "all" : scope;
@@ -307,6 +309,7 @@ export function buildRepositoryBrowserSourceTaskQueue({
           ...basePayload,
           selected_phases: ["cleanup"],
           run_llm_cleanup: true,
+          force_llm_cleanup: overwriteExisting,
         },
       });
       return;
@@ -319,6 +322,7 @@ export function buildRepositoryBrowserSourceTaskQueue({
           ...basePayload,
           selected_phases: ["title"],
           run_llm_title: true,
+          force_title: overwriteExisting,
         },
       });
       return;
@@ -331,6 +335,7 @@ export function buildRepositoryBrowserSourceTaskQueue({
           ...basePayload,
           selected_phases: ["catalog"],
           run_catalog: true,
+          force_catalog: overwriteExisting,
         },
       });
       return;
@@ -343,6 +348,7 @@ export function buildRepositoryBrowserSourceTaskQueue({
           ...basePayload,
           selected_phases: ["citation_verify"],
           run_citation_verify: true,
+          force_citation_verify: overwriteExisting,
         },
       });
       return;
@@ -355,6 +361,7 @@ export function buildRepositoryBrowserSourceTaskQueue({
           ...basePayload,
           selected_phases: ["summary"],
           run_llm_summary: true,
+          force_summary: overwriteExisting,
         },
       });
       return;
@@ -366,6 +373,7 @@ export function buildRepositoryBrowserSourceTaskQueue({
         ...basePayload,
         selected_phases: ["rating"],
         run_llm_rating: true,
+        force_rating: overwriteExisting,
       },
     });
   });

@@ -22,6 +22,8 @@ from backend.llm.prompts import COLUMN_PROMPT_FIX_SYSTEM, COLUMN_PROMPT_FIX_USER
 from backend.models.repository import RepositoryColumnOutputConstraint
 from backend.models.spreadsheets import (
     SpreadsheetColumnConfig,
+    SpreadsheetColumnClearRequest,
+    SpreadsheetColumnClearResponse,
     SpreadsheetColumnCreateRequest,
     SpreadsheetColumnPromptFixRequest,
     SpreadsheetColumnPromptFixResponse,
@@ -561,6 +563,52 @@ class SpreadsheetWorkspaceService:
             self._save_row_payload(session_id, target_id, row_id, current_values, row["original"])
             self._touch_session(session_id)
             return self._row_dict(row_id, current_values)
+
+    def clear_column(
+        self,
+        session_id: str,
+        column_id: str,
+        payload: SpreadsheetColumnClearRequest,
+    ) -> SpreadsheetColumnClearResponse:
+        with self._mutex:
+            target_id = self._active_target_id(session_id)
+            columns = self._load_columns(session_id, target_id)
+            column = self._require_column(session_id, target_id, column_id)
+            rows = self._load_rows(session_id, target_id)
+            normalized_scope = str(payload.scope or "filtered").strip().lower()
+            if normalized_scope == "all":
+                base_rows = rows
+            elif normalized_scope == "selected":
+                wanted = {str(item or "").strip() for item in payload.row_ids if str(item or "").strip()}
+                base_rows = [row for row in rows if str(row.get("id") or "") in wanted]
+            elif normalized_scope == "filtered":
+                base_rows = self._filter_rows(rows, columns, payload.filters)
+            else:
+                raise ValueError(f"Unsupported spreadsheet column clear scope: {normalized_scope}")
+
+            target_rows = [row for row in base_rows if _row_has_value(row.get(column.id))]
+            if not target_rows:
+                if normalized_scope == "selected":
+                    raise ValueError("No selected spreadsheet rows have values to clear.")
+                raise ValueError(f"No values found in {column.label} for the selected scope.")
+
+            cleared_value = self._coerce_value_for_column(column, None)
+            for row in target_rows:
+                row_id = str(row.get("id") or "")
+                if not row_id:
+                    continue
+                payload_row = self._load_row_payload(session_id, target_id, row_id)
+                current_values = dict(payload_row["data"])
+                current_values[column.id] = cleared_value
+                self._save_row_payload(session_id, target_id, row_id, current_values, payload_row["original"])
+
+            self._touch_session(session_id)
+            return SpreadsheetColumnClearResponse(
+                status="completed",
+                column_id=column.id,
+                cleared_rows=len(target_rows),
+                message=f"Cleared {column.label} for {len(target_rows)} row(s).",
+            )
 
     def create_column(
         self,

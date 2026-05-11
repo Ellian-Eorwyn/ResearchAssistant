@@ -340,6 +340,19 @@ class RepositoryColumnRunRequest(BaseModel):
     confirm_overwrite: bool = False
 
 
+class RepositoryColumnClearRequest(BaseModel):
+    filters: "RepositoryManifestFilterRequest" = Field(default_factory=lambda: RepositoryManifestFilterRequest())
+    scope: Literal["filtered", "all", "selected"] = "filtered"
+    source_ids: list[str] = Field(default_factory=list)
+
+
+class RepositoryColumnClearResponse(BaseModel):
+    status: str = "completed"
+    column_id: str
+    cleared_rows: int = 0
+    message: str = ""
+
+
 class RepositoryColumnRunStartResponse(BaseModel):
     job_id: str = ""
     status: str = "started"  # started | confirmation_required
@@ -413,3 +426,4 @@ class RepositoryManifestExportRequest(BaseModel):
 
 
 RepositoryColumnRunRequest.model_rebuild()
+RepositoryColumnClearRequest.model_rebuild()

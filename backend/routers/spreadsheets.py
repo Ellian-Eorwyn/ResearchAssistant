@@ -6,6 +6,8 @@ from fastapi import APIRouter, File, HTTPException, Query, Request, Response, Up
 
 from backend.models.spreadsheets import (
     SpreadsheetColumnConfig,
+    SpreadsheetColumnClearRequest,
+    SpreadsheetColumnClearResponse,
     SpreadsheetColumnCreateRequest,
     SpreadsheetColumnPromptFixRequest,
     SpreadsheetColumnPromptFixResponse,
@@ -174,6 +176,25 @@ async def start_spreadsheet_column_run(
     service = request.app.state.spreadsheet_service
     try:
         return service.start_column_run(session_id, column_id, payload)
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 404 if "not found" in detail.lower() or "unknown" in detail.lower() else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+
+
+@router.post(
+    "/spreadsheets/sessions/{session_id}/columns/{column_id}/clear",
+    response_model=SpreadsheetColumnClearResponse,
+)
+async def clear_spreadsheet_column(
+    session_id: str,
+    column_id: str,
+    request: Request,
+    payload: SpreadsheetColumnClearRequest,
+) -> SpreadsheetColumnClearResponse:
+    service = request.app.state.spreadsheet_service
+    try:
+        return service.clear_column(session_id, column_id, payload)
     except ValueError as exc:
         detail = str(exc)
         status_code = 404 if "not found" in detail.lower() or "unknown" in detail.lower() else 400

@@ -970,6 +970,7 @@ interface ColumnPromptDraftState {
 }
 
 type ColumnRunScope = "all" | "empty_only" | "selected";
+type ColumnClearScope = "all" | "filtered" | "selected";
 
 type ExportKind = "spreadsheet" | "ris";
 type ExportScope = "all" | "displayed" | "selected";
@@ -981,6 +982,7 @@ interface ColumnRunScopeDraftState {
   columnId: string;
   label: string;
   scope: ColumnRunScope;
+  confirmOverwrite: boolean;
 }
 
 interface DownloadSourcesModalDraftState {
@@ -1166,6 +1168,20 @@ function ColumnRenameIcon() {
   );
 }
 
+function ColumnClearIcon() {
+  return (
+    <svg aria-hidden="true" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
+      <path
+        d="M5 7h14M10 11v6M14 11v6M8 7l.6 12h6.8L16 7M10 7l.5-2h3L14 7"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.7"
+      />
+    </svg>
+  );
+}
+
 function formatColumnActionStatus(
   column: RepositoryManifestColumn,
   activeRun: RepositoryColumnRunStatus | null,
@@ -1308,6 +1324,7 @@ function ColumnRunScopeModal({
   startPending,
   onCancel,
   onChangeScope,
+  onChangeOverwrite,
   onConfirm,
 }: {
   draft: ColumnRunScopeDraftState;
@@ -1315,6 +1332,7 @@ function ColumnRunScopeModal({
   startPending: boolean;
   onCancel: () => void;
   onChangeScope: (scope: ColumnRunScope) => void;
+  onChangeOverwrite: (confirmOverwrite: boolean) => void;
   onConfirm: () => void;
 }) {
   const selectedDisabled = selectedCount === 0;
@@ -1376,6 +1394,23 @@ function ColumnRunScopeModal({
             </div>
           </button>
         </div>
+
+        {draft.scope !== "empty_only" && (
+          <label className="mt-4 flex items-start gap-2 rounded-md bg-surface-container-low p-3 text-body-md text-on-surface">
+            <input
+              checked={draft.confirmOverwrite}
+              disabled={startPending}
+              type="checkbox"
+              onChange={(event) => onChangeOverwrite(event.target.checked)}
+            />
+            <span>
+              Overwrite cells that already have values
+              <span className="mt-1 block text-on-surface-variant">
+                Use this after changing the prompt, row context, source text option, or model settings.
+              </span>
+            </span>
+          </label>
+        )}
 
         <div className="mt-5 flex justify-end gap-2">
           <Button disabled={startPending} onClick={onCancel}>
@@ -2120,6 +2155,7 @@ export function RepositoryBrowserPage() {
   const [showEnrichmentPanel, setShowEnrichmentPanel] = useState(true);
   const [showViewPanel, setShowViewPanel] = useState(true);
   const [browserTaskScope, setBrowserTaskScope] = useState<RepositoryBrowserTaskScope>("empty_only");
+  const [overwriteEnrichmentExisting, setOverwriteEnrichmentExisting] = useState(false);
   const [actionMessage, setActionMessage] = useState("");
   const [actionError, setActionError] = useState("");
   const [linksPending, setLinksPending] = useState(false);
@@ -2154,6 +2190,7 @@ export function RepositoryBrowserPage() {
   const [columnRunScopeDraft, setColumnRunScopeDraft] = useState<ColumnRunScopeDraftState | null>(null);
   const [columnRunStarting, setColumnRunStarting] = useState(false);
   const [columnRunJobId, setColumnRunJobId] = useState("");
+  const [columnClearPendingId, setColumnClearPendingId] = useState("");
   const [downloadSourcesModalDraft, setDownloadSourcesModalDraft] =
     useState<DownloadSourcesModalDraftState | null>(null);
   const [downloadSourcesModalError, setDownloadSourcesModalError] = useState("");
@@ -2898,8 +2935,88 @@ export function RepositoryBrowserPage() {
       columnId: column.key,
       label: labelRepositoryBrowserColumn(column.key, column.label),
       scope: selectedIds.size > 0 ? "selected" : "empty_only",
+      confirmOverwrite: false,
     });
     setActionError("");
+  };
+
+  const columnIsClearable = (column: RepositoryManifestColumn): boolean =>
+    column.kind === "custom" ||
+    [
+      "title",
+      "author_names",
+      "publication_date",
+      "publication_year",
+      "document_type",
+      "organization_name",
+      "organization_type",
+      "tags_text",
+      "notes",
+      "summary_text",
+      "rating_overall",
+      "rating_overall_relevance",
+      "rating_depth_score",
+      "rating_relevant_detail_score",
+      "rating_rationale",
+      "relevant_sections",
+      "rating_confidence",
+      "rating_raw_json",
+      "citation_title",
+      "citation_authors",
+      "citation_issued",
+      "citation_type",
+      "citation_url",
+      "citation_publisher",
+      "citation_container_title",
+      "citation_volume",
+      "citation_issue",
+      "citation_pages",
+      "citation_doi",
+      "citation_report_number",
+      "citation_standard_number",
+      "citation_language",
+      "citation_accessed",
+    ].includes(column.key);
+
+  const clearScopeForColumn = (): ColumnClearScope => {
+    if (selectedIds.size > 0) return "selected";
+    const activeFilter = Object.entries(filters).some(([key, value]) => {
+      if (["sortBy", "sortDir", "limit", "offset"].includes(key)) return false;
+      return String(value || "").trim() !== "";
+    });
+    return activeFilter ? "filtered" : "all";
+  };
+
+  const handleClearColumn = async (column: RepositoryManifestColumn) => {
+    if (!columnIsClearable(column) || columnClearPendingId) return;
+    const label = labelRepositoryBrowserColumn(column.key, column.label);
+    const scope = clearScopeForColumn();
+    const scopeLabel =
+      scope === "selected"
+        ? `${selectedIds.size} selected row${selectedIds.size === 1 ? "" : "s"}`
+        : scope === "filtered"
+          ? "the current filtered rows"
+          : "the whole repository";
+    const confirmed = window.confirm(`Clear ${label} for ${scopeLabel}?`);
+    if (!confirmed) return;
+
+    setColumnClearPendingId(column.key);
+    setActionMessage("");
+    setActionError("");
+    try {
+      const response = await api.clearRepositoryColumn(column.key, {
+        filters: buildRepositoryManifestFilterPayload(filters),
+        scope,
+        source_ids: scope === "selected" ? Array.from(selectedIds) : [],
+      });
+      await refreshDashboard();
+      await manifestQuery.refetch();
+      setActionMessage(response.message || `Cleared ${label}.`);
+    } catch (error) {
+      setActionError(String((error as Error).message || "Failed to clear column"));
+    } finally {
+      setColumnClearPendingId("");
+    }
   };
 
   const handleRunColumn = async (
@@ -2917,15 +3034,10 @@ export function RepositoryBrowserPage() {
         filters: buildRepositoryManifestFilterPayload(filters),
         scope: draft.scope === "all" ? "all" : draft.scope,
         source_ids: draft.scope === "selected" ? Array.from(selectedIds) : [],
-        confirm_overwrite: confirmOverwrite,
+        confirm_overwrite: confirmOverwrite || draft.confirmOverwrite,
       });
       if (response.status === "confirmation_required") {
-        const confirmed = window.confirm(
-          response.message || `Overwrite ${response.populated_rows} populated cell(s)?`,
-        );
-        if (confirmed) {
-          await handleRunColumn(draft, true);
-        }
+        setActionError(response.message || `Enable overwrite to replace ${response.populated_rows} populated cell(s).`);
         return;
       }
       setColumnRunJobId(response.job_id);
@@ -3298,6 +3410,7 @@ export function RepositoryBrowserPage() {
         scope: browserTaskScope,
         selectedSourceIds: selectedTaskIds,
         defaultProjectProfileName: settingsDraft.default_project_profile_name,
+        overwriteExisting: overwriteEnrichmentExisting,
       });
       await startSourceTaskQueue(
         queuedTasks,
@@ -3837,6 +3950,20 @@ export function RepositoryBrowserPage() {
               <option value="empty_only">Empty spaces only</option>
             </SelectField>
 
+            <label className="flex items-start gap-2 rounded-md bg-surface p-3 text-body-md text-on-surface">
+              <input
+                checked={overwriteEnrichmentExisting}
+                type="checkbox"
+                onChange={(event) => setOverwriteEnrichmentExisting(event.target.checked)}
+              />
+              <span>
+                Overwrite existing enrichment outputs
+                <span className="mt-1 block text-on-surface-variant">
+                  Rebuild selected fields when prompts, AI guidance, project profile, or model settings changed.
+                </span>
+              </span>
+            </label>
+
             <div className="rounded-md bg-surface p-3 text-body-md text-on-surface-variant">
               Catalog metadata updates browsing fields. Citation verification separately builds the
               authoritative RIS citation record from the available source metadata.
@@ -4325,6 +4452,18 @@ export function RepositoryBrowserPage() {
                             >
                               <ColumnRunIcon />
                             </button>
+                            <button
+                              aria-label={`Clear ${label}`}
+                              className={repositoryColumnActionButtonClass(
+                                !columnIsClearable(column) || Boolean(columnClearPendingId),
+                              )}
+                              disabled={!columnIsClearable(column) || Boolean(columnClearPendingId)}
+                              onClick={() => void handleClearColumn(column)}
+                              title={columnClearPendingId === column.key ? "Clearing" : "Clear column"}
+                              type="button"
+                            >
+                              <ColumnClearIcon />
+                            </button>
                             {column.renamable && (
                               <button
                                 aria-label={`Rename ${label}`}
@@ -4629,6 +4768,9 @@ export function RepositoryBrowserPage() {
           }}
           onChangeScope={(scope) =>
             setColumnRunScopeDraft((prev) => (prev ? { ...prev, scope } : prev))
+          }
+          onChangeOverwrite={(confirmOverwrite) =>
+            setColumnRunScopeDraft((prev) => (prev ? { ...prev, confirmOverwrite } : prev))
           }
           onConfirm={() => void handleRunColumn(columnRunScopeDraft)}
         />
