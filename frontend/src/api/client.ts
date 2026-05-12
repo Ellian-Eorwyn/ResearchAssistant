@@ -7,6 +7,7 @@ import type {
   IngestionProfileSuggestionActionResponse,
   IngestionProfileSuggestionListResponse,
   JobStatusResponse,
+  LLMCallLogSummary,
   ModelsResponse,
   PickDirectoryResponse,
   ProjectProfile,
@@ -194,6 +195,7 @@ export const api = {
   saveRepoSettings: (settings: RepoSettings) =>
     apiPut<RepoSettings>("repository/settings", settings),
   getModels: (query: URLSearchParams) => apiGet<ModelsResponse>(`models?${query.toString()}`),
+  getLlmCallLog: (limit = 20) => apiGet<LLMCallLogSummary>(`llm/call-log?limit=${limit}`),
   ingestRepositorySeedFiles: (files: File[]) =>
     apiPostFiles<RepositoryImportResponse>("repository/ingest/seed-files", files),
   ingestRepositoryDocuments: (files: File[]) =>

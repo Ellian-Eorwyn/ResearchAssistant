@@ -8,6 +8,7 @@ import logging
 
 import httpx
 
+from backend.llm.call_log import get_llm_call_logger
 from backend.models.settings import LLMBackendConfig
 
 logger = logging.getLogger(__name__)
@@ -71,10 +72,26 @@ class UnifiedLLMClient:
         response_format: str | None = "json",
     ) -> str:
         """Send a chat completion request and return the text response."""
-        if self.config.kind == "ollama":
-            return await self._ollama_chat(system_prompt, user_prompt, response_format)
-        else:
-            return await self._openai_chat(system_prompt, user_prompt, response_format)
+        call_id = get_llm_call_logger().start_chat(
+            self.config,
+            system_prompt,
+            user_prompt,
+            response_format,
+        )
+        try:
+            if self.config.kind == "ollama":
+                content, usage = await self._ollama_chat(
+                    system_prompt, user_prompt, response_format
+                )
+            else:
+                content, usage = await self._openai_chat(
+                    system_prompt, user_prompt, response_format
+                )
+            get_llm_call_logger().finish(call_id, response_text=content, usage=usage)
+            return content
+        except Exception as exc:
+            get_llm_call_logger().finish(call_id, error=exc)
+            raise
 
     def sync_chat_completion(
         self,
@@ -83,10 +100,26 @@ class UnifiedLLMClient:
         response_format: str | None = "json",
     ) -> str:
         """Synchronous chat completion using a shared httpx.Client."""
-        if self.config.kind == "ollama":
-            return self._ollama_chat_sync(system_prompt, user_prompt, response_format)
-        else:
-            return self._openai_chat_sync(system_prompt, user_prompt, response_format)
+        call_id = get_llm_call_logger().start_chat(
+            self.config,
+            system_prompt,
+            user_prompt,
+            response_format,
+        )
+        try:
+            if self.config.kind == "ollama":
+                content, usage = self._ollama_chat_sync(
+                    system_prompt, user_prompt, response_format
+                )
+            else:
+                content, usage = self._openai_chat_sync(
+                    system_prompt, user_prompt, response_format
+                )
+            get_llm_call_logger().finish(call_id, response_text=content, usage=usage)
+            return content
+        except Exception as exc:
+            get_llm_call_logger().finish(call_id, error=exc)
+            raise
 
     async def vision_ocr(
         self,
@@ -95,24 +128,41 @@ class UnifiedLLMClient:
         mime_type: str = "image/png",
     ) -> str:
         """Run OCR-style extraction from an image using a multimodal model."""
-        if self.config.kind == "ollama":
-            return await self._ollama_vision_ocr(prompt, image_bytes)
-        return await self._openai_vision_ocr(prompt, image_bytes, mime_type)
+        call_id = get_llm_call_logger().start_chat(
+            self.config,
+            "You are an OCR engine. Return only extracted text from the image.",
+            f"{prompt}\n\n[image: {mime_type}, {len(image_bytes)} bytes]",
+            None,
+            call_type="vision_ocr",
+        )
+        try:
+            if self.config.kind == "ollama":
+                content, usage = await self._ollama_vision_ocr(prompt, image_bytes)
+            else:
+                content, usage = await self._openai_vision_ocr(
+                    prompt, image_bytes, mime_type
+                )
+            get_llm_call_logger().finish(call_id, response_text=content, usage=usage)
+            return content
+        except Exception as exc:
+            get_llm_call_logger().finish(call_id, error=exc)
+            raise
 
     # ---- Async chat methods ----
 
     async def _ollama_chat(
         self, system: str, user: str, fmt: str | None
-    ) -> str:
+    ) -> tuple[str, dict]:
         base = self.config.base_url.rstrip("/")
         body = self._build_ollama_body(system, user, fmt)
         resp = await self._client.post(f"{base}/api/chat", json=body)
         resp.raise_for_status()
-        return resp.json()["message"]["content"]
+        data = resp.json()
+        return data["message"]["content"], _ollama_usage(data)
 
     async def _openai_chat(
         self, system: str, user: str, fmt: str | None
-    ) -> str:
+    ) -> tuple[str, dict]:
         base = self.config.base_url.rstrip("/")
         headers = self._openai_headers()
         body = self._build_openai_body(system, user, fmt)
@@ -125,7 +175,8 @@ class UnifiedLLMClient:
                 if resp.status_code == 404:
                     continue
                 resp.raise_for_status()
-                return resp.json()["choices"][0]["message"]["content"]
+                data = resp.json()
+                return data["choices"][0]["message"]["content"], data.get("usage", {})
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 404:
                     continue
@@ -137,7 +188,7 @@ class UnifiedLLMClient:
 
     def _ollama_chat_sync(
         self, system: str, user: str, fmt: str | None
-    ) -> str:
+    ) -> tuple[str, dict]:
         client = self._get_sync_client()
         base = self.config.base_url.rstrip("/")
         body = self._build_ollama_body(system, user, fmt)
@@ -145,11 +196,12 @@ class UnifiedLLMClient:
             f"{base}/api/chat", json=body, timeout=self.config.llm_timeout
         )
         resp.raise_for_status()
-        return resp.json()["message"]["content"]
+        data = resp.json()
+        return data["message"]["content"], _ollama_usage(data)
 
     def _openai_chat_sync(
         self, system: str, user: str, fmt: str | None
-    ) -> str:
+    ) -> tuple[str, dict]:
         client = self._get_sync_client()
         base = self.config.base_url.rstrip("/")
         headers = self._openai_headers()
@@ -166,7 +218,8 @@ class UnifiedLLMClient:
                 if resp.status_code == 404:
                     continue
                 resp.raise_for_status()
-                return resp.json()["choices"][0]["message"]["content"]
+                data = resp.json()
+                return data["choices"][0]["message"]["content"], data.get("usage", {})
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 404:
                     continue
@@ -215,7 +268,9 @@ class UnifiedLLMClient:
 
     # ---- Vision methods (async only) ----
 
-    async def _ollama_vision_ocr(self, prompt: str, image_bytes: bytes) -> str:
+    async def _ollama_vision_ocr(
+        self, prompt: str, image_bytes: bytes
+    ) -> tuple[str, dict]:
         base = self.config.base_url.rstrip("/")
         image_b64 = base64.b64encode(image_bytes).decode("ascii")
         body: dict = {
@@ -241,14 +296,15 @@ class UnifiedLLMClient:
             body["think"] = think_value
         resp = await self._client.post(f"{base}/api/chat", json=body)
         resp.raise_for_status()
-        return str(resp.json().get("message", {}).get("content", "")).strip()
+        data = resp.json()
+        return str(data.get("message", {}).get("content", "")).strip(), _ollama_usage(data)
 
     async def _openai_vision_ocr(
         self,
         prompt: str,
         image_bytes: bytes,
         mime_type: str,
-    ) -> str:
+    ) -> tuple[str, dict]:
         base = self.config.base_url.rstrip("/")
         headers = self._openai_headers()
         image_b64 = base64.b64encode(image_bytes).decode("ascii")
@@ -283,8 +339,9 @@ class UnifiedLLMClient:
                 if resp.status_code == 404:
                     continue
                 resp.raise_for_status()
-                message = resp.json()["choices"][0]["message"]["content"]
-                return _normalize_openai_message_content(message)
+                data = resp.json()
+                message = data["choices"][0]["message"]["content"]
+                return _normalize_openai_message_content(message), data.get("usage", {})
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 404:
                     continue
@@ -311,6 +368,19 @@ def _normalize_openai_message_content(content: object) -> str:
                     parts.append(text.strip())
         return "\n".join(parts).strip()
     return str(content).strip()
+
+
+def _ollama_usage(data: dict) -> dict[str, int]:
+    prompt_tokens = data.get("prompt_eval_count")
+    completion_tokens = data.get("eval_count")
+    usage: dict[str, int] = {}
+    if isinstance(prompt_tokens, int):
+        usage["prompt_tokens"] = prompt_tokens
+    if isinstance(completion_tokens, int):
+        usage["completion_tokens"] = completion_tokens
+    if isinstance(prompt_tokens, int) and isinstance(completion_tokens, int):
+        usage["total_tokens"] = prompt_tokens + completion_tokens
+    return usage
 
 
 def _ollama_think_value(think_mode: str) -> bool | None:

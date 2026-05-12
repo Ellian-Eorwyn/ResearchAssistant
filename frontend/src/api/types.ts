@@ -303,6 +303,42 @@ export interface ModelsResponse {
   error: string;
 }
 
+export interface LLMCallLogEntry {
+  id: string;
+  started_at: string;
+  completed_at: string;
+  status: "running" | "completed" | "failed" | string;
+  backend_kind: string;
+  base_url: string;
+  model: string;
+  response_format: string | null;
+  call_type: string;
+  system_prompt: string;
+  user_prompt: string;
+  prompt_preview: string;
+  prompt_chars: number;
+  estimated_context_tokens: number;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  total_tokens: number | null;
+  context_tokens_used: number;
+  response_chars: number;
+  duration_ms: number;
+  error: string;
+}
+
+export interface LLMCallLogSummary {
+  session_started_at: string;
+  total_calls: number;
+  completed_calls: number;
+  failed_calls: number;
+  running_calls: number;
+  largest_context_tokens: number;
+  largest_call: LLMCallLogEntry | null;
+  recent_calls: LLMCallLogEntry[];
+  log_file: string;
+}
+
 export interface BibliographyEntry {
   ref_number: number;
   authors: string[];

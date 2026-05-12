@@ -12,7 +12,19 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.models.settings import AppSettings, LLMBackendConfig, RepoSettings
-from backend.routers import agent, pipeline, repository, results, search, settings, sources, spreadsheets, upload
+from backend.llm.call_log import get_llm_call_logger
+from backend.routers import (
+    agent,
+    llm_logs,
+    pipeline,
+    repository,
+    results,
+    search,
+    settings,
+    sources,
+    spreadsheets,
+    upload,
+)
 from backend.storage.attached_repository import AttachedRepositoryService
 from backend.storage.file_store import FileStore
 from backend.storage.spreadsheet_workspace import SpreadsheetWorkspaceService
@@ -81,6 +93,7 @@ def create_app() -> FastAPI:
     # Initialize file store
     data_dir = Path(__file__).parent.parent / "data"
     store = FileStore(base_dir=data_dir)
+    get_llm_call_logger(data_dir)
     app.state.file_store = store
     repository_service = AttachedRepositoryService(store=store)
     app.state.repository_service = repository_service
@@ -110,6 +123,7 @@ def create_app() -> FastAPI:
     app.include_router(settings.router, prefix="/api", tags=["settings"])
     app.include_router(repository.router, prefix="/api", tags=["repository"])
     app.include_router(agent.router, prefix="/api", tags=["agent"])
+    app.include_router(llm_logs.router, prefix="/api", tags=["llm"])
     app.include_router(search.router, prefix="/api", tags=["search"])
     app.include_router(spreadsheets.router, prefix="/api", tags=["spreadsheets"])
 

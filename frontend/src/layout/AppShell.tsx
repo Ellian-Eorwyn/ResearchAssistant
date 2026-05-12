@@ -1,6 +1,8 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 
+import { api } from "../api/client";
+import type { LLMCallLogEntry, LLMCallLogSummary } from "../api/types";
 import { Button, StatusBadge } from "../components/primitives";
 import { useAppState } from "../state/AppState";
 
@@ -55,6 +57,25 @@ function statusTone(state: string | undefined): "neutral" | "active" | "warning"
   return "neutral";
 }
 
+function formatTokens(value: number | null | undefined): string {
+  if (!value) return "0";
+  if (value >= 1000) return `${(value / 1000).toFixed(value >= 10000 ? 0 : 1)}k`;
+  return String(value);
+}
+
+function formatLocalDate(value: string): string {
+  if (!value) return "In progress";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString();
+}
+
+function promptLabel(call: LLMCallLogEntry): string {
+  const promptTokens = call.prompt_tokens ?? call.estimated_context_tokens;
+  const source = call.prompt_tokens == null ? "est." : "reported";
+  return `${formatTokens(promptTokens)} context (${source})`;
+}
+
 export function AppShell() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -80,6 +101,9 @@ export function AppShell() {
 
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [legacyOpen, setLegacyOpen] = useState(false);
+  const [llmLogOpen, setLlmLogOpen] = useState(false);
+  const [llmLog, setLlmLog] = useState<LLMCallLogSummary | null>(null);
+  const [llmLogError, setLlmLogError] = useState("");
 
   const repoName = useMemo(() => {
     if (!repositoryStatus?.path) return "No Repository";
@@ -143,6 +167,21 @@ export function AppShell() {
 
   const repoState = repositoryStatus?.download_state || "idle";
   const isBrowserRoute = location.pathname === "/browser";
+
+  const refreshLlmLog = useCallback(async () => {
+    try {
+      setLlmLog(await api.getLlmCallLog(20));
+      setLlmLogError("");
+    } catch (error) {
+      setLlmLogError(error instanceof Error ? error.message : "Could not load LLM log");
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshLlmLog();
+    const timer = window.setInterval(() => void refreshLlmLog(), 5000);
+    return () => window.clearInterval(timer);
+  }, [refreshLlmLog]);
 
   const handleOpenProject = useCallback(async () => {
     const seedPath = repositoryStatus?.path || lastRepositoryPath;
@@ -330,6 +369,17 @@ export function AppShell() {
           <div className="truncate text-right font-mono text-label-sm text-on-surface-variant">
             {sourceStatus?.message || dashboard?.recent_jobs?.[0]?.message || "No active jobs"}
           </div>
+          <button
+            className="shrink-0 rounded-md bg-surface-variant px-3 py-2 font-mono text-label-sm text-on-surface-variant hover:bg-surface-container-highest"
+            onClick={() => {
+              setLlmLogOpen(true);
+              void refreshLlmLog();
+            }}
+            title="Show LLM call context log"
+            type="button"
+          >
+            LLM {formatTokens(llmLog?.largest_context_tokens || 0)}
+          </button>
           {sourceRunning && sourceTaskJobId && (
             <Button
               disabled={sourceStopping}
@@ -341,6 +391,106 @@ export function AppShell() {
           )}
         </div>
       </footer>
+
+      {llmLogOpen && (
+        <div className="fixed inset-0 z-50 flex items-end justify-end bg-surface/80 p-4 backdrop-blur-sm" role="dialog" aria-modal="true">
+          <div className="thin-scrollbar max-h-[82vh] w-full max-w-3xl overflow-y-auto rounded-lg border border-outline-variant/40 bg-surface p-4 shadow-xl">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h2 className="text-title-lg font-bold">LLM Call Log</h2>
+                <p className="mt-1 text-body-sm text-on-surface-variant">
+                  Largest completed context this session:{" "}
+                  <span className="font-mono text-on-surface">
+                    {formatTokens(llmLog?.largest_context_tokens || 0)} tokens
+                  </span>
+                </p>
+              </div>
+              <Button variant="secondary" onClick={() => setLlmLogOpen(false)}>Close</Button>
+            </div>
+
+            {llmLogError && (
+              <div className="mt-4 rounded-md border border-error/40 bg-error/10 p-3 text-body-sm text-error">
+                {llmLogError}
+              </div>
+            )}
+
+            <div className="mt-4 grid gap-3 text-body-sm md:grid-cols-4">
+              <div>
+                <div className="text-label-sm uppercase tracking-[0.08em] text-on-surface-variant">Calls</div>
+                <div className="font-mono text-title-md">{llmLog?.total_calls || 0}</div>
+              </div>
+              <div>
+                <div className="text-label-sm uppercase tracking-[0.08em] text-on-surface-variant">Completed</div>
+                <div className="font-mono text-title-md">{llmLog?.completed_calls || 0}</div>
+              </div>
+              <div>
+                <div className="text-label-sm uppercase tracking-[0.08em] text-on-surface-variant">Failed</div>
+                <div className="font-mono text-title-md">{llmLog?.failed_calls || 0}</div>
+              </div>
+              <div>
+                <div className="text-label-sm uppercase tracking-[0.08em] text-on-surface-variant">Log File</div>
+                <div className="truncate font-mono text-label-sm" title={llmLog?.log_file || ""}>
+                  {llmLog?.log_file || "Not started"}
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-5 space-y-3">
+              {(llmLog?.recent_calls || []).length === 0 ? (
+                <div className="rounded-md bg-surface-container p-4 text-body-md text-on-surface-variant">
+                  No LLM calls have been recorded in this app session yet.
+                </div>
+              ) : (
+                llmLog?.recent_calls.map((call) => (
+                  <details key={call.id} className="rounded-md bg-surface-container p-3 ghost-border">
+                    <summary className="cursor-pointer list-none">
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="font-mono text-label-sm text-on-surface-variant">
+                            {formatLocalDate(call.completed_at || call.started_at)} · {call.call_type} · {call.status}
+                          </div>
+                          <div className="truncate text-body-md" title={call.prompt_preview}>
+                            {call.prompt_preview || "No prompt text"}
+                          </div>
+                        </div>
+                        <div className="shrink-0 text-right font-mono text-label-sm">
+                          <div>{promptLabel(call)}</div>
+                          <div className="text-on-surface-variant">
+                            {formatTokens(call.prompt_chars)} chars · {call.duration_ms} ms
+                          </div>
+                        </div>
+                      </div>
+                    </summary>
+                    <div className="mt-3 grid gap-3">
+                      <div className="grid gap-1">
+                        <div className="text-label-sm uppercase tracking-[0.08em] text-on-surface-variant">
+                          System Prompt
+                        </div>
+                        <pre className="thin-scrollbar max-h-48 overflow-auto rounded-md bg-surface-container-lowest p-3 text-label-sm">
+                          {call.system_prompt || "(empty)"}
+                        </pre>
+                      </div>
+                      <div className="grid gap-1">
+                        <div className="text-label-sm uppercase tracking-[0.08em] text-on-surface-variant">
+                          User Prompt
+                        </div>
+                        <pre className="thin-scrollbar max-h-72 overflow-auto rounded-md bg-surface-container-lowest p-3 text-label-sm">
+                          {call.user_prompt || "(empty)"}
+                        </pre>
+                      </div>
+                      {call.error && (
+                        <div className="rounded-md border border-error/40 bg-error/10 p-3 text-body-sm text-error">
+                          {call.error}
+                        </div>
+                      )}
+                    </div>
+                  </details>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
