@@ -160,6 +160,46 @@ If you have uncommitted local changes, the pull will fail safely — commit or s
 
 ---
 
+## Launch On Startup
+
+To install a systemd service that starts ResearchAssistant automatically at boot:
+
+```bash
+sudo ./scripts/install_systemd_service.sh
+```
+
+This installs `researchassistant.service`, enables it, and starts it immediately.
+
+Default service behavior:
+
+- runs as the current user
+- starts `run.py` directly from `.venv`
+- disables browser auto-open
+- restarts automatically if the process exits
+
+Optional overrides can be placed in:
+
+```bash
+/etc/default/researchassistant
+```
+
+Example:
+
+```bash
+RA_HOST=127.0.0.1
+RA_PORT=7995
+```
+
+Useful commands:
+
+```bash
+sudo systemctl status researchassistant
+sudo systemctl restart researchassistant
+sudo journalctl -u researchassistant -f
+```
+
+---
+
 ## Development
 
 ### Hot-reload mode
