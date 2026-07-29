@@ -352,6 +352,18 @@ npm run build
 - Pydantic models
 - Playwright Chromium for web capture support
 - OpenPyXL for spreadsheet export
+- yt-dlp for downloading videos discovered inside sources
+
+### Optional external tools
+
+Both are detected at runtime. If either is missing the app still runs and
+reports what is unavailable in the job's runtime notes.
+
+- `tesseract` — gives scanned PDFs a searchable, highlightable text layer.
+  Install with `brew install tesseract`.
+- `ffmpeg` — lets video downloads combine the best separate video and audio
+  streams. Without it, downloads fall back to a single combined stream.
+  Install with `brew install ffmpeg`.
 
 ---
 

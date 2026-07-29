@@ -96,7 +96,11 @@ export const REPOSITORY_BROWSER_FILE_COLUMNS: Array<{
   { id: "file_pdf", kind: "pdf", label: "PDF" },
   { id: "file_html", kind: "html", label: "HTML" },
   { id: "file_rendered", kind: "rendered", label: "Rendered" },
+  { id: "file_ocr", kind: "ocr", label: "OCR PDF" },
   { id: "file_md", kind: "md", label: "MD" },
+  { id: "file_video", kind: "video", label: "Video" },
+  { id: "file_audio", kind: "audio", label: "Audio" },
+  { id: "file_thumbnail", kind: "thumbnail", label: "Thumb" },
 ];
 
 export const REPOSITORY_BROWSER_BIBLIOGRAPHY_COLUMNS = [
@@ -143,6 +147,10 @@ export const REPOSITORY_BROWSER_COLUMN_CATEGORIES: RepositoryBrowserColumnCatego
       "fetch_status",
       "fetched_at",
       "markdown_char_count",
+      "discovered_media_count",
+      "discovered_media_urls",
+      "discovered_from",
+      "media_duration_seconds",
     ],
   },
   {
@@ -193,6 +201,8 @@ export const REPOSITORY_BROWSER_COLUMN_CATEGORIES: RepositoryBrowserColumnCatego
       "llm_cleanup_status",
       "summary_status",
       "rating_status",
+      "ocr_status",
+      "media_status",
       "error_message",
     ],
   },
@@ -284,6 +294,12 @@ export function buildRepositoryBrowserSourceTaskQueue({
     include_rendered_html: true,
     include_rendered_pdf: true,
     include_markdown: true,
+    include_ocr_pdf: true,
+    extract_media_links: true,
+    download_media_transcript: true,
+    download_media_video: false,
+    download_media_audio: true,
+    download_media_thumbnail: true,
     project_profile_name: draft.project_profile_name || defaultProjectProfileName,
   };
 
@@ -421,6 +437,12 @@ export function buildRepositoryBrowserDownloadTaskPayload({
     include_rendered_html: Boolean(draft.include_rendered_html),
     include_rendered_pdf: Boolean(draft.include_rendered_pdf),
     include_markdown: includeMarkdown,
+    include_ocr_pdf: Boolean(draft.include_ocr_pdf),
+    extract_media_links: Boolean(draft.extract_media_links),
+    download_media_transcript: Boolean(draft.download_media_transcript),
+    download_media_video: Boolean(draft.download_media_video),
+    download_media_audio: Boolean(draft.download_media_audio),
+    download_media_thumbnail: Boolean(draft.download_media_thumbnail),
     project_profile_name: draft.project_profile_name || defaultProjectProfileName,
   };
 }
@@ -443,6 +465,12 @@ export function defaultRepositoryBrowserColumnWidth(columnKey: string): number {
     fetch_status: 140,
     fetched_at: 180,
     markdown_char_count: 150,
+    ocr_status: 150,
+    media_status: 150,
+    media_duration_seconds: 150,
+    discovered_from: 150,
+    discovered_media_count: 160,
+    discovered_media_urls: 320,
     summary_text: 380,
     rating_overall_relevance: 160,
     rating_depth_score: 140,

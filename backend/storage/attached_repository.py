@@ -200,10 +200,14 @@ CITATIONS_CSV_NAME = "citations.csv"
 CITATIONS_XLSX_NAME = "citations.xlsx"
 REPO_JOB_PREFIX = "repo"
 
+# Text-bearing artifacts copied into a job output dir for reprocessing. Media
+# files are deliberately excluded -- they can be very large and no downstream
+# phase reads them.
 JOB_SEED_FILE_FIELDS = [
     "raw_file",
     "rendered_file",
     "rendered_pdf_file",
+    "ocr_pdf_file",
     "markdown_file",
     "llm_cleanup_file",
     "catalog_file",
@@ -237,12 +241,16 @@ FILE_FIELDS = [
     "raw_file",
     "rendered_file",
     "rendered_pdf_file",
+    "ocr_pdf_file",
     "markdown_file",
     "llm_cleanup_file",
     "catalog_file",
     "summary_file",
     "rating_file",
     "metadata_file",
+    "video_file",
+    "audio_file",
+    "thumbnail_file",
 ]
 
 REPOSITORY_BUNDLE_FILE_KINDS = ("pdf", "rendered", "html", "md")
@@ -6032,6 +6040,12 @@ class AttachedRepositoryService:
                     include_rendered_html=payload.include_rendered_html,
                     include_rendered_pdf=payload.include_rendered_pdf,
                     include_markdown=payload.include_markdown,
+                    include_ocr_pdf=payload.include_ocr_pdf,
+                    extract_media_links=payload.extract_media_links,
+                    download_media_transcript=payload.download_media_transcript,
+                    download_media_video=payload.download_media_video,
+                    download_media_audio=payload.download_media_audio,
+                    download_media_thumbnail=payload.download_media_thumbnail,
                 ),
             )
             if not selected_rows:
@@ -6093,6 +6107,12 @@ class AttachedRepositoryService:
                     include_rendered_html=payload.include_rendered_html,
                     include_rendered_pdf=payload.include_rendered_pdf,
                     include_markdown=payload.include_markdown,
+                    include_ocr_pdf=payload.include_ocr_pdf,
+                    extract_media_links=payload.extract_media_links,
+                    download_media_transcript=payload.download_media_transcript,
+                    download_media_video=payload.download_media_video,
+                    download_media_audio=payload.download_media_audio,
+                    download_media_thumbnail=payload.download_media_thumbnail,
                 ),
                 target_rows=[row.model_copy(deep=True) for row in selected_rows],
                 output_dir=self.path,
@@ -6102,6 +6122,7 @@ class AttachedRepositoryService:
                 selected_import_id=selected_import_id,
                 selected_phases=selected_phases,
                 row_persist_callback=self._persist_source_task_row,
+                reserve_source_id_callback=self._reserve_repository_source_id,
             )
 
             if live_jobs is not None and live_jobs_lock is not None:
@@ -6161,6 +6182,30 @@ class AttachedRepositoryService:
             if self._download_state in {"running", "cancelling"}:
                 self._download_state = "cancelling"
                 self._download_message = (message or "Stop requested").strip()
+
+    def _reserve_repository_source_id(self) -> str:
+        """Claim the next source id for a row discovered during a download run.
+
+        Reserving under the writer lock and immediately persisting the bumped
+        counter keeps a concurrent import from handing out the same id.
+        """
+        with self._writer_lock():
+            meta = self._load_meta_locked()
+            state = self._load_state_locked()
+            rows = _load_source_rows(state.get("sources", []))
+            next_source_id = max(
+                int(meta.get("next_source_id") or 1),
+                _next_source_id_from_rows(rows),
+            )
+            self._save_meta_locked(
+                {
+                    **meta,
+                    "schema_version": SCHEMA_VERSION,
+                    "next_source_id": next_source_id + 1,
+                    "updated_at": _utc_now_iso(),
+                }
+            )
+            return f"{next_source_id:06d}"
 
     def _persist_source_task_row(self, row: SourceManifestRow) -> None:
         with self._writer_lock():
@@ -7460,6 +7505,21 @@ class AttachedRepositoryService:
             if rendered_path is not None:
                 return rendered_path
             return None
+
+        if normalized_kind == "ocr":
+            return self._resolve_repository_artifact_path(
+                row,
+                "ocr_pdf_file",
+                row.ocr_pdf_file,
+            )
+
+        if normalized_kind in {"video", "audio", "thumbnail"}:
+            field_name = f"{normalized_kind}_file"
+            return self._resolve_repository_artifact_path(
+                row,
+                field_name,
+                getattr(row, field_name, ""),
+            )
 
         cleanup_path = self._resolve_repository_artifact_path(
             row,
@@ -8803,10 +8863,14 @@ def _split_relevant_sections_text(value: Any) -> list[str]:
     return [item for item in items if item]
 
 
+SOURCE_FILE_KINDS = ("pdf", "html", "rendered", "ocr", "md", "video", "audio", "thumbnail")
+
+
 def _normalize_source_file_kind(value: str) -> str:
     normalized = str(value or "").strip().lower()
-    if normalized not in {"pdf", "html", "rendered", "md"}:
-        raise ValueError("Invalid file kind. Use `pdf`, `html`, `rendered`, or `md`.")
+    if normalized not in SOURCE_FILE_KINDS:
+        allowed = ", ".join(f"`{kind}`" for kind in SOURCE_FILE_KINDS)
+        raise ValueError(f"Invalid file kind. Use one of: {allowed}.")
     return normalized
 
 
@@ -9159,7 +9223,7 @@ def _media_type_for_repository_source_path(path: Path, kind: str) -> str:
         return "application/pdf"
     if suffix in {".html", ".htm"}:
         return "text/html; charset=utf-8"
-    if suffix in {".md", ".markdown", ".txt"}:
+    if suffix in {".md", ".markdown", ".txt", ".vtt", ".srt"}:
         return "text/plain; charset=utf-8"
 
     guessed, _ = mimetypes.guess_type(path.name)
@@ -9168,8 +9232,12 @@ def _media_type_for_repository_source_path(path: Path, kind: str) -> str:
     return {
         "pdf": "application/pdf",
         "rendered": "application/pdf",
+        "ocr": "application/pdf",
         "html": "text/html; charset=utf-8",
         "md": "text/plain; charset=utf-8",
+        "video": "video/mp4",
+        "audio": "audio/mp4",
+        "thumbnail": "image/jpeg",
     }[_normalize_source_file_kind(kind)]
 
 

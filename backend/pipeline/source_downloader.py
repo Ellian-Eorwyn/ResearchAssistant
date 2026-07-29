@@ -55,7 +55,22 @@ from backend.models.sources import (
     SourceManifestRow,
     SourcePhaseMetadata,
 )
+from backend.pipeline.media_links import (
+    DiscoveredMedia,
+    extract_youtube_urls,
+    is_media_platform_url,
+    merge_discovered_media,
+    youtube_dedupe_key,
+    youtube_video_id,
+)
 from backend.pipeline.standardized_markdown import extract_markdown_title_candidate
+from backend.pipeline.video_downloader import (
+    build_info_json,
+    build_transcript_markdown,
+    fetch_video_assets,
+    ffmpeg_available,
+    yt_dlp_available,
+)
 from backend.search.searxng_client import SearXNGClient
 from backend.storage.file_store import FileStore
 
@@ -78,6 +93,12 @@ MIN_MARKDOWN_SCORE = 180
 MIN_FALLBACK_MARKDOWN_SCORE = 20
 MAX_CLEANUP_SOURCE_CHARS = 24000  # legacy fallback
 MAX_SUMMARY_SOURCE_CHARS = 20000  # legacy fallback
+OCR_PDF_PAGE_TIMEOUT_SECONDS = 90
+OCR_PDF_RENDER_SCALE = 2.0
+# PDF page dimensions are capped at 200in (14400pt); stay clear of the boundary.
+MAX_VECTOR_PDF_PAGE_POINTS = 14000
+MAX_MEDIA_DISCOVERY_DEPTH = 1
+MAX_DISCOVERED_MEDIA_PER_SOURCE = 10
 
 NOTE_RUNTIME_MISSING_TRAFILATURA = "runtime_missing_trafilatura"
 NOTE_RUNTIME_MISSING_PLAYWRIGHT = "runtime_missing_playwright"
@@ -99,6 +120,15 @@ NOTE_RATING_GENERATION_FAILED = "rating_generation_failed"
 NOTE_RATING_SKIPPED_LLM_NOT_CONFIGURED = "rating_skipped_llm_not_configured"
 NOTE_VISUAL_CAPTURE_FAILED = "visual_capture_failed"
 NOTE_VISUAL_CAPTURE_SEGMENTED = "visual_capture_segmented"
+NOTE_RUNTIME_MISSING_YTDLP = "runtime_missing_yt_dlp"
+NOTE_RUNTIME_MISSING_FFMPEG = "runtime_missing_ffmpeg"
+NOTE_RENDER_PDF_VECTOR = "render_pdf_vector"
+NOTE_RENDER_PDF_SCREENSHOT = "render_pdf_screenshot"
+NOTE_OCR_PDF_FAILED = "ocr_pdf_failed"
+NOTE_OCR_PDF_PARTIAL = "ocr_pdf_partial"
+NOTE_MEDIA_LINKS_FOUND = "media_links_found"
+NOTE_MEDIA_DOWNLOAD_FAILED = "media_download_failed"
+NOTE_MEDIA_TRANSCRIPT_MISSING = "media_transcript_missing"
 PHASE_FETCH = "fetch"
 PHASE_CONVERT = "convert"
 PHASE_CLEANUP = "cleanup"
@@ -127,6 +157,8 @@ PROMPT_VERSION_RATING = "source_rating.v1"
 INSTALL_BOOTSTRAP_COMMAND = "./scripts/bootstrap_venv.sh"
 INSTALL_REQUIREMENTS_COMMAND = ".venv/bin/python -m pip install -r requirements.txt"
 INSTALL_PLAYWRIGHT_BROWSER_COMMAND = ".venv/bin/python -m playwright install chromium"
+INSTALL_TESSERACT_COMMAND = "brew install tesseract"
+INSTALL_FFMPEG_COMMAND = "brew install ffmpeg"
 
 PDF_NATIVE_PAGE_MIN_CHARS = 120
 PDF_NATIVE_DOC_MIN_AVG_CHARS = 180
@@ -341,6 +373,11 @@ class SourceTarget:
     source_document_name: str
     citation_number: str
     original_url: str
+    # Set when this target was discovered inside another source rather than
+    # supplied by the user; drives provenance and the discovery depth cap.
+    discovered_from: str = ""
+    discovery_depth: int = 0
+    source_kind: str = "url"
 
 
 @dataclass
@@ -350,6 +387,8 @@ class RuntimeCapabilities:
     playwright_browser_available: bool
     textutil_available: bool
     tesseract_available: bool
+    yt_dlp_available: bool
+    ffmpeg_available: bool
     llm_vision_enabled: bool
     runtime_notes: list[str]
     runtime_guidance: list[dict[str, str]]
@@ -484,8 +523,10 @@ class PlaywrightRenderer:
         self,
         timeout_ms: int = PLAYWRIGHT_TIMEOUT_MS,
         startup_error: str = "",
+        ocr_fallback_enabled: bool = True,
     ):
         self.timeout_ms = timeout_ms
+        self.ocr_fallback_enabled = ocr_fallback_enabled
         self._playwright = None
         self._browser = None
         self._startup_error: str = startup_error
@@ -534,22 +575,65 @@ class PlaywrightRenderer:
             page.close()
 
     def _page_to_visual_pdf(self, page, notes: list[str]) -> bytes:
+        """Produce the capture PDF, preferring a real text layer over pixels.
+
+        Chromium's own PDF writer emits vector text that is exactly accurate, so it
+        is tried first. Only when it fails do we fall back to screenshots, and those
+        get an OCR text layer so the result is still selectable.
+        """
+        vector_pdf = self._page_to_vector_pdf(page)
+        if vector_pdf:
+            notes.append(NOTE_RENDER_PDF_VECTOR)
+            return vector_pdf
+
+        notes.append(NOTE_RENDER_PDF_SCREENSHOT)
         full_page_error: Exception | None = None
         try:
-            full_page_png = page.screenshot(type="png", full_page=True)
-            return png_images_to_pdf_bytes([full_page_png])
+            images = [page.screenshot(type="png", full_page=True)]
         except Exception as exc:
             full_page_error = exc
+            images = self._capture_segmented_screenshots(page)
+            if images:
+                notes.append(NOTE_VISUAL_CAPTURE_SEGMENTED)
 
-        segmented_pngs = self._capture_segmented_screenshots(page)
-        if segmented_pngs:
-            notes.append(NOTE_VISUAL_CAPTURE_SEGMENTED)
-            return png_images_to_pdf_bytes(segmented_pngs)
-        if full_page_error:
-            raise full_page_error
-        raise RuntimeError("visual_capture_failed: no screenshot data")
+        if not images:
+            if full_page_error:
+                raise full_page_error
+            raise RuntimeError("visual_capture_failed: no screenshot data")
 
-    def _capture_segmented_screenshots(self, page) -> list[bytes]:
+        if not self.ocr_fallback_enabled:
+            return png_images_to_pdf_bytes(images)
+
+        pdf_bytes, ocr_notes = png_images_to_searchable_pdf_bytes(images)
+        notes.extend(ocr_notes)
+        return pdf_bytes
+
+    def _page_to_vector_pdf(self, page) -> bytes:
+        """Render the page via Chromium's PDF writer, keeping the on-screen layout.
+
+        `emulate_media("screen")` stops print stylesheets from restyling the page.
+        A single page tall enough to hold the whole document reproduces the
+        full-page screenshot layout; documents past the PDF size cap fall back to
+        viewport-height pagination.
+        """
+        try:
+            page.emulate_media(media="screen")
+            total_height = self._measure_scroll_height(page)
+            page_height = total_height
+            if page_height > MAX_VECTOR_PDF_PAGE_POINTS:
+                page_height = PLAYWRIGHT_VIEWPORT_HEIGHT
+            return page.pdf(
+                width=f"{PLAYWRIGHT_VIEWPORT_WIDTH}px",
+                height=f"{max(page_height, 1)}px",
+                print_background=True,
+                margin={"top": "0", "bottom": "0", "left": "0", "right": "0"},
+                scale=1,
+                prefer_css_page_size=False,
+            )
+        except Exception:
+            return b""
+
+    def _measure_scroll_height(self, page) -> int:
         viewport = page.viewport_size or {}
         viewport_height = int(viewport.get("height") or PLAYWRIGHT_VIEWPORT_HEIGHT)
         if viewport_height <= 0:
@@ -565,8 +649,15 @@ class PlaywrightRenderer:
             )"""
         )
         total_height = int(scroll_height or viewport_height)
-        if total_height <= 0:
-            total_height = viewport_height
+        return total_height if total_height > 0 else viewport_height
+
+    def _capture_segmented_screenshots(self, page) -> list[bytes]:
+        viewport = page.viewport_size or {}
+        viewport_height = int(viewport.get("height") or PLAYWRIGHT_VIEWPORT_HEIGHT)
+        if viewport_height <= 0:
+            viewport_height = PLAYWRIGHT_VIEWPORT_HEIGHT
+
+        total_height = self._measure_scroll_height(page)
 
         max_scroll = max(total_height - viewport_height, 0)
         captures: list[bytes] = []
@@ -645,6 +736,7 @@ class SourceDownloadOrchestrator:
         selected_import_id: str = "",
         selected_phases: list[str] | None = None,
         row_persist_callback: Callable[[SourceManifestRow], None] | None = None,
+        reserve_source_id_callback: Callable[[], str] | None = None,
     ):
         self.job_id = job_id
         self.store = store
@@ -699,11 +791,17 @@ class SourceDownloadOrchestrator:
             }
         ]
         self.row_persist_callback = row_persist_callback
+        self.reserve_source_id_callback = reserve_source_id_callback
         self.logs_dir = self.execution_output_dir / "logs"
         self.log_file = self.logs_dir / "source_download.jsonl"
         self.status: SourceDownloadStatus | None = None
         self._status_items: dict[str, SourceItemStatus] = {}
         self.duplicate_urls_removed = 0
+        # Videos found on the page currently being processed, drained by the run
+        # loop once the parent row is finalized.
+        self._pending_discoveries: list[tuple[str, int, DiscoveredMedia]] = []
+        self._discovered_media_keys: set[str] = set()
+        self._next_standalone_source_id = 0
         self._cancel_event = threading.Event()
         self._llm_client: UnifiedLLMClient | None = None
         self._incremental_save_counter: int = 0
@@ -714,6 +812,8 @@ class SourceDownloadOrchestrator:
             playwright_browser_available=False,
             textutil_available=check_textutil_available(),
             tesseract_available=check_tesseract_available(),
+            yt_dlp_available=yt_dlp_available(),
+            ffmpeg_available=ffmpeg_available(),
             llm_vision_enabled=False,
             runtime_notes=[],
             runtime_guidance=[],
@@ -884,6 +984,7 @@ class SourceDownloadOrchestrator:
                 runtime_capabilities=self.runtime_capabilities,
                 existing_rows=previous_rows,
             )
+            self._seed_discovery_state(targets, previous_rows)
             self._append_log(
                 {
                     "event": "started",
@@ -929,7 +1030,10 @@ class SourceDownloadOrchestrator:
                     renderer_startup_error = (
                         f"playwright_not_installed: run `{INSTALL_BOOTSTRAP_COMMAND}`"
                     )
-            renderer = PlaywrightRenderer(startup_error=renderer_startup_error)
+            renderer = PlaywrightRenderer(
+                startup_error=renderer_startup_error,
+                ocr_fallback_enabled=self.output_options.include_ocr_pdf,
+            )
 
             cancelled = False
             try:
@@ -941,7 +1045,6 @@ class SourceDownloadOrchestrator:
                         "Accept": "*/*",
                     },
                 ) as client:
-                    last_idx = len(targets) - 1
                     for idx, target in enumerate(targets):
                         if self._cancel_event.is_set():
                             cancelled = True
@@ -983,6 +1086,9 @@ class SourceDownloadOrchestrator:
                             rows_by_id[row.id] = row
                             self._persist_sink_row(row)
                             self._mark_item_finished(row)
+                            # Videos found on this page join the end of `targets`
+                            # and are downloaded later in this same run.
+                            self._flush_discovered_targets(targets)
                             self._maybe_incremental_save(rows_by_id, targets)
                         else:
                             if existing_row is None:
@@ -993,9 +1099,12 @@ class SourceDownloadOrchestrator:
                             rows_by_id[row.id] = row
                             self._persist_sink_row(row)
                             self._mark_item_finished(row)
+                            self._flush_discovered_targets(targets)
                             self._maybe_incremental_save(rows_by_id, targets)
 
-                        if idx < last_idx and not self._cancel_event.is_set():
+                        # Compared live rather than against a precomputed last
+                        # index, because discovery can extend `targets` mid-run.
+                        if idx < len(targets) - 1 and not self._cancel_event.is_set():
                             self._cancel_event.wait(self.fetch_delay)
             finally:
                 renderer.close()
@@ -1417,6 +1526,18 @@ class SourceDownloadOrchestrator:
     def _rendered_pdf_rel(self, row: SourceManifestRow) -> Path:
         return self._source_file_rel(row, f"{row.id}_rendered.pdf", "rendered")
 
+    def _ocr_pdf_rel(self, row: SourceManifestRow) -> Path:
+        return self._source_file_rel(row, f"{row.id}_source.ocr.pdf", "originals")
+
+    def _video_rel(self, row: SourceManifestRow, suffix: str) -> Path:
+        return self._source_file_rel(row, f"{row.id}_video{suffix}", "media")
+
+    def _audio_rel(self, row: SourceManifestRow, suffix: str) -> Path:
+        return self._source_file_rel(row, f"{row.id}_audio{suffix}", "media")
+
+    def _thumbnail_rel(self, row: SourceManifestRow, suffix: str) -> Path:
+        return self._source_file_rel(row, f"{row.id}_thumbnail{suffix}", "media")
+
     def _markdown_rel(self, row: SourceManifestRow) -> Path:
         return self._source_file_rel(row, f"{row.id}_clean.md", "markdown")
 
@@ -1500,20 +1621,7 @@ class SourceDownloadOrchestrator:
             "original_url": row.original_url,
             "started_at": _utc_now_iso(),
         }
-        if self.run_convert:
-            self._set_phase_state(PHASE_CONVERT, "running")
-        if self.run_llm_cleanup:
-            self._set_phase_state(PHASE_CLEANUP, "running")
-        if self.run_llm_title:
-            self._set_phase_state(PHASE_TITLE, "running")
-        if self.run_catalog:
-            self._set_phase_state(PHASE_CATALOG, "running")
-        if self.run_citation_verify:
-            self._set_phase_state(PHASE_CITATION_VERIFY, "running")
-        if self.run_llm_summary:
-            self._set_phase_state(PHASE_SUMMARY, "running")
-        if self.run_llm_rating:
-            self._set_phase_state(PHASE_RATING, "running")
+        self._activate_postprocess_phases()
         return self._finalize_row(
             row=row,
             notes=notes,
@@ -1726,6 +1834,105 @@ class SourceDownloadOrchestrator:
         }
         self._save_status()
 
+    def _activate_postprocess_phases(self) -> None:
+        """Flip every requested post-fetch phase to running for this row."""
+        for should_run, phase in (
+            (self.run_convert, PHASE_CONVERT),
+            (self.run_llm_cleanup, PHASE_CLEANUP),
+            (self.run_llm_title, PHASE_TITLE),
+            (self.run_catalog, PHASE_CATALOG),
+            (self.run_citation_verify, PHASE_CITATION_VERIFY),
+            (self.run_llm_summary, PHASE_SUMMARY),
+            (self.run_llm_rating, PHASE_RATING),
+        ):
+            if should_run:
+                self._set_phase_state(phase, "running")
+
+    def _reserve_source_id(self) -> str:
+        """Allocate an id for a newly discovered source.
+
+        In repository mode the id is reserved by the repository under its writer
+        lock so it cannot collide with a concurrent import; standalone runs fall
+        back to counting past the highest id already in play.
+        """
+        if self.reserve_source_id_callback is not None:
+            reserved = str(self.reserve_source_id_callback() or "").strip()
+            if reserved:
+                return reserved
+        self._next_standalone_source_id += 1
+        return f"{self._next_standalone_source_id:06d}"
+
+    def _seed_discovery_state(
+        self,
+        targets: list[SourceTarget],
+        existing_rows: list[SourceManifestRow],
+    ) -> None:
+        """Prime dedup keys and the standalone id counter from what already exists."""
+        highest = 0
+        for row in existing_rows:
+            try:
+                highest = max(highest, int(row.id))
+            except (TypeError, ValueError):
+                continue
+            video_id = youtube_video_id(row.original_url or row.final_url)
+            if video_id:
+                self._discovered_media_keys.add(youtube_dedupe_key(video_id))
+        for target in targets:
+            try:
+                highest = max(highest, int(target.id))
+            except (TypeError, ValueError):
+                continue
+            video_id = youtube_video_id(target.original_url)
+            if video_id:
+                self._discovered_media_keys.add(youtube_dedupe_key(video_id))
+        self._next_standalone_source_id = highest
+
+    def _flush_discovered_targets(self, targets: list[SourceTarget]) -> int:
+        """Append staged video discoveries to the live target list.
+
+        The run loop iterates `targets` with `enumerate`, so targets appended here
+        are picked up by the same run. Status counters are widened to match, and
+        each video is deduped by video id so the same clip embedded across several
+        pages produces exactly one source row.
+        """
+        pending = self._pending_discoveries
+        self._pending_discoveries = []
+        if not pending:
+            return 0
+
+        added = 0
+        for parent_id, depth, item in pending:
+            key = item.dedupe_key
+            if not key or key in self._discovered_media_keys:
+                continue
+            self._discovered_media_keys.add(key)
+
+            target = SourceTarget(
+                id=self._reserve_source_id(),
+                source_document_name=f"discovered:{parent_id}",
+                citation_number="",
+                original_url=item.url,
+                discovered_from=parent_id,
+                discovery_depth=depth,
+                source_kind="video",
+            )
+            targets.append(target)
+            added += 1
+
+            if self.status is not None:
+                status_item = SourceItemStatus(
+                    id=target.id,
+                    original_url=target.original_url,
+                    source_kind="video",
+                )
+                self._status_items[target.id] = status_item
+                self.status.items.append(status_item)
+                self.status.total_urls += 1
+
+        if added and self.status is not None:
+            self._save_status()
+        return added
+
     def _process_target(
         self,
         target: SourceTarget,
@@ -1742,10 +1949,21 @@ class SourceDownloadOrchestrator:
         else:
             row = SourceManifestRow(
                 id=target.id,
+                source_kind=target.source_kind,
                 source_document_name=target.source_document_name,
                 citation_number=target.citation_number,
                 original_url=target.original_url,
             )
+        if target.discovered_from:
+            row.discovered_from = target.discovered_from
+            row.discovery_depth = target.discovery_depth
+            row.import_type = row.import_type or "media_discovery"
+            row.imported_at = row.imported_at or _utc_now_iso()
+            row.provenance_ref = (
+                row.provenance_ref or f"{self.job_id}:discovered_from:{target.discovered_from}"
+            )
+            if self.writes_to_repository:
+                row.repository_source_id = row.repository_source_id or row.id
         notes: list[str] = parse_notes(row.notes)
         self._set_phase_state(PHASE_FETCH, "running")
         self._begin_row_phase(row, PHASE_FETCH)
@@ -1762,6 +1980,7 @@ class SourceDownloadOrchestrator:
             row.error_message = ""
             if not row.notes:
                 notes.append("local_document")
+            self._backfill_searchable_pdf(row, notes)
             self._complete_row_phase(
                 row,
                 PHASE_FETCH,
@@ -1770,20 +1989,7 @@ class SourceDownloadOrchestrator:
                 error="not_applicable: uploaded repository document",
                 error_code="not_applicable",
             )
-            if self.run_convert:
-                self._set_phase_state(PHASE_CONVERT, "running")
-            if self.run_llm_cleanup:
-                self._set_phase_state(PHASE_CLEANUP, "running")
-            if self.run_llm_title:
-                self._set_phase_state(PHASE_TITLE, "running")
-            if self.run_catalog:
-                self._set_phase_state(PHASE_CATALOG, "running")
-            if self.run_citation_verify:
-                self._set_phase_state(PHASE_CITATION_VERIFY, "running")
-            if self.run_llm_summary:
-                self._set_phase_state(PHASE_SUMMARY, "running")
-            if self.run_llm_rating:
-                self._set_phase_state(PHASE_RATING, "running")
+            self._activate_postprocess_phases()
             return self._finalize_row(row, notes, event, update_fetched_at=False)
 
         normalized_url, url_error = normalize_url(target.original_url)
@@ -1798,6 +2004,26 @@ class SourceDownloadOrchestrator:
                 error=row.error_message,
                 error_code="invalid_url",
             )
+            return self._finalize_row(row, notes, event)
+
+        # Recursion guard: video URLs are diverted before any HTTP fetch, so they
+        # never reach `_handle_html_response` and can never be scanned for further
+        # video links. This also covers a video URL the user pasted in by hand.
+        if is_media_platform_url(normalized_url):
+            self._handle_video_target(row, normalized_url, notes)
+            self._complete_row_phase(
+                row,
+                PHASE_FETCH,
+                status="failed" if row.fetch_status == "failed" else "completed",
+                content_digest=row.sha256,
+                error=row.error_message if row.fetch_status == "failed" else "",
+                error_code=(
+                    _phase_error_code(row.error_message)
+                    if row.fetch_status == "failed"
+                    else ""
+                ),
+            )
+            self._activate_postprocess_phases()
             return self._finalize_row(row, notes, event)
 
         try:
@@ -1872,22 +2098,50 @@ class SourceDownloadOrchestrator:
             error=fetch_error,
             error_code=fetch_error_code if fetch_status == "failed" else "",
         )
-        if self.run_convert:
-            self._set_phase_state(PHASE_CONVERT, "running")
-        if self.run_llm_cleanup:
-            self._set_phase_state(PHASE_CLEANUP, "running")
-        if self.run_llm_title:
-            self._set_phase_state(PHASE_TITLE, "running")
-        if self.run_catalog:
-            self._set_phase_state(PHASE_CATALOG, "running")
-        if self.run_citation_verify:
-            self._set_phase_state(PHASE_CITATION_VERIFY, "running")
-        if self.run_llm_summary:
-            self._set_phase_state(PHASE_SUMMARY, "running")
-        if self.run_llm_rating:
-            self._set_phase_state(PHASE_RATING, "running")
+        self._activate_postprocess_phases()
 
         return self._finalize_row(row, notes, event)
+
+    def _backfill_searchable_pdf(self, row: SourceManifestRow, notes: list[str]) -> None:
+        """Add a searchable copy for a PDF already sitting on disk.
+
+        Covers both repository-uploaded PDFs and sources downloaded before OCR
+        existed, so re-running convert brings an old repository up to date.
+        """
+        if not row.raw_file or not row.raw_file.lower().endswith(".pdf"):
+            return
+        if row.ocr_pdf_file and not self.force_convert:
+            return
+        if not _has_output_file(self.output_dir, row.raw_file):
+            return
+        self._write_searchable_pdf_copy(row, self._read_binary(Path(row.raw_file)), notes)
+
+    def _write_searchable_pdf_copy(
+        self,
+        row: SourceManifestRow,
+        pdf_bytes: bytes,
+        notes: list[str],
+    ) -> None:
+        """Write a highlightable copy of a PDF that lacks a usable text layer.
+
+        The original file and `row.sha256` are left untouched so provenance stays
+        intact; the OCR'd version lands beside it as a separate artifact.
+        """
+        if not self.output_options.include_ocr_pdf:
+            row.ocr_status = "not_requested"
+            return
+        if not pdf_bytes:
+            return
+
+        ocr_bytes, status, ocr_notes = build_searchable_pdf(pdf_bytes)
+        notes.extend(ocr_notes)
+        row.ocr_status = status
+        if not ocr_bytes:
+            return
+
+        ocr_rel = self._ocr_pdf_rel(row)
+        self._write_binary(ocr_rel, ocr_bytes)
+        row.ocr_pdf_file = ocr_rel.as_posix()
 
     def _handle_pdf_response(
         self,
@@ -1906,6 +2160,7 @@ class SourceDownloadOrchestrator:
             notes.append(reason)
             row.error_message = f"{reason}: http_status_{response.status_code}"
         else:
+            self._write_searchable_pdf_copy(row, response.content, notes)
             if not self.run_convert:
                 row.fetch_status = "success"
                 return
@@ -1926,6 +2181,173 @@ class SourceDownloadOrchestrator:
                 row.fetch_status = "partial"
                 row.error_message = "extraction_failure: markdown not generated"
                 notes.append(NOTE_EXTRACTION_FAILURE)
+
+    def _collect_media_links(
+        self,
+        row: SourceManifestRow,
+        raw_html: str,
+        rendered_html: str,
+        notes: list[str],
+    ) -> None:
+        """Record videos embedded in a page and stage them for enqueueing.
+
+        Scans both the raw HTML and the rendered DOM, since embeds are often
+        injected by JavaScript and only exist after rendering.
+
+        Recursion guard: this is the only caller of `extract_youtube_urls`, and it
+        is only reachable from `_handle_html_response`. Video URLs never reach that
+        handler because `_process_target` routes them to `_handle_video_target`
+        before any HTTP fetch, so a discovered video can never be scanned for more
+        videos. The depth check below makes that invariant explicit and testable.
+        """
+        if not self.output_options.extract_media_links:
+            return
+        if row.discovery_depth >= MAX_MEDIA_DISCOVERY_DEPTH:
+            return
+        if is_media_platform_url(row.final_url) or is_media_platform_url(row.original_url):
+            return
+
+        discovered = merge_discovered_media(
+            extract_youtube_urls(raw_html, row.final_url or row.original_url),
+            extract_youtube_urls(rendered_html, row.final_url or row.original_url),
+            limit=MAX_DISCOVERED_MEDIA_PER_SOURCE,
+        )
+        if not discovered:
+            return
+
+        row.discovered_media_urls = "; ".join(item.url for item in discovered)
+        row.discovered_media_count = len(discovered)
+        notes.append(NOTE_MEDIA_LINKS_FOUND)
+
+        for item in discovered:
+            self._pending_discoveries.append((row.id, row.discovery_depth + 1, item))
+
+    def _handle_video_target(
+        self,
+        row: SourceManifestRow,
+        url: str,
+        notes: list[str],
+    ) -> None:
+        """Fetch a video source: transcript, metadata, and any enabled media files.
+
+        The transcript is written to the row's markdown file so the catalog,
+        title, summary and rating phases treat a video like any other source.
+        """
+        row.source_kind = "video"
+        row.detected_type = "video"
+        row.fetch_method = "yt_dlp"
+        row.final_url = url
+        row.document_type = row.document_type or "video"
+
+        if not self.runtime_capabilities.yt_dlp_available:
+            row.fetch_status = "failed"
+            row.media_status = "failed"
+            row.error_message = "runtime_missing_yt_dlp: install yt-dlp to download videos"
+            notes.append(NOTE_RUNTIME_MISSING_YTDLP)
+            return
+
+        options = self.output_options
+        want_video = options.download_media_video
+        want_audio = options.download_media_audio
+        want_thumbnail = options.download_media_thumbnail
+        want_transcript = options.download_media_transcript
+
+        try:
+            assets = fetch_video_assets(
+                url,
+                want_transcript=want_transcript,
+                want_video=want_video,
+                want_audio=want_audio,
+                want_thumbnail=want_thumbnail,
+            )
+        except Exception as exc:  # pragma: no cover - extractor runtime failures
+            logger.warning("Video fetch failed for %s: %s", row.id, exc)
+            row.fetch_status = "failed"
+            row.media_status = "failed"
+            row.error_message = f"media_download_failed: {type(exc).__name__}: {exc}"
+            notes.append(NOTE_MEDIA_DOWNLOAD_FAILED)
+            return
+
+        if assets.title:
+            row.title = row.title or assets.title
+            row.title_status = row.title_status or "extracted"
+        if assets.channel:
+            row.author_names = row.author_names or assets.channel
+            row.organization_name = row.organization_name or assets.channel
+        if assets.upload_date:
+            row.publication_date = row.publication_date or assets.upload_date
+            row.publication_year = row.publication_year or assets.upload_date[:4]
+        if assets.webpage_url:
+            row.canonical_url = assets.webpage_url
+        row.media_duration_seconds = assets.duration_seconds
+
+        wrote_any = False
+
+        if assets.subtitle_bytes and options.include_raw_file:
+            raw_rel = self._raw_file_rel(row, assets.subtitle_ext or ".vtt")
+            self._write_binary(raw_rel, assets.subtitle_bytes)
+            row.raw_file = raw_rel.as_posix()
+            row.sha256 = hashlib.sha256(assets.subtitle_bytes).hexdigest()
+            wrote_any = True
+
+        if assets.info_json:
+            metadata_rel = self._source_file_rel(
+                row, f"{row.id}_video_info.json", "metadata"
+            )
+            self._write_text(metadata_rel, build_info_json(assets))
+            wrote_any = True
+
+        if assets.video_bytes:
+            video_rel = self._video_rel(row, assets.video_ext or ".mp4")
+            self._write_binary(video_rel, assets.video_bytes)
+            row.video_file = video_rel.as_posix()
+            wrote_any = True
+
+        if assets.audio_bytes:
+            audio_rel = self._audio_rel(row, assets.audio_ext or ".m4a")
+            self._write_binary(audio_rel, assets.audio_bytes)
+            row.audio_file = audio_rel.as_posix()
+            wrote_any = True
+
+        if assets.thumbnail_bytes:
+            thumb_rel = self._thumbnail_rel(row, assets.thumbnail_ext or ".jpg")
+            self._write_binary(thumb_rel, assets.thumbnail_bytes)
+            row.thumbnail_file = thumb_rel.as_posix()
+            wrote_any = True
+
+        markdown_text = build_transcript_markdown(assets)
+        if markdown_text and self.output_options.include_markdown:
+            markdown_rel = self._markdown_rel(row)
+            self._write_text(markdown_rel, markdown_text)
+            row.markdown_file = markdown_rel.as_posix()
+            row.markdown_char_count = len(markdown_text)
+            row.extraction_method = "video_transcript"
+            wrote_any = True
+
+        if "transcript_unavailable" in assets.errors:
+            notes.append(NOTE_MEDIA_TRANSCRIPT_MISSING)
+
+        download_errors = [
+            error for error in assets.errors if error.endswith("_download_failed")
+        ]
+        if download_errors:
+            notes.append(NOTE_MEDIA_DOWNLOAD_FAILED)
+
+        if not wrote_any:
+            row.fetch_status = "failed"
+            row.media_status = "failed"
+            row.error_message = (
+                f"media_download_failed: {', '.join(assets.errors) or 'no_artifacts'}"
+            )
+            notes.append(NOTE_MEDIA_DOWNLOAD_FAILED)
+            return
+
+        if download_errors or not assets.transcript_text:
+            row.fetch_status = "partial" if not assets.transcript_text else "success"
+            row.media_status = "partial"
+        else:
+            row.fetch_status = "success"
+            row.media_status = "downloaded"
 
     def _handle_html_response(
         self,
@@ -2012,6 +2434,8 @@ class SourceDownloadOrchestrator:
                     )
                     notes.extend(rendered_notes)
                     rendered_score = markdown_score(rendered_markdown)
+
+        self._collect_media_links(row, raw_html, rendered_html, notes)
 
         if self.run_convert:
             markdown_to_write = raw_markdown
@@ -2137,6 +2561,10 @@ class SourceDownloadOrchestrator:
         row: SourceManifestRow,
         notes: list[str],
     ) -> None:
+        # Runs before the markdown early-return so repositories converted prior to
+        # OCR support still pick up searchable copies on a re-run.
+        self._backfill_searchable_pdf(row, notes)
+
         if row.markdown_file and not self.force_convert and _has_output_file(self.output_dir, row.markdown_file):
             return
 
@@ -5516,6 +5944,11 @@ def summarize_output_rows(rows: list[SourceManifestRow]) -> SourceOutputSummary:
         rating_file_count=sum(1 for row in rows if row.rating_file),
         rating_missing_count=rating_missing,
         rating_failed_count=rating_failed,
+        ocr_pdf_count=sum(1 for row in rows if row.ocr_pdf_file),
+        video_file_count=sum(1 for row in rows if row.video_file),
+        audio_file_count=sum(1 for row in rows if row.audio_file),
+        thumbnail_file_count=sum(1 for row in rows if row.thumbnail_file),
+        discovered_media_count=sum(int(row.discovered_media_count or 0) for row in rows),
     )
 
 
@@ -6099,6 +6532,47 @@ def detect_runtime_capabilities(
     tesseract_available = check_tesseract_available()
     if not tesseract_available:
         runtime_notes.append(NOTE_RUNTIME_MISSING_TESSERACT)
+        runtime_guidance.append(
+            {
+                "code": NOTE_RUNTIME_MISSING_TESSERACT,
+                "title": "Install Tesseract OCR",
+                "detail": (
+                    "Tesseract is not on PATH, so scanned PDFs cannot be given a "
+                    "searchable text layer and screenshot captures stay non-selectable."
+                ),
+                "command": INSTALL_TESSERACT_COMMAND,
+            }
+        )
+
+    yt_dlp_installed = yt_dlp_available()
+    if not yt_dlp_installed:
+        runtime_notes.append(NOTE_RUNTIME_MISSING_YTDLP)
+        runtime_guidance.append(
+            {
+                "code": NOTE_RUNTIME_MISSING_YTDLP,
+                "title": "Install yt-dlp",
+                "detail": (
+                    "yt-dlp is not importable, so discovered video sources cannot be "
+                    "downloaded and will be recorded without transcript or media files."
+                ),
+                "command": INSTALL_BOOTSTRAP_COMMAND,
+            }
+        )
+
+    ffmpeg_installed = ffmpeg_available()
+    if not ffmpeg_installed:
+        runtime_notes.append(NOTE_RUNTIME_MISSING_FFMPEG)
+        runtime_guidance.append(
+            {
+                "code": NOTE_RUNTIME_MISSING_FFMPEG,
+                "title": "Install ffmpeg",
+                "detail": (
+                    "ffmpeg is not on PATH, so video downloads fall back to a single "
+                    "combined stream instead of the best video and audio tracks."
+                ),
+                "command": INSTALL_FFMPEG_COMMAND,
+            }
+        )
 
     llm_vision_enabled = False
     if use_llm:
@@ -6112,6 +6586,8 @@ def detect_runtime_capabilities(
         playwright_browser_available=playwright_browser_available,
         textutil_available=textutil_available,
         tesseract_available=tesseract_available,
+        yt_dlp_available=yt_dlp_installed,
+        ffmpeg_available=ffmpeg_installed,
         llm_vision_enabled=llm_vision_enabled,
         runtime_notes=runtime_notes,
         runtime_guidance=runtime_guidance,
@@ -6617,6 +7093,180 @@ def run_tesseract_ocr_on_pixmap(pixmap: fitz.Pixmap) -> str:
         if result.returncode != 0:
             return ""
         return (result.stdout or "").strip()
+
+
+def run_tesseract_ocr_pdf_page(png_bytes: bytes) -> bytes:
+    """OCR one PNG page into a single-page PDF carrying an invisible text layer.
+
+    Tesseract's `pdf` output renderer keeps the original image as the page content
+    and overlays positioned, invisible text, so the result looks identical to the
+    input but is selectable and highlightable in any PDF viewer.
+    """
+    if not png_bytes:
+        return b""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        image_path = Path(tmpdir) / "page.png"
+        image_path.write_bytes(png_bytes)
+        out_stem = Path(tmpdir) / "page_ocr"
+        cmd = [
+            "tesseract",
+            str(image_path),
+            str(out_stem),
+            "--psm",
+            "3",
+            "-l",
+            "eng",
+            "pdf",
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                check=False,
+                timeout=OCR_PDF_PAGE_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            return b""
+        if result.returncode != 0:
+            return b""
+        out_path = out_stem.with_suffix(".pdf")
+        if not out_path.is_file():
+            return b""
+        return out_path.read_bytes()
+
+
+def build_searchable_pdf(pdf_bytes: bytes) -> tuple[bytes, str, list[str]]:
+    """Return a copy of `pdf_bytes` where every page has a usable text layer.
+
+    Pages that already carry good native text are copied through untouched; only
+    pages failing the same quality gate used for markdown extraction are rendered
+    to an image and OCR'd. A document whose text layer is already healthy returns
+    an empty payload with status `native_text` so no redundant file is written.
+
+    Returns `(pdf_bytes, status, notes)`.
+    """
+    if not pdf_bytes:
+        return b"", "failed", [NOTE_EXTRACTION_FAILURE]
+
+    try:
+        with suppress_mupdf_messages():
+            source = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception:
+        return b"", "failed", [NOTE_EXTRACTION_FAILURE]
+
+    notes: list[str] = []
+    try:
+        if source.page_count == 0:
+            return b"", "failed", [NOTE_EXTRACTION_FAILURE]
+
+        pages_needing_ocr: list[int] = []
+        with suppress_mupdf_messages():
+            for page_index in range(source.page_count):
+                metrics = compute_text_metrics(source[page_index].get_text("text"))
+                if (
+                    metrics["chars"] < PDF_NATIVE_PAGE_MIN_CHARS
+                    or metrics["alpha_ratio"] < PDF_TEXT_ALPHA_MIN_RATIO
+                ):
+                    pages_needing_ocr.append(page_index)
+
+        if not pages_needing_ocr:
+            return b"", "native_text", notes
+
+        if not shutil.which("tesseract"):
+            return b"", "failed", [NOTE_RUNTIME_MISSING_TESSERACT]
+
+        output = fitz.open()
+        ocr_applied = 0
+        try:
+            with suppress_mupdf_messages():
+                for page_index in range(source.page_count):
+                    if page_index not in pages_needing_ocr:
+                        output.insert_pdf(source, from_page=page_index, to_page=page_index)
+                        continue
+
+                    pixmap = source[page_index].get_pixmap(
+                        matrix=fitz.Matrix(OCR_PDF_RENDER_SCALE, OCR_PDF_RENDER_SCALE),
+                        alpha=False,
+                    )
+                    ocr_page = run_tesseract_ocr_pdf_page(pixmap.tobytes("png"))
+                    if not ocr_page:
+                        output.insert_pdf(source, from_page=page_index, to_page=page_index)
+                        continue
+
+                    ocr_doc = fitz.open(stream=ocr_page, filetype="pdf")
+                    try:
+                        output.insert_pdf(ocr_doc)
+                    finally:
+                        ocr_doc.close()
+                    ocr_applied += 1
+
+            if ocr_applied == 0:
+                return b"", "failed", [NOTE_OCR_PDF_FAILED]
+
+            if ocr_applied < len(pages_needing_ocr):
+                notes.append(NOTE_OCR_PDF_PARTIAL)
+            notes.append(NOTE_OCR_LOCAL_USED)
+            return output.tobytes(deflate=True, garbage=3), "ocr_applied", notes
+        finally:
+            output.close()
+    except Exception:
+        return b"", "failed", [NOTE_OCR_PDF_FAILED]
+    finally:
+        source.close()
+
+
+def png_images_to_searchable_pdf_bytes(images: list[bytes]) -> tuple[bytes, list[str]]:
+    """Assemble PNG page captures into a PDF with an invisible OCR text layer.
+
+    Falls back to the plain image-only PDF when tesseract is unavailable or every
+    page fails to OCR, so a capture is never lost just because OCR could not run.
+    """
+    if not images:
+        return b"", []
+
+    if not shutil.which("tesseract"):
+        return png_images_to_pdf_bytes(images), [NOTE_RUNTIME_MISSING_TESSERACT]
+
+    doc = fitz.open()
+    notes: list[str] = []
+    ocr_applied = 0
+    plain_pages = 0
+    try:
+        for image_bytes in images:
+            if not image_bytes:
+                continue
+            ocr_page = run_tesseract_ocr_pdf_page(image_bytes)
+            if ocr_page:
+                ocr_doc = fitz.open(stream=ocr_page, filetype="pdf")
+                try:
+                    doc.insert_pdf(ocr_doc)
+                finally:
+                    ocr_doc.close()
+                ocr_applied += 1
+                continue
+
+            image_doc = fitz.open(stream=image_bytes, filetype="png")
+            try:
+                rect = image_doc[0].rect
+            finally:
+                image_doc.close()
+            page = doc.new_page(width=rect.width, height=rect.height)
+            page.insert_image(page.rect, stream=image_bytes)
+            plain_pages += 1
+
+        if doc.page_count == 0:
+            return b"", [NOTE_OCR_PDF_FAILED]
+        if ocr_applied == 0:
+            notes.append(NOTE_OCR_PDF_FAILED)
+        else:
+            notes.append(NOTE_OCR_LOCAL_USED)
+            if plain_pages:
+                notes.append(NOTE_OCR_PDF_PARTIAL)
+        return doc.tobytes(deflate=True, garbage=3), notes
+    except Exception:
+        return png_images_to_pdf_bytes(images), [NOTE_OCR_PDF_FAILED]
+    finally:
+        doc.close()
 
 
 def format_pages_as_markdown(page_texts: list[str]) -> str:

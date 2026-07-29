@@ -474,6 +474,14 @@ export interface SourceDownloadRequest {
   include_rendered_html: boolean;
   include_rendered_pdf: boolean;
   include_markdown: boolean;
+  // Optional like the other later additions above: the backend model supplies
+  // defaults for each, so older callers stay valid.
+  include_ocr_pdf?: boolean;
+  extract_media_links?: boolean;
+  download_media_transcript?: boolean;
+  download_media_video?: boolean;
+  download_media_audio?: boolean;
+  download_media_thumbnail?: boolean;
 }
 
 export interface RepositorySourceTaskRequest extends SourceDownloadRequest {
@@ -663,6 +671,8 @@ export interface RepositoryManifestRow {
   raw_file: string;
   rendered_file: string;
   rendered_pdf_file: string;
+  ocr_pdf_file: string;
+  ocr_status: string;
   markdown_file: string;
   llm_cleanup_needed: boolean;
   llm_cleanup_file: string;
@@ -682,6 +692,14 @@ export interface RepositoryManifestRow {
   sha256: string;
   extraction_method: string;
   markdown_char_count: number;
+  video_file: string;
+  audio_file: string;
+  thumbnail_file: string;
+  media_status: string;
+  media_duration_seconds: number;
+  discovered_from: string;
+  discovered_media_urls: string;
+  discovered_media_count: number;
   summary_text?: string;
   rating_overall?: string | number | boolean;
   rating_confidence?: string | number | boolean;
@@ -777,7 +795,15 @@ export interface RepositoryManifestResponse {
   };
 }
 
-export type RepositorySourceFileKind = "pdf" | "html" | "rendered" | "md";
+export type RepositorySourceFileKind =
+  | "pdf"
+  | "html"
+  | "rendered"
+  | "ocr"
+  | "md"
+  | "video"
+  | "audio"
+  | "thumbnail";
 
 export interface RepositoryDuplicateCandidateRow {
   id: string;

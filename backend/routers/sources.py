@@ -300,6 +300,12 @@ async def start_source_download(
             include_rendered_html=payload.include_rendered_html,
             include_rendered_pdf=payload.include_rendered_pdf,
             include_markdown=payload.include_markdown,
+            include_ocr_pdf=payload.include_ocr_pdf,
+            extract_media_links=payload.extract_media_links,
+            download_media_transcript=payload.download_media_transcript,
+            download_media_video=payload.download_media_video,
+            download_media_audio=payload.download_media_audio,
+            download_media_thumbnail=payload.download_media_thumbnail,
         ),
         selected_phases=_selected_phase_names(
             run_download=run_download,

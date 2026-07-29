@@ -991,6 +991,12 @@ interface DownloadSourcesModalDraftState {
   include_rendered_html: boolean;
   include_rendered_pdf: boolean;
   include_markdown: boolean;
+  include_ocr_pdf: boolean;
+  extract_media_links: boolean;
+  download_media_transcript: boolean;
+  download_media_video: boolean;
+  download_media_audio: boolean;
+  download_media_thumbnail: boolean;
 }
 
 interface ExportModalDraftState {
@@ -1030,7 +1036,13 @@ type DownloadSourceOutputKey =
   | "include_raw_file"
   | "include_rendered_html"
   | "include_rendered_pdf"
-  | "include_markdown";
+  | "include_markdown"
+  | "include_ocr_pdf"
+  | "extract_media_links"
+  | "download_media_transcript"
+  | "download_media_video"
+  | "download_media_audio"
+  | "download_media_thumbnail";
 
 const DOWNLOAD_SOURCE_OUTPUT_OPTIONS: Array<{
   key: DownloadSourceOutputKey;
@@ -1050,24 +1062,58 @@ const DOWNLOAD_SOURCE_OUTPUT_OPTIONS: Array<{
   {
     key: "include_rendered_pdf",
     label: "Rendered PDF",
-    detail: "Capture webpage screenshots and package them into a PDF.",
+    detail: "Capture the webpage as a PDF with selectable, highlightable text.",
   },
   {
     key: "include_markdown",
     label: "Markdown extraction",
     detail: "Convert source content into markdown for downstream processing.",
   },
+  {
+    key: "include_ocr_pdf",
+    label: "Searchable PDF (OCR)",
+    detail: "For PDFs without a text layer, save an OCR'd copy you can search and highlight.",
+  },
+  {
+    key: "extract_media_links",
+    label: "Find embedded videos",
+    detail: "Record YouTube videos found on a page and add them as their own sources.",
+  },
+  {
+    key: "download_media_transcript",
+    label: "Video transcript",
+    detail: "Save captions and video metadata as the source text.",
+  },
+  {
+    key: "download_media_audio",
+    label: "Video audio",
+    detail: "Download the audio track of discovered videos.",
+  },
+  {
+    key: "download_media_video",
+    label: "Video file",
+    detail: "Download the full video. Large: expect hundreds of MB per source.",
+  },
+  {
+    key: "download_media_thumbnail",
+    label: "Video thumbnail",
+    detail: "Save the video's poster image.",
+  },
+];
+
+// Outputs that must not all be off before a download can start. The media
+// options are refinements of a discovered video, not standalone outputs, so
+// they do not count toward this check.
+const REQUIRED_DOWNLOAD_OUTPUT_KEYS: DownloadSourceOutputKey[] = [
+  "include_raw_file",
+  "include_rendered_html",
+  "include_rendered_pdf",
+  "include_markdown",
 ];
 
 function buildDownloadSourcesModalDraft(
   scope: RepositoryBrowserDownloadScope,
-  draft: Pick<
-    RepositorySourceTaskRequest,
-    | "include_raw_file"
-    | "include_rendered_html"
-    | "include_rendered_pdf"
-    | "include_markdown"
-  >,
+  draft: Pick<RepositorySourceTaskRequest, DownloadSourceOutputKey>,
   lockMarkdown = false,
 ): DownloadSourcesModalDraftState {
   return {
@@ -1076,16 +1122,17 @@ function buildDownloadSourcesModalDraft(
     include_rendered_html: Boolean(draft.include_rendered_html),
     include_rendered_pdf: Boolean(draft.include_rendered_pdf),
     include_markdown: Boolean(draft.include_markdown || lockMarkdown),
+    include_ocr_pdf: Boolean(draft.include_ocr_pdf),
+    extract_media_links: Boolean(draft.extract_media_links),
+    download_media_transcript: Boolean(draft.download_media_transcript),
+    download_media_video: Boolean(draft.download_media_video),
+    download_media_audio: Boolean(draft.download_media_audio),
+    download_media_thumbnail: Boolean(draft.download_media_thumbnail),
   };
 }
 
 function hasSelectedDownloadOutputs(draft: DownloadSourcesModalDraftState): boolean {
-  return Boolean(
-    draft.include_raw_file ||
-      draft.include_rendered_html ||
-      draft.include_rendered_pdf ||
-      draft.include_markdown,
-  );
+  return REQUIRED_DOWNLOAD_OUTPUT_KEYS.some((key) => Boolean(draft[key]));
 }
 
 function duplicateConfidenceTone(
@@ -3152,6 +3199,12 @@ export function RepositoryBrowserPage() {
         include_rendered_html: true,
         include_rendered_pdf: true,
         include_markdown: true,
+        include_ocr_pdf: true,
+        extract_media_links: true,
+        download_media_transcript: true,
+        download_media_video: false,
+        download_media_audio: true,
+        download_media_thumbnail: true,
       }));
       const startResponse = await api.startRepositorySourceTasks({
         ...sourceTaskDraft,
@@ -3179,6 +3232,12 @@ export function RepositoryBrowserPage() {
         include_rendered_html: true,
         include_rendered_pdf: true,
         include_markdown: true,
+        include_ocr_pdf: true,
+        extract_media_links: true,
+        download_media_transcript: true,
+        download_media_video: false,
+        download_media_audio: true,
+        download_media_thumbnail: true,
         project_profile_name: settingsDraft.default_project_profile_name,
       });
       setActionMessage(
@@ -3244,6 +3303,12 @@ export function RepositoryBrowserPage() {
         include_rendered_html: true,
         include_rendered_pdf: true,
         include_markdown: true,
+        include_ocr_pdf: true,
+        extract_media_links: true,
+        download_media_transcript: true,
+        download_media_video: false,
+        download_media_audio: true,
+        download_media_thumbnail: true,
       }));
       const startResponse = await api.startRepositorySourceTasks({
         ...sourceTaskDraft,
@@ -3271,6 +3336,12 @@ export function RepositoryBrowserPage() {
         include_rendered_html: true,
         include_rendered_pdf: true,
         include_markdown: true,
+        include_ocr_pdf: true,
+        extract_media_links: true,
+        download_media_transcript: true,
+        download_media_video: false,
+        download_media_audio: true,
+        download_media_thumbnail: true,
         project_profile_name: settingsDraft.default_project_profile_name,
       });
       setActionMessage(

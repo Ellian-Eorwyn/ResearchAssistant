@@ -22,7 +22,7 @@ class SourcePhaseMetadata(BaseModel):
 class SourceManifestRow(BaseModel):
     id: str
     repository_source_id: str = ""
-    source_kind: str = "url"  # url | uploaded_document
+    source_kind: str = "url"  # url | uploaded_document | video
     import_type: str = ""
     imported_at: str = ""
     provenance_ref: str = ""
@@ -47,6 +47,8 @@ class SourceManifestRow(BaseModel):
     raw_file: str = ""
     rendered_file: str = ""
     rendered_pdf_file: str = ""
+    ocr_pdf_file: str = ""
+    ocr_status: str = ""  # not_requested | native_text | ocr_applied | failed | skipped_*
     markdown_file: str = ""
     llm_cleanup_needed: bool = False
     llm_cleanup_file: str = ""
@@ -66,6 +68,15 @@ class SourceManifestRow(BaseModel):
     sha256: str = ""
     extraction_method: str = ""  # raw_html | rendered_html
     markdown_char_count: int = 0
+    video_file: str = ""
+    audio_file: str = ""
+    thumbnail_file: str = ""
+    media_status: str = ""  # not_requested | downloaded | partial | failed | skipped_*
+    media_duration_seconds: int = 0
+    discovered_from: str = ""
+    discovered_media_urls: str = ""
+    discovered_media_count: int = 0
+    discovery_depth: int = 0
     custom_fields: dict[str, str] = Field(default_factory=dict)
     phase_metadata: dict[str, SourcePhaseMetadata] = Field(default_factory=dict)
 
@@ -97,6 +108,8 @@ SOURCE_MANIFEST_COLUMNS = [
     "raw_file",
     "rendered_file",
     "rendered_pdf_file",
+    "ocr_pdf_file",
+    "ocr_status",
     "markdown_file",
     "llm_cleanup_needed",
     "llm_cleanup_file",
@@ -116,6 +129,14 @@ SOURCE_MANIFEST_COLUMNS = [
     "sha256",
     "extraction_method",
     "markdown_char_count",
+    "video_file",
+    "audio_file",
+    "thumbnail_file",
+    "media_status",
+    "media_duration_seconds",
+    "discovered_from",
+    "discovered_media_urls",
+    "discovered_media_count",
 ]
 
 
@@ -155,6 +176,12 @@ class SourceOutputOptions(BaseModel):
     include_rendered_html: bool = True
     include_rendered_pdf: bool = True
     include_markdown: bool = True
+    include_ocr_pdf: bool = True
+    extract_media_links: bool = True
+    download_media_transcript: bool = True
+    download_media_video: bool = False
+    download_media_audio: bool = True
+    download_media_thumbnail: bool = True
 
 
 class SourceDownloadRequest(BaseModel):
@@ -180,6 +207,12 @@ class SourceDownloadRequest(BaseModel):
     include_rendered_html: bool = True
     include_rendered_pdf: bool = True
     include_markdown: bool = True
+    include_ocr_pdf: bool = True
+    extract_media_links: bool = True
+    download_media_transcript: bool = True
+    download_media_video: bool = False
+    download_media_audio: bool = True
+    download_media_thumbnail: bool = True
 
 
 class SourceOutputSummary(BaseModel):
@@ -200,6 +233,11 @@ class SourceOutputSummary(BaseModel):
     rating_file_count: int = 0
     rating_missing_count: int = 0
     rating_failed_count: int = 0
+    ocr_pdf_count: int = 0
+    video_file_count: int = 0
+    audio_file_count: int = 0
+    thumbnail_file_count: int = 0
+    discovered_media_count: int = 0
 
 
 class SourceDownloadStatus(BaseModel):
