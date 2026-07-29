@@ -8,6 +8,7 @@ PORT="${RA_PORT:-7995}"
 RUNTIME_DIR="${ROOT_DIR}/.run"
 PID_FILE="${RUNTIME_DIR}/server.pid"
 LOG_FILE="${RUNTIME_DIR}/server.log"
+UNIT_NAME="researchassistant.service"
 
 echo "=== ResearchAssistant Update ==="
 
@@ -125,6 +126,25 @@ start_server() {
   exit 1
 }
 
+systemd_unit_exists() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  systemctl cat "${UNIT_NAME}" >/dev/null 2>&1
+}
+
+restart_systemd_service() {
+  if [[ "${EUID}" -eq 0 ]]; then
+    systemctl restart "${UNIT_NAME}"
+    return 0
+  fi
+
+  if command -v sudo >/dev/null 2>&1; then
+    sudo systemctl restart "${UNIT_NAME}"
+    return 0
+  fi
+
+  return 1
+}
+
 # Pull latest code
 echo "[update] Pulling latest changes..."
 cd "${ROOT_DIR}"
@@ -152,13 +172,18 @@ else
   exit 1
 fi
 
-if SERVER_PID="$(find_running_server_pid)"; then
-  stop_server "${SERVER_PID}"
+if systemd_unit_exists; then
+  echo "[update] Detected systemd-managed service: ${UNIT_NAME}"
+  restart_systemd_service
 else
-  echo "[update] No running server detected on port ${PORT}; starting a fresh instance."
-fi
+  if SERVER_PID="$(find_running_server_pid)"; then
+    stop_server "${SERVER_PID}"
+  else
+    echo "[update] No running server detected on port ${PORT}; starting a fresh instance."
+  fi
 
-start_server
+  start_server
+fi
 
 echo ""
 echo "=== Update complete ==="
