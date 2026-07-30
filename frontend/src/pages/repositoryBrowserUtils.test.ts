@@ -18,7 +18,18 @@ import {
   reorderRepositoryBrowserColumns,
   resolveRepositoryBrowserColumnWidth,
   toggleRepositoryBrowserSelection,
+  formatRelatedSourceLabel,
+  hasFileForKind,
+  parseSourceIdList,
+  REPOSITORY_BROWSER_FILE_COLUMNS,
+  REPOSITORY_BROWSER_PROVENANCE_COLUMNS,
+  resolveRelatedSources,
 } from "./repositoryBrowserUtils";
+import type { RepositoryManifestRow, RepositorySourceFileKind } from "../api/types";
+
+function manifestRow(overrides: Partial<RepositoryManifestRow>): RepositoryManifestRow {
+  return { id: "000001", ...overrides } as RepositoryManifestRow;
+}
 
 describe("repositoryBrowserUtils", () => {
   it("exposes stable default visible columns", () => {
@@ -495,5 +506,94 @@ describe("repositoryBrowserUtils", () => {
 
     expect(first).toBe("000123 - A Title With Bad Characters.md");
     expect(second).toBe("000123 - A Title With Bad Characters (2).md");
+  });
+});
+
+describe("hasFileForKind", () => {
+  const backingField: Record<RepositorySourceFileKind, keyof RepositoryManifestRow> = {
+    pdf: "raw_file",
+    html: "raw_file",
+    rendered: "rendered_pdf_file",
+    ocr: "ocr_pdf_file",
+    md: "markdown_file",
+    video: "video_file",
+    audio: "audio_file",
+    thumbnail: "thumbnail_file",
+  };
+
+  it("matches each kind to the field that actually backs it", () => {
+    for (const { kind } of REPOSITORY_BROWSER_FILE_COLUMNS) {
+      const value = kind === "pdf" ? "a.pdf" : kind === "html" ? "a.html" : "a.bin";
+      const row = manifestRow({ [backingField[kind]]: value });
+      expect(hasFileForKind(row, kind), `${kind} should be present`).toBe(true);
+    }
+  });
+
+  it("does not claim a file the row does not have", () => {
+    // Regression: every kind used to fall through to the markdown check, so a
+    // row with only markdown reported having OCR, video, audio and thumbnails.
+    const row = manifestRow({ markdown_file: "a.md" });
+    expect(hasFileForKind(row, "md")).toBe(true);
+    for (const kind of ["ocr", "video", "audio", "thumbnail", "rendered"] as const) {
+      expect(hasFileForKind(row, kind), `${kind} should be absent`).toBe(false);
+    }
+  });
+
+  it("distinguishes pdf and html by the raw file extension", () => {
+    const pdfRow = manifestRow({ raw_file: "sources/000001/000001_source.pdf" });
+    expect(hasFileForKind(pdfRow, "pdf")).toBe(true);
+    expect(hasFileForKind(pdfRow, "html")).toBe(false);
+
+    const htmlRow = manifestRow({ raw_file: "sources/000001/000001_source.html" });
+    expect(hasFileForKind(htmlRow, "html")).toBe(true);
+    expect(hasFileForKind(htmlRow, "pdf")).toBe(false);
+  });
+
+  it("treats an empty row as having nothing", () => {
+    const row = manifestRow({});
+    for (const { kind } of REPOSITORY_BROWSER_FILE_COLUMNS) {
+      expect(hasFileForKind(row, kind), `${kind} should be absent`).toBe(false);
+    }
+  });
+});
+
+describe("provenance helpers", () => {
+  it("registers both directions as provenance columns", () => {
+    expect(REPOSITORY_BROWSER_PROVENANCE_COLUMNS).toEqual([
+      "discovered_from",
+      "discovered_source_ids",
+    ]);
+  });
+
+  it("parses a semicolon separated id list", () => {
+    expect(parseSourceIdList("000002; 000003")).toEqual(["000002", "000003"]);
+    expect(parseSourceIdList("  000002 ;; 000003 ")).toEqual(["000002", "000003"]);
+    expect(parseSourceIdList("")).toEqual([]);
+    expect(parseSourceIdList(undefined)).toEqual([]);
+  });
+
+  it("resolves ids to titles and flags ids with no surviving row", () => {
+    const resolved = resolveRelatedSources("000002; 000404", { "000002": "Beta Source" });
+
+    expect(resolved).toEqual([
+      { id: "000002", title: "Beta Source", exists: true },
+      { id: "000404", title: "", exists: false },
+    ]);
+  });
+
+  it("treats a missing related map as everything deleted", () => {
+    expect(resolveRelatedSources("000002", undefined)).toEqual([
+      { id: "000002", title: "", exists: false },
+    ]);
+  });
+
+  it("labels a related source for display", () => {
+    expect(formatRelatedSourceLabel({ id: "000002", title: "Beta", exists: true })).toBe(
+      "000002 \u2014 Beta",
+    );
+    expect(formatRelatedSourceLabel({ id: "000002", title: "", exists: true })).toBe("000002");
+    expect(formatRelatedSourceLabel({ id: "000404", title: "", exists: false })).toBe(
+      "000404 (deleted)",
+    );
   });
 });

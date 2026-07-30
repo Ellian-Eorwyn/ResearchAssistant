@@ -698,6 +698,7 @@ export interface RepositoryManifestRow {
   media_status: string;
   media_duration_seconds: number;
   discovered_from: string;
+  discovered_source_ids: string;
   discovered_media_urls: string;
   discovered_media_count: number;
   summary_text?: string;
@@ -763,6 +764,11 @@ export interface RepositoryManifestResponse {
   sort_by: string;
   sort_dir: "asc" | "desc" | "";
   columns: RepositoryManifestColumn[];
+  /**
+   * Titles for the source IDs referenced by this page's provenance columns.
+   * A referenced ID absent from this map has no surviving row.
+   */
+  related_sources?: Record<string, string>;
   filters: {
     q: string;
     fetch_status: string;

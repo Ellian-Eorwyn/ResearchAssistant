@@ -799,7 +799,7 @@ class SourceDownloadOrchestrator:
         self.duplicate_urls_removed = 0
         # Videos found on the page currently being processed, drained by the run
         # loop once the parent row is finalized.
-        self._pending_discoveries: list[tuple[str, int, DiscoveredMedia]] = []
+        self._pending_discoveries: list[tuple[str, str, int, DiscoveredMedia]] = []
         self._discovered_media_keys: set[str] = set()
         self._next_standalone_source_id = 0
         self._cancel_event = threading.Event()
@@ -1113,6 +1113,9 @@ class SourceDownloadOrchestrator:
                     self._llm_client = None
 
             final_rows = [rows_by_id[t.id] for t in targets if t.id in rows_by_id]
+            # Give parents the ids of the rows their discovered links became, so
+            # standalone runs get the same reciprocal link the repository keeps.
+            reconcile_discovery_links(final_rows)
             counts = _count_fetch_outcomes(final_rows)
             artifact = SourceManifestArtifact(
                 rows=final_rows,
@@ -1901,7 +1904,7 @@ class SourceDownloadOrchestrator:
             return 0
 
         added = 0
-        for parent_id, depth, item in pending:
+        for parent_id, parent_document_name, depth, item in pending:
             key = item.dedupe_key
             if not key or key in self._discovered_media_keys:
                 continue
@@ -1909,7 +1912,10 @@ class SourceDownloadOrchestrator:
 
             target = SourceTarget(
                 id=self._reserve_source_id(),
-                source_document_name=f"discovered:{parent_id}",
+                # Inherit the parent's seed document so a discovered video traces
+                # back to the same origin as the page that contained it; the link
+                # to the page itself is carried by `discovered_from`.
+                source_document_name=parent_document_name,
                 citation_number="",
                 original_url=item.url,
                 discovered_from=parent_id,
@@ -2220,7 +2226,9 @@ class SourceDownloadOrchestrator:
         notes.append(NOTE_MEDIA_LINKS_FOUND)
 
         for item in discovered:
-            self._pending_discoveries.append((row.id, row.discovery_depth + 1, item))
+            self._pending_discoveries.append(
+                (row.id, row.source_document_name, row.discovery_depth + 1, item)
+            )
 
     def _handle_video_target(
         self,
@@ -5950,6 +5958,41 @@ def summarize_output_rows(rows: list[SourceManifestRow]) -> SourceOutputSummary:
         thumbnail_file_count=sum(1 for row in rows if row.thumbnail_file),
         discovered_media_count=sum(int(row.discovered_media_count or 0) for row in rows),
     )
+
+
+def reconcile_discovery_links(rows: list[SourceManifestRow]) -> None:
+    """Mirror each row's `discovered_from` onto its parent's `discovered_source_ids`.
+
+    Discovery only writes the child side of the link, so the parent side is
+    derived here and kept current wherever rows are saved. The merge is a union
+    with whatever the parent already recorded, never a replacement: if a
+    discovered row is later deleted, the parent keeps the id as a record that it
+    once produced that source. The UI marks ids with no surviving row as deleted.
+
+    Mutates rows in place and is idempotent, so it is safe to call on every save.
+    """
+    children_by_parent: dict[str, list[str]] = {}
+    for row in rows:
+        parent_id = str(row.discovered_from or "").strip()
+        if not parent_id or parent_id == row.id:
+            continue
+        children_by_parent.setdefault(parent_id, []).append(row.id)
+
+    for row in rows:
+        recorded = parse_source_id_list(row.discovered_source_ids)
+        merged = _dedupe_strings([*recorded, *children_by_parent.get(row.id, [])])
+        row.discovered_source_ids = format_source_id_list(sorted(merged))
+
+
+def parse_source_id_list(value: str) -> list[str]:
+    """Split a stored `a; b; c` id list into its parts."""
+    if not value:
+        return []
+    return [part.strip() for part in str(value).split(";") if part.strip()]
+
+
+def format_source_id_list(ids: Sequence[str]) -> str:
+    return "; ".join(ids)
 
 
 def parse_notes(value: str) -> list[str]:

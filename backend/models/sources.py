@@ -74,6 +74,7 @@ class SourceManifestRow(BaseModel):
     media_status: str = ""  # not_requested | downloaded | partial | failed | skipped_*
     media_duration_seconds: int = 0
     discovered_from: str = ""
+    discovered_source_ids: str = ""
     discovered_media_urls: str = ""
     discovered_media_count: int = 0
     discovery_depth: int = 0
@@ -135,6 +136,7 @@ SOURCE_MANIFEST_COLUMNS = [
     "media_status",
     "media_duration_seconds",
     "discovered_from",
+    "discovered_source_ids",
     "discovered_media_urls",
     "discovered_media_count",
 ]

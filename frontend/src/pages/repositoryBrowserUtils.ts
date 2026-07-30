@@ -1,6 +1,7 @@
 import type {
   RepositoryManifestColumn,
   RepositoryManifestFilterPayload,
+  RepositoryManifestRow,
   RepositorySourceFileKind,
   RepositorySourceTaskRequest,
 } from "../api/types";
@@ -103,6 +104,77 @@ export const REPOSITORY_BROWSER_FILE_COLUMNS: Array<{
   { id: "file_thumbnail", kind: "thumbnail", label: "Thumb" },
 ];
 
+/** The row field that actually backs each downloadable file kind. */
+const FILE_KIND_FIELDS: Record<RepositorySourceFileKind, Array<keyof RepositoryManifestRow>> = {
+  pdf: [],
+  html: [],
+  rendered: ["rendered_pdf_file", "rendered_file"],
+  ocr: ["ocr_pdf_file"],
+  md: ["llm_cleanup_file", "markdown_file"],
+  video: ["video_file"],
+  audio: ["audio_file"],
+  thumbnail: ["thumbnail_file"],
+};
+
+function hasRawFileWithSuffix(row: RepositoryManifestRow, suffixes: string[]): boolean {
+  const rawFile = String(row.raw_file || "").trim().toLowerCase();
+  return suffixes.some((suffix) => rawFile.endsWith(suffix));
+}
+
+export function hasFileForKind(
+  row: RepositoryManifestRow,
+  kind: RepositorySourceFileKind,
+): boolean {
+  // `pdf` and `html` are the raw download, distinguished by extension rather
+  // than by a dedicated field.
+  if (kind === "pdf") return hasRawFileWithSuffix(row, [".pdf"]);
+  if (kind === "html") return hasRawFileWithSuffix(row, [".html", ".htm"]);
+  const fields = FILE_KIND_FIELDS[kind] || [];
+  return fields.some((field) => Boolean(String(row[field] || "").trim()));
+}
+
+export function buildFileHref(
+  row: RepositoryManifestRow,
+  kind: RepositorySourceFileKind,
+): string {
+  return `/api/repository/sources/${encodeURIComponent(row.id)}/files/${kind}`;
+}
+
+/** Columns holding `; `-joined source IDs that link one row to another. */
+export const REPOSITORY_BROWSER_PROVENANCE_COLUMNS = ["discovered_from", "discovered_source_ids"];
+
+export interface RepositoryBrowserRelatedSource {
+  id: string;
+  title: string;
+  /** False when no row with this id survives, so the link is history, not a target. */
+  exists: boolean;
+}
+
+export function parseSourceIdList(value: unknown): string[] {
+  if (!value) return [];
+  return String(value)
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+export function resolveRelatedSources(
+  value: unknown,
+  relatedSources: Record<string, string> | undefined,
+): RepositoryBrowserRelatedSource[] {
+  const lookup = relatedSources || {};
+  return parseSourceIdList(value).map((id) => ({
+    id,
+    title: lookup[id] || "",
+    exists: Object.prototype.hasOwnProperty.call(lookup, id),
+  }));
+}
+
+export function formatRelatedSourceLabel(related: RepositoryBrowserRelatedSource): string {
+  if (!related.exists) return `${related.id} (deleted)`;
+  return related.title ? `${related.id} — ${related.title}` : related.id;
+}
+
 export const REPOSITORY_BROWSER_BIBLIOGRAPHY_COLUMNS = [
   "title",
   "author_names",
@@ -150,6 +222,7 @@ export const REPOSITORY_BROWSER_COLUMN_CATEGORIES: RepositoryBrowserColumnCatego
       "discovered_media_count",
       "discovered_media_urls",
       "discovered_from",
+      "discovered_source_ids",
       "media_duration_seconds",
     ],
   },
@@ -468,7 +541,8 @@ export function defaultRepositoryBrowserColumnWidth(columnKey: string): number {
     ocr_status: 150,
     media_status: 150,
     media_duration_seconds: 150,
-    discovered_from: 150,
+    discovered_from: 200,
+    discovered_source_ids: 240,
     discovered_media_count: 160,
     discovered_media_urls: 320,
     summary_text: 380,

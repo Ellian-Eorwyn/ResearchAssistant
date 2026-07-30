@@ -151,6 +151,8 @@ from backend.pipeline.source_downloader import (
     llm_backend_ready_for_chat,
     normalize_url,
     normalize_citation_authors,
+    parse_source_id_list,
+    reconcile_discovery_links,
     summarize_output_rows,
 )
 from backend.pipeline.source_list_parser import parse_source_list_upload
@@ -2552,6 +2554,7 @@ class AttachedRepositoryService:
             "sort_by": normalized_sort_by,
             "sort_dir": normalized_sort_dir,
             "columns": columns,
+            "related_sources": _build_related_sources_map(records, paged_rows),
             "filters": {
                 "q": q,
                 "fetch_status": fetch_status,
@@ -2746,6 +2749,10 @@ class AttachedRepositoryService:
                         str(record.get("final_url") or ""),
                         str(record.get("source_document_name") or ""),
                         str(record.get("provenance_ref") or ""),
+                        # So searching a source id finds both its parent and the
+                        # rows discovered from it.
+                        str(record.get("discovered_from") or ""),
+                        str(record.get("discovered_source_ids") or ""),
                         str(record.get("summary_text") or ""),
                         str(record.get("rating_rationale") or ""),
                         str(record.get("relevant_sections") or ""),
@@ -8476,6 +8483,12 @@ class AttachedRepositoryService:
             if column_configs is not None
             else _load_column_configs(self._load_state_locked().get("column_configs", []))
         )
+        # Single choke point for every path that changes the row set (imports,
+        # downloads, deletes, column runs), so the parent side of a discovery
+        # link stays current without each caller having to remember. Mutates
+        # `sources` in place, so callers that reuse the list afterwards -- such
+        # as `_rebuild_outputs_locked` -- write the reconciled values too.
+        reconcile_discovery_links(sources)
         payload = {
             "sources": [row.model_dump(mode="json") for row in sources],
             "citations": [row.model_dump(mode="json") for row in citations],
@@ -8864,6 +8877,34 @@ def _split_relevant_sections_text(value: Any) -> list[str]:
 
 
 SOURCE_FILE_KINDS = ("pdf", "html", "rendered", "ocr", "md", "video", "audio", "thumbnail")
+
+
+def _build_related_sources_map(
+    all_records: list[dict[str, str | int | float | bool]],
+    page_records: list[dict[str, str | int | float | bool]],
+) -> dict[str, str]:
+    """Resolve provenance ids referenced by a page of rows to their titles.
+
+    Lets the browser label a discovery link with the other row's title instead of
+    a bare id, without denormalizing titles into stored columns where they would
+    go stale. An id that is absent from this map has no surviving row, which is
+    how the UI knows to render it as deleted.
+    """
+    titles_by_id = {
+        str(record.get("id") or ""): str(record.get("title") or "").strip()
+        for record in all_records
+    }
+
+    referenced: set[str] = set()
+    for record in page_records:
+        referenced.update(parse_source_id_list(str(record.get("discovered_from") or "")))
+        referenced.update(parse_source_id_list(str(record.get("discovered_source_ids") or "")))
+
+    return {
+        source_id: titles_by_id[source_id]
+        for source_id in sorted(referenced)
+        if source_id in titles_by_id
+    }
 
 
 def _normalize_source_file_kind(value: str) -> str:

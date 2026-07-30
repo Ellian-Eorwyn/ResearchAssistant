@@ -45,7 +45,11 @@ import {
   clampRepositoryBrowserColumnWidth,
   buildRepositoryBrowserQuery,
   buildRepositoryBrowserStorageKey,
+  buildFileHref,
+  formatRelatedSourceLabel,
+  hasFileForKind,
   labelRepositoryBrowserColumn,
+  resolveRelatedSources,
   migrateRepositoryBrowserVisibleColumns,
   mergeRepositoryBrowserColumns,
   nextRepositoryBrowserSort,
@@ -56,9 +60,11 @@ import {
   REPOSITORY_BROWSER_DEFAULT_VISIBLE_COLUMNS,
   REPOSITORY_BROWSER_FILE_COLUMNS,
   REPOSITORY_BROWSER_PAGE_SIZE,
+  REPOSITORY_BROWSER_PROVENANCE_COLUMNS,
   toggleRepositoryBrowserSelection,
   type RepositoryBrowserDownloadScope,
   type RepositoryBrowserFilters,
+  type RepositoryBrowserRelatedSource,
   type RepositoryBrowserTaskScope,
   type RepositoryBrowserStoredState,
 } from "./repositoryBrowserUtils";
@@ -246,22 +252,46 @@ const CITATION_EVIDENCE_FIELDS: Array<{
   { key: "accessed", label: "Accessed", valueKey: "citation_accessed" },
 ];
 
-function hasRawFileWithSuffix(row: RepositoryManifestRow, suffixes: string[]): boolean {
-  const rawFile = String(row.raw_file || "").trim().toLowerCase();
-  return suffixes.some((suffix) => rawFile.endsWith(suffix));
-}
-
-function hasFileForKind(row: RepositoryManifestRow, kind: RepositorySourceFileKind): boolean {
-  if (kind === "pdf") return hasRawFileWithSuffix(row, [".pdf"]);
-  if (kind === "html") return hasRawFileWithSuffix(row, [".html", ".htm"]);
-  if (kind === "rendered") {
-    return Boolean(String(row.rendered_file || "").trim() || String(row.rendered_pdf_file || "").trim());
+function RelatedSourceChip({
+  related,
+  onJump,
+}: {
+  related: RepositoryBrowserRelatedSource;
+  onJump: (sourceId: string) => void;
+}) {
+  const label = formatRelatedSourceLabel(related);
+  if (!related.exists) {
+    return (
+      <span
+        className="rounded border border-outline-variant/40 px-1.5 py-0.5 text-xs text-on-surface-variant/60"
+        title="This source has been deleted from the repository."
+      >
+        {label}
+      </span>
+    );
   }
-  return Boolean(String(row.llm_cleanup_file || "").trim() || String(row.markdown_file || "").trim());
+  return (
+    <button
+      type="button"
+      className="rounded border border-outline-variant/40 px-1.5 py-0.5 text-xs text-primary hover:border-primary/50 hover:underline"
+      onClick={(event) => {
+        event.stopPropagation();
+        onJump(related.id);
+      }}
+      title={`Go to source ${label}`}
+    >
+      {label}
+    </button>
+  );
 }
 
-function buildFileHref(row: RepositoryManifestRow, kind: RepositorySourceFileKind): string {
-  return `/api/repository/sources/${encodeURIComponent(row.id)}/files/${kind}`;
+function scrollSourceRowIntoView(sourceId: string): void {
+  if (typeof document === "undefined") return;
+  window.requestAnimationFrame(() => {
+    document
+      .querySelector(`[data-source-id="${CSS.escape(sourceId)}"]`)
+      ?.scrollIntoView({ behavior: "smooth", block: "center" });
+  });
 }
 
 function formatCellValue(value: string | number | boolean | null | undefined): string {
@@ -493,15 +523,27 @@ function SourceDetailsDrawer({
   onChange,
   saveState,
   saveError,
+  relatedSources,
+  onJumpToSource,
 }: {
   row: RepositoryManifestRow;
   draft: SourceDetailsDraft;
   onChange: (field: keyof SourceDetailsDraft, value: string) => void;
   saveState: "idle" | "saving" | "saved" | "error";
   saveError: string;
+  relatedSources: Record<string, string> | undefined;
+  onJumpToSource: (sourceId: string) => void;
 }) {
   const fileLinks = REPOSITORY_BROWSER_FILE_COLUMNS.filter((column) =>
     hasFileForKind(row, column.kind),
+  );
+  const discoveredFrom = useMemo(
+    () => resolveRelatedSources(row.discovered_from, relatedSources),
+    [row.discovered_from, relatedSources],
+  );
+  const discoveredHere = useMemo(
+    () => resolveRelatedSources(row.discovered_source_ids, relatedSources),
+    [row.discovered_source_ids, relatedSources],
   );
   const citationEvidenceMap = useMemo(
     () => parseCitationFieldEvidenceMap(row.citation_field_evidence_json),
@@ -625,6 +667,36 @@ function SourceDetailsDrawer({
             </div>
           )}
         </div>
+
+        {(discoveredFrom.length > 0 || discoveredHere.length > 0) && (
+          <div>
+            <div className="mb-2 text-title-sm font-semibold">Provenance</div>
+            {discoveredFrom.length > 0 && (
+              <div className="mb-3">
+                <div className="mb-1 text-label-sm uppercase tracking-[0.08em] text-on-surface-variant">
+                  Discovered in
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {discoveredFrom.map((item) => (
+                    <RelatedSourceChip key={item.id} related={item} onJump={onJumpToSource} />
+                  ))}
+                </div>
+              </div>
+            )}
+            {discoveredHere.length > 0 && (
+              <div>
+                <div className="mb-1 text-label-sm uppercase tracking-[0.08em] text-on-surface-variant">
+                  Discovered here
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {discoveredHere.map((item) => (
+                    <RelatedSourceChip key={item.id} related={item} onJump={onJumpToSource} />
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
 
         <div className="grid gap-3">
           <InputField
@@ -2218,6 +2290,7 @@ export function RepositoryBrowserPage() {
   const [spreadsheetExportPending, setSpreadsheetExportPending] = useState(false);
   const [repositoryExportPending, setRepositoryExportPending] = useState(false);
   const [activeRowId, setActiveRowId] = useState<string | null>(null);
+  const pendingJumpRowId = useRef<string | null>(null);
   const [detailDraft, setDetailDraft] = useState<SourceDetailsDraft | null>(null);
   const [detailBaseline, setDetailBaseline] = useState<SourceDetailsDraft | null>(null);
   const [detailSaveState, setDetailSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
@@ -2353,6 +2426,7 @@ export function RepositoryBrowserPage() {
 
   const rows = manifestQuery.data?.rows || [];
   const totalRows = manifestQuery.data?.total || 0;
+  const relatedSources = manifestQuery.data?.related_sources;
   const llmReady = Boolean(
     appSettingsDraft.use_llm &&
       appSettingsDraft.llm_backend.base_url.trim() &&
@@ -2535,8 +2609,21 @@ export function RepositoryBrowserPage() {
   useEffect(() => {
     if (!activeRowId) return;
     if (rows.some((row) => row.id === activeRowId)) return;
+    // A jump to another page clears its own target here, because the new rows
+    // have not arrived yet. pendingJumpRowId below restores it once they do.
+    if (pendingJumpRowId.current === activeRowId) return;
     setActiveRowId(null);
   }, [activeRowId, rows]);
+
+  // Applies a cross-page jump once the filtered refetch delivers the target row.
+  useEffect(() => {
+    const targetId = pendingJumpRowId.current;
+    if (!targetId) return;
+    if (!rows.some((row) => row.id === targetId)) return;
+    pendingJumpRowId.current = null;
+    setActiveRowId(targetId);
+    scrollSourceRowIntoView(targetId);
+  }, [rows]);
 
   const detailPatch = useMemo(
     () => buildSourcePatch(activeRow, detailDraft, detailBaseline),
@@ -2724,6 +2811,23 @@ export function RepositoryBrowserPage() {
       offset: resetOffset ? 0 : patch.offset ?? prev.offset,
       limit: REPOSITORY_BROWSER_PAGE_SIZE,
     }));
+  };
+
+  /** Open another source's details, following it across pages when needed. */
+  const jumpToSource = (sourceId: string) => {
+    const targetId = sourceId.trim();
+    if (!targetId) return;
+    if (rows.some((row) => row.id === targetId)) {
+      pendingJumpRowId.current = null;
+      setActiveRowId(targetId);
+      scrollSourceRowIntoView(targetId);
+      return;
+    }
+    // Off the current page: narrow by id (the backend `q` filter matches it) and
+    // finish the jump once the refetch lands.
+    pendingJumpRowId.current = targetId;
+    setActiveRowId(targetId);
+    patchFilters({ q: targetId });
   };
 
   const toggleVisibleColumn = (columnId: string) => {
@@ -4604,6 +4708,7 @@ export function RepositoryBrowserPage() {
                         return (
                           <tr
                             key={`${row.id}-${row.original_url}`}
+                            data-source-id={row.id}
                             className={[
                               isSelected ? "repository-browser-row-selected" : "",
                               isActive ? "repository-browser-row-active" : "",
@@ -4637,6 +4742,30 @@ export function RepositoryBrowserPage() {
                                       </a>
                                     ) : (
                                       <span className="text-on-surface-variant/60">—</span>
+                                    )}
+                                  </td>
+                                );
+                              }
+
+                              if (REPOSITORY_BROWSER_PROVENANCE_COLUMNS.includes(column.key)) {
+                                const related = resolveRelatedSources(
+                                  row[column.key],
+                                  relatedSources,
+                                );
+                                return (
+                                  <td key={`${row.id}-${column.key}`} style={style}>
+                                    {related.length === 0 ? (
+                                      <span className="text-on-surface-variant/60">—</span>
+                                    ) : (
+                                      <span className="flex flex-wrap gap-1">
+                                        {related.map((item) => (
+                                          <RelatedSourceChip
+                                            key={`${row.id}-${column.key}-${item.id}`}
+                                            related={item}
+                                            onJump={jumpToSource}
+                                          />
+                                        ))}
+                                      </span>
                                     )}
                                   </td>
                                 );
@@ -4792,6 +4921,8 @@ export function RepositoryBrowserPage() {
               row={activeRow}
               saveError={detailSaveError}
               saveState={detailSaveState}
+              relatedSources={relatedSources}
+              onJumpToSource={jumpToSource}
               onChange={(field, value) => {
                 setDetailDraft((prev) => (prev ? { ...prev, [field]: value } : prev));
                 setDetailSaveState("idle");
