@@ -14,6 +14,7 @@ import {
   MatchesPage,
   OverviewPage,
   RepositoryBrowserPage,
+  ResolveFetchesPage,
   SearchPage,
   SentencesPage,
   SettingsPage,
@@ -38,7 +39,8 @@ export default function App() {
         <Route element={<Navigate replace to="/browser" />} index />
 
         <Route element={<RepositoryBrowserPage />} path="browser" />
-        <Route element={<SearchPage />} path="search" />
+        <Route element={<ResolveFetchesPage />} path="resolve-fetches" />
+      <Route element={<SearchPage />} path="search" />
         <Route element={<SpreadsheetsPage />} path="spreadsheets" />
         <Route element={<AiGuidancePage />} path="ai-guidance" />
         <Route element={<SettingsPage />} path="settings" />

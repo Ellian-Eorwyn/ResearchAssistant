@@ -65,7 +65,7 @@ export interface RepositoryBrowserColumnCategory {
 }
 
 export type RepositoryBrowserTaskScope = "all" | "selected" | "empty_only";
-export type RepositoryBrowserDownloadScope = "all" | "selected" | "failed_fetch";
+export type RepositoryBrowserDownloadScope = "all" | "selected" | "failed_fetch" | "blocked";
 
 export interface RepositoryBrowserQueuedSourceTask {
   id: "convert" | "cleanup" | "title" | "catalog" | "citation_verify" | "summary" | "rating";
@@ -217,6 +217,7 @@ export const REPOSITORY_BROWSER_COLUMN_CATEGORIES: RepositoryBrowserColumnCatego
       "final_url",
       "detected_type",
       "fetch_status",
+      "fetch_verification",
       "fetched_at",
       "markdown_char_count",
       "discovered_media_count",
@@ -485,7 +486,9 @@ export function buildRepositoryBrowserDownloadTaskPayload({
 
   return {
     ...draft,
-    scope: "all",
+    // `blocked` narrows server-side to rows the verifier flagged; the other
+    // scopes select every row and filter with rerun_failed_only / source_ids.
+    scope: scope === "blocked" ? "blocked" : "all",
     import_id: "",
     source_ids: scope === "selected" ? normalizedSelectedIds : [],
     selected_phases: [],
@@ -536,6 +539,7 @@ export function defaultRepositoryBrowserColumnWidth(columnKey: string): number {
     final_url: 300,
     detected_type: 140,
     fetch_status: 140,
+    fetch_verification: 180,
     fetched_at: 180,
     markdown_char_count: 150,
     ocr_status: 150,
@@ -860,4 +864,56 @@ export function labelRepositoryBrowserColumn(columnKey: string, fallbackLabel?: 
     rating_relevant_detail_score: "Detail Score",
   };
   return overrides[columnKey] || fallbackLabel || columnKey;
+}
+
+export type StatusTone = "neutral" | "success" | "warning" | "error" | "active";
+
+export function statusTone(status: string): StatusTone {
+  const normalized = status.trim().toLowerCase();
+  if (!normalized || normalized === "idle" || normalized === "unknown") return "neutral";
+  if (
+    normalized === "generated" ||
+    normalized === "completed" ||
+    normalized === "success" ||
+    normalized === "existing" ||
+    normalized === "ok"
+  ) {
+    return "success";
+  }
+  if (normalized === "running" || normalized === "pending" || normalized === "queued") {
+    return "active";
+  }
+  if (normalized === "partial" || normalized === "cancelling" || normalized === "thin_content") {
+    return "warning";
+  }
+  // `blocked` and the verification reasons contain neither "fail" nor "error",
+  // so they have to be named explicitly or they render as neutral grey.
+  if (
+    normalized === "blocked" ||
+    normalized === "blocked_challenge" ||
+    normalized === "blocked_http" ||
+    normalized === "login_required" ||
+    normalized === "paywall" ||
+    normalized === "empty" ||
+    normalized === "cancelled" ||
+    normalized.includes("fail") ||
+    normalized.includes("error")
+  ) {
+    return "error";
+  }
+  return "neutral";
+}
+
+/** Human label for a `fetch_verification` reason. */
+export function labelFetchVerification(reason: string): string {
+  const labels: Record<string, string> = {
+    ok: "Verified",
+    blocked_challenge: "Bot wall / CAPTCHA",
+    blocked_http: "Refused by server",
+    login_required: "Sign-in required",
+    paywall: "Paywalled",
+    thin_content: "Almost no content",
+    empty: "Nothing extracted",
+  };
+  return labels[reason.trim().toLowerCase()] || reason;
 }

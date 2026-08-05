@@ -280,7 +280,53 @@ class RepositorySourcePatchRequest(BaseModel):
     citation_language: str | None = None
     citation_accessed: str | None = None
     citation_override_fields: list[str] = Field(default_factory=list)
+    # Manual override for a fetch the verifier mis-scored.
+    fetch_status: str | None = None
+    fetch_verification: str | None = None
     custom_fields: dict[str, str | None] = Field(default_factory=dict)
+
+
+class RepositoryReverifyFetchesRequest(BaseModel):
+    scope: Literal["all", "selected"] = "all"
+    source_ids: list[str] = Field(default_factory=list)
+    # Re-score rows even when they already carry the current verifier version.
+    force: bool = False
+
+
+class RepositoryReverifyFetchChange(BaseModel):
+    source_id: str
+    title: str = ""
+    original_url: str = ""
+    before_status: str = ""
+    after_status: str = ""
+    before_verification: str = ""
+    after_verification: str = ""
+    message: str = ""
+    staled_phases: list[str] = Field(default_factory=list)
+
+
+class RepositoryCaptureResponse(BaseModel):
+    # captured: the page is now verified real. still_blocked: we wrote the files
+    # but the verifier says it is still a wall, so the row keeps `blocked`.
+    status: Literal["captured", "still_blocked"] = "captured"
+    source_id: str
+    fetch_status: str = ""
+    fetch_verification: str = ""
+    fetch_method: str = ""
+    title: str = ""
+    final_url: str = ""
+    markdown_char_count: int = 0
+    written_files: list[str] = Field(default_factory=list)
+    staled_phases: list[str] = Field(default_factory=list)
+    message: str = ""
+
+
+class RepositoryReverifyFetchesResponse(BaseModel):
+    checked_count: int = 0
+    changed_count: int = 0
+    blocked_count: int = 0
+    changes: list[RepositoryReverifyFetchChange] = Field(default_factory=list)
+    message: str = ""
 
 
 class RepositoryColumnOutputConstraint(BaseModel):

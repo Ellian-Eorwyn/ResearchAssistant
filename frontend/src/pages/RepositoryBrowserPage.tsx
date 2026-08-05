@@ -56,6 +56,7 @@ import {
   moveRepositoryBrowserColumnToEnd,
   reorderRepositoryBrowserColumns,
   resolveRepositoryBrowserColumnWidth,
+  statusTone,
   REPOSITORY_BROWSER_COLUMN_CATEGORIES,
   REPOSITORY_BROWSER_DEFAULT_VISIBLE_COLUMNS,
   REPOSITORY_BROWSER_FILE_COLUMNS,
@@ -480,29 +481,6 @@ function downloadBlob(blob: Blob, filename: string): void {
   link.click();
   document.body.removeChild(link);
   window.URL.revokeObjectURL(objectUrl);
-}
-
-function statusTone(status: string): "neutral" | "success" | "warning" | "error" | "active" {
-  const normalized = status.trim().toLowerCase();
-  if (!normalized || normalized === "idle" || normalized === "unknown") return "neutral";
-  if (
-    normalized === "generated" ||
-    normalized === "completed" ||
-    normalized === "success" ||
-    normalized === "existing"
-  ) {
-    return "success";
-  }
-  if (normalized === "running" || normalized === "pending" || normalized === "queued") {
-    return "active";
-  }
-  if (normalized === "partial" || normalized === "cancelling") {
-    return "warning";
-  }
-  if (normalized.includes("fail") || normalized.includes("error") || normalized === "cancelled") {
-    return "error";
-  }
-  return "neutral";
 }
 
 function columnWidthStyle(
@@ -1628,6 +1606,18 @@ function DownloadSourcesModal({
               be skipped automatically.
             </div>
           </button>
+          <button
+            className={columnRunScopeOptionClass(draft.scope === "blocked", false)}
+            disabled={startPending}
+            onClick={() => onChangeScope("blocked")}
+            type="button"
+          >
+            <div className="font-semibold text-on-surface">Blocked Fetches</div>
+            <div className="mt-1 text-body-md text-on-surface-variant">
+              Retry only rows where a bot wall, sign-in or paywall was served instead of the
+              source. Most of these need the Resolve Fetches page rather than another retry.
+            </div>
+          </button>
         </div>
 
         <div className="mt-4 rounded-lg border border-outline-variant/30 bg-surface-container-low p-4">
@@ -2698,7 +2688,10 @@ export function RepositoryBrowserPage() {
     if (!activeRow || !detailPatch) return false;
     if (scope === "all") return true;
     if (scope === "selected") return selectedIds.has(activeRow.id);
-    return String(activeRow.fetch_status || "").trim().toLowerCase() === "failed";
+    const fetchStatus = String(activeRow.fetch_status || "").trim().toLowerCase();
+    if (scope === "blocked") return fetchStatus === "blocked";
+    // `failed_fetch` reruns anything that is not a clean success.
+    return fetchStatus !== "success";
   };
 
   const flushActiveDetailDraftForDownload = async (

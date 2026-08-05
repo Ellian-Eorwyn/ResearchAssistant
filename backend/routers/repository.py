@@ -35,6 +35,8 @@ from backend.models.repository import (
     RepositoryDocumentImportListResponse,
     RepositoryDuplicateCandidateResponse,
     RepositoryManifestExportRequest,
+    RepositoryReverifyFetchesRequest,
+    RepositoryReverifyFetchesResponse,
     RepositorySourceBulkRisReadyRequest,
     RepositorySourceBulkRisReadyResponse,
     RepositorySourceDeleteRequest,
@@ -657,6 +659,22 @@ async def run_repository_source_tasks(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/repository/reverify-fetches", response_model=RepositoryReverifyFetchesResponse)
+async def reverify_repository_fetches(
+    request: Request,
+    payload: RepositoryReverifyFetchesRequest,
+) -> RepositoryReverifyFetchesResponse:
+    service = request.app.state.repository_service
+    try:
+        return service.reverify_fetches(
+            scope=payload.scope,
+            source_ids=payload.source_ids,
+            force=payload.force,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/repository/sources/{source_id}/files/{kind}")

@@ -395,6 +395,7 @@ export interface SourceItemStatus {
   source_kind: string;
   status: "pending" | "running" | "completed" | "failed" | "skipped" | "cancelled";
   fetch_status: string;
+  fetch_verification: string;
   catalog_status: string;
   citation_verification_status: string;
   title_status: string;
@@ -419,6 +420,7 @@ export interface SourceDownloadStatus {
   success_count: number;
   failed_count: number;
   partial_count: number;
+  blocked_count: number;
   skipped_count: number;
   duplicate_urls_removed: number;
   cancel_requested: boolean;
@@ -485,7 +487,7 @@ export interface SourceDownloadRequest {
 }
 
 export interface RepositorySourceTaskRequest extends SourceDownloadRequest {
-  scope: "all" | "queued" | "import" | "latest_import" | "empty_only";
+  scope: "all" | "queued" | "blocked" | "import" | "latest_import" | "empty_only";
   import_id: string;
   source_ids?: string[];
   selected_phases?: string[];
@@ -656,6 +658,7 @@ export interface RepositoryManifestRow {
   original_url: string;
   final_url: string;
   fetch_status: string;
+  fetch_verification: string;
   http_status: number | null;
   content_type: string;
   detected_type: string;
@@ -1173,5 +1176,119 @@ export interface SearchImportResponse {
   imported_count: number;
   duplicates_skipped: number;
   total_sources: number;
+  message: string;
+}
+
+// --- Resolve Fetches -------------------------------------------------------
+
+export interface ResolveSourceRow {
+  id: string;
+  title: string;
+  original_url: string;
+  final_url: string;
+  fetch_status: string;
+  fetch_verification: string;
+  http_status: number | null;
+  detected_type: string;
+  error_message: string;
+  markdown_char_count: number;
+  fetched_at: string;
+  /** Head of the content currently stored — usually the block page being replaced. */
+  current_content_preview: string;
+}
+
+export interface ResolveSourceListResponse {
+  rows: ResolveSourceRow[];
+  total: number;
+  blocked_count: number;
+  failed_count: number;
+  partial_count: number;
+  /** True when this request triggered the one-shot retroactive re-verification. */
+  reverified: boolean;
+}
+
+export interface CaptureAvailabilityResponse {
+  available: boolean;
+  headless: boolean;
+  channel: string;
+  display: string;
+  error: string;
+  guidance: string;
+}
+
+export interface CaptureSessionInfo {
+  session_id: string;
+  source_id: string;
+  current_url: string;
+  title: string;
+  viewport_width: number;
+  viewport_height: number;
+  frame_mode: string;
+  frame_seq: number;
+  headless: boolean;
+  channel: string;
+  idle_seconds: number;
+}
+
+export type CaptureInputEventType =
+  | "mouseMoved"
+  | "mousePressed"
+  | "mouseReleased"
+  | "mouseWheel"
+  | "keyDown"
+  | "keyUp"
+  | "rawKeyDown"
+  | "char"
+  | "insertText";
+
+/** Mirrors the CDP Input domain; the server dispatches these verbatim. */
+export interface CaptureInputEvent {
+  type: CaptureInputEventType;
+  x?: number;
+  y?: number;
+  button?: string;
+  buttons?: number;
+  clickCount?: number;
+  modifiers?: number;
+  deltaX?: number;
+  deltaY?: number;
+  key?: string;
+  code?: string;
+  text?: string;
+  unmodifiedText?: string;
+  windowsVirtualKeyCode?: number;
+}
+
+export interface RepositoryCaptureResponse {
+  status: "captured" | "still_blocked";
+  source_id: string;
+  fetch_status: string;
+  fetch_verification: string;
+  fetch_method: string;
+  title: string;
+  final_url: string;
+  markdown_char_count: number;
+  written_files: string[];
+  staled_phases: string[];
+  message: string;
+}
+
+export interface RepositoryReverifyFetchChange {
+  source_id: string;
+  title: string;
+  original_url: string;
+  before_status: string;
+  after_status: string;
+  before_verification: string;
+  after_verification: string;
+  message: string;
+  staled_phases: string[];
+}
+
+export interface RepositoryReverifyFetchesResponse {
+  checked_count: number;
+  changed_count: number;
+  blocked_count: number;
+  changes: RepositoryReverifyFetchChange[];
   message: string;
 }

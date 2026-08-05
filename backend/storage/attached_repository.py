@@ -55,6 +55,7 @@ from backend.models.ingestion_profiles import (
 from backend.models.repository import (
     RepositoryActionResponse,
     RepositoryBundleExportRequest,
+    RepositoryCaptureResponse,
     RepositoryCitationRisExportRequest,
     RepositoryColumnConfig,
     RepositoryColumnClearRequest,
@@ -81,6 +82,8 @@ from backend.models.repository import (
     RepositoryManifestExportRequest,
     RepositoryProcessDocumentsResponse,
     RepositoryReprocessDocumentsResponse,
+    RepositoryReverifyFetchChange,
+    RepositoryReverifyFetchesResponse,
     RepositorySourceBulkRisReadyResponse,
     RepositoryScanSummary,
     RepositorySourceDeleteResponse,
@@ -122,6 +125,7 @@ from backend.pipeline.standardized_markdown import (
 )
 from backend.pipeline.source_downloader import (
     MANIFEST_DERIVED_COLUMNS,
+    NOTE_BLOCKED_REQUEST,
     PHASE_CATALOG,
     PHASE_CITATION_VERIFY,
     PHASE_CLEANUP,
@@ -140,6 +144,15 @@ from backend.pipeline.source_downloader import (
     _normalize_phase_name,
     _citation_reference_url_for_row,
     _normalize_row_phase_metadata,
+    mark_downstream_stale,
+    mark_downstream_stale_for_blocked,
+    markdown_rel,
+    metadata_rel,
+    ocr_pdf_rel,
+    raw_file_rel,
+    rendered_html_rel,
+    rendered_pdf_rel,
+    reverify_row_from_artifacts,
     _row_citation_verification_status,
     SourceDownloadOrchestrator,
     build_ris_records,
@@ -151,10 +164,13 @@ from backend.pipeline.source_downloader import (
     llm_backend_ready_for_chat,
     normalize_url,
     normalize_citation_authors,
+    parse_notes,
     parse_source_id_list,
     reconcile_discovery_links,
     summarize_output_rows,
 )
+from backend.pipeline.fetch_verification import FETCH_VERIFICATION_VERSION, verify_fetch
+from backend.pipeline.source_capture import CapturedArtifacts
 from backend.pipeline.source_list_parser import parse_source_list_upload
 from backend.pipeline.stage_bibliography import (
     build_entries_from_inline_urls,
@@ -179,7 +195,14 @@ except Exception:  # pragma: no cover - Windows fallback
     fcntl = None
 
 
-SCHEMA_VERSION = 4
+VALID_FETCH_STATUSES = frozenset(
+    {"", "queued", "success", "partial", "blocked", "failed", "not_applicable"}
+)
+
+# v5 added SourceManifestRow.fetch_verification and the `blocked` fetch status.
+# Old rows simply lack the key and pick up the pydantic default on load; the
+# bump exists so attaching an older repository takes a backup snapshot first.
+SCHEMA_VERSION = 5
 INTERNAL_DIR_NAME = ".ra_repo"
 META_FILE_NAME = "repository.json"
 STATE_FILE_NAME = "repository_state.json"
@@ -1331,6 +1354,12 @@ class AttachedRepositoryService:
             "rating_rationale",
             "relevant_sections",
         }
+        # Manual escape hatch for the fetch verifier: a page it wrongly called a
+        # bot wall can be forced back to success without re-fetching it.
+        fetch_fields = {
+            "fetch_status",
+            "fetch_verification",
+        }
         citation_fields = {
             "citation_title",
             "citation_authors",
@@ -1397,6 +1426,19 @@ class AttachedRepositoryService:
                     },
                 )
 
+            if requested_fields.intersection(fetch_fields):
+                if "fetch_status" in requested_fields:
+                    next_status = self._normalize_source_patch_text(patch.get("fetch_status")).lower()
+                    if next_status not in VALID_FETCH_STATUSES:
+                        raise ValueError(
+                            f"fetch_status must be one of: {', '.join(sorted(VALID_FETCH_STATUSES))}"
+                        )
+                    row.fetch_status = next_status
+                if "fetch_verification" in requested_fields:
+                    row.fetch_verification = self._normalize_source_patch_text(
+                        patch.get("fetch_verification")
+                    ).lower()
+
             if "custom_fields" in requested_fields:
                 custom_updates = patch.get("custom_fields") or {}
                 if not isinstance(custom_updates, dict):
@@ -1440,6 +1482,350 @@ class AttachedRepositoryService:
                 base_dir=self.path,
                 column_configs=column_configs,
             )
+
+    def reverify_fetches(
+        self,
+        *,
+        scope: str = "all",
+        source_ids: list[str] | None = None,
+        force: bool = False,
+    ) -> RepositoryReverifyFetchesResponse:
+        """Re-score already-fetched sources against the current verifier.
+
+        Reads only the stored markdown — no network — so this is how a repository
+        fetched under an older, weaker check picks up the newer one. Rows that
+        turn out to be block pages also have their LLM phases staled, because
+        those summaries and ratings describe the wall, not the source.
+        """
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+
+        normalized_ids = _normalize_source_ids(source_ids or [])
+        if scope == "selected" and not normalized_ids:
+            raise ValueError("Select at least one source to re-check.")
+
+        with self._writer_lock():
+            state = self._load_state_locked()
+            rows = _load_source_rows(state.get("sources", []))
+            citations = _load_citation_rows(state.get("citations", []))
+            column_configs = _load_column_configs(state.get("column_configs", []))
+
+            changes: list[RepositoryReverifyFetchChange] = []
+            checked = 0
+
+            for index, row in enumerate(rows):
+                if scope == "selected" and row.id not in normalized_ids:
+                    continue
+
+                fetch_metadata = row.phase_metadata.get(PHASE_FETCH)
+                already_current = (
+                    fetch_metadata is not None
+                    and fetch_metadata.prompt_version == FETCH_VERIFICATION_VERSION
+                )
+                if already_current and not force:
+                    continue
+
+                verification = reverify_row_from_artifacts(row, self.path)
+                if verification is None:
+                    continue
+                checked += 1
+
+                before_status = row.fetch_status
+                before_verification = row.fetch_verification
+                updated = row.model_copy(deep=True)
+                updated.fetch_verification = verification.reason
+
+                staled: list[str] = []
+                if verification.is_blocked and updated.fetch_status != "blocked":
+                    updated.fetch_status = "blocked"
+                    updated.error_message = f"{verification.reason}: {verification.message}"
+                    staled = mark_downstream_stale_for_blocked(updated)
+                elif verification.is_blocked:
+                    updated.error_message = f"{verification.reason}: {verification.message}"
+
+                # Record which verifier scored this row so the next pass can skip it.
+                metadata = updated.phase_metadata.get(PHASE_FETCH) or SourcePhaseMetadata(
+                    phase=PHASE_FETCH
+                )
+                metadata.phase = PHASE_FETCH
+                metadata.prompt_version = FETCH_VERIFICATION_VERSION
+                if verification.is_blocked:
+                    metadata.status = "failed"
+                    metadata.error = updated.error_message
+                    metadata.error_code = verification.reason
+                updated.phase_metadata[PHASE_FETCH] = metadata
+
+                rows[index] = updated
+                if updated.fetch_verification != before_verification:
+                    self._write_repository_source_metadata(updated)
+                # Only status flips are worth reporting: every row picks up a
+                # verification reason on the first pass, and 40 rows reading
+                # "ok -> ok" would bury the handful that actually moved.
+                if updated.fetch_status != before_status:
+                    changes.append(
+                        RepositoryReverifyFetchChange(
+                            source_id=updated.id,
+                            title=updated.title,
+                            original_url=updated.original_url,
+                            before_status=before_status,
+                            after_status=updated.fetch_status,
+                            before_verification=before_verification,
+                            after_verification=updated.fetch_verification,
+                            message=verification.message,
+                            staled_phases=staled,
+                        )
+                    )
+
+            self._save_state_locked(
+                sources=rows,
+                citations=citations,
+                imports=state.get("imports", []),
+                column_configs=column_configs,
+            )
+            self._save_meta_locked(
+                {
+                    **self._load_meta_locked(),
+                    "fetch_verification_version": FETCH_VERIFICATION_VERSION,
+                    "updated_at": _utc_now_iso(),
+                }
+            )
+            self._rebuild_outputs_locked(rows, citations)
+
+            blocked_total = sum(
+                1 for row in rows if str(row.fetch_status or "").strip().lower() == "blocked"
+            )
+            if not checked:
+                message = "All sources have already been checked by the current verifier."
+            elif not changes:
+                message = f"Re-checked {checked} source(s); no fetch status changed."
+            else:
+                message = (
+                    f"Re-checked {checked} source(s); {len(changes)} changed status. "
+                    f"{blocked_total} source(s) are now blocked."
+                )
+            return RepositoryReverifyFetchesResponse(
+                checked_count=checked,
+                changed_count=len(changes),
+                blocked_count=blocked_total,
+                changes=changes,
+                message=message,
+            )
+
+    def capture_source_artifacts(
+        self,
+        *,
+        source_id: str,
+        artifacts: CapturedArtifacts,
+    ) -> RepositoryCaptureResponse:
+        """Write externally captured files into an existing source, in place.
+
+        The source id never changes: the same row gains real artifacts under the
+        same filenames the downloader uses, so everything downstream keeps
+        working. Only the fetch phase is replayed — catalog, summary and rating
+        are marked stale for the user to re-run deliberately.
+        """
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+
+        normalized_id = str(source_id or "").strip()
+        if not normalized_id:
+            raise ValueError("source_id is required")
+        if not artifacts.has_content():
+            raise ValueError("Nothing was captured for this source.")
+
+        # A running job holds its own in-memory copy of these rows and would
+        # overwrite the capture when it finishes. The writer lock alone does not
+        # protect against that, so refuse loudly rather than lose the capture.
+        if self._download_thread and self._download_thread.is_alive():
+            raise RuntimeError(
+                "A repository operation is already running. Wait for it to finish "
+                "before capturing into a source."
+            )
+
+        with self._writer_lock():
+            state = self._load_state_locked()
+            rows = _load_source_rows(state.get("sources", []))
+            citations = _load_citation_rows(state.get("citations", []))
+            column_configs = _load_column_configs(state.get("column_configs", []))
+            row_index = next(
+                (index for index, item in enumerate(rows) if item.id == normalized_id), -1
+            )
+            if row_index < 0:
+                raise ValueError(f"Unknown source_id: {normalized_id}")
+
+            row = rows[row_index].model_copy(deep=True)
+            written: list[str] = []
+
+            def write_text(rel: Path, text: str) -> str:
+                target = self.path / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding="utf-8")
+                written.append(rel.as_posix())
+                return rel.as_posix()
+
+            def write_binary(rel: Path, data: bytes) -> str:
+                target = self.path / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+                written.append(rel.as_posix())
+                return rel.as_posix()
+
+            if artifacts.raw_pdf:
+                row.raw_file = write_binary(
+                    raw_file_rel(row.id, ".pdf", writes_to_repository=True), artifacts.raw_pdf
+                )
+                row.sha256 = hashlib.sha256(artifacts.raw_pdf).hexdigest()
+            elif artifacts.raw_html:
+                row.raw_file = write_text(
+                    raw_file_rel(row.id, ".html", writes_to_repository=True), artifacts.raw_html
+                )
+                row.sha256 = hashlib.sha256(artifacts.raw_html.encode("utf-8")).hexdigest()
+
+            if artifacts.rendered_html:
+                row.rendered_file = write_text(
+                    rendered_html_rel(row.id, writes_to_repository=True), artifacts.rendered_html
+                )
+            if artifacts.rendered_pdf:
+                row.rendered_pdf_file = write_binary(
+                    rendered_pdf_rel(row.id, writes_to_repository=True), artifacts.rendered_pdf
+                )
+            if artifacts.ocr_pdf:
+                row.ocr_pdf_file = write_binary(
+                    ocr_pdf_rel(row.id, writes_to_repository=True), artifacts.ocr_pdf
+                )
+                if artifacts.ocr_status:
+                    row.ocr_status = artifacts.ocr_status
+            if artifacts.markdown:
+                row.markdown_file = write_text(
+                    markdown_rel(row.id, writes_to_repository=True), artifacts.markdown
+                )
+                row.markdown_char_count = len(artifacts.markdown)
+                row.extraction_method = artifacts.extraction_method or "manual_capture"
+
+            if artifacts.final_url:
+                row.final_url = artifacts.final_url
+            if artifacts.canonical_url:
+                row.canonical_url = artifacts.canonical_url
+            if artifacts.content_type:
+                row.content_type = artifacts.content_type
+            if artifacts.detected_type:
+                row.detected_type = artifacts.detected_type
+            row.http_status = artifacts.http_status
+            row.fetch_method = artifacts.fetch_method
+            row.fetched_at = _utc_now_iso()
+
+            verification = verify_fetch(
+                http_status=artifacts.http_status,
+                final_url=row.final_url or row.original_url,
+                title=artifacts.title or row.title,
+                raw_html=artifacts.rendered_html or artifacts.raw_html,
+                extracted_text=artifacts.markdown,
+                content_type=row.content_type,
+                detected_type=row.detected_type,
+                source_kind=row.source_kind,
+            )
+
+            # Do not let a wall's title overwrite a good one we already had.
+            captured_title = str(artifacts.title or "").strip()
+            if captured_title and not verification.is_blocked:
+                row.title = captured_title
+                row.title_status = row.title_status or "extracted"
+            elif captured_title and not row.title:
+                row.title = captured_title
+
+            row.fetch_verification = verification.reason
+            notes = parse_notes(row.notes)
+            for note in [*artifacts.notes, artifacts.fetch_method]:
+                if note and note not in notes:
+                    notes.append(note)
+
+            if verification.is_blocked:
+                row.fetch_status = "blocked"
+                row.error_message = f"{verification.reason}: {verification.message}"
+                phase_status, phase_error_code = "failed", verification.reason
+                if NOTE_BLOCKED_REQUEST not in notes:
+                    notes.append(NOTE_BLOCKED_REQUEST)
+            else:
+                row.fetch_status = "partial" if verification.suggested_status == "partial" else "success"
+                row.error_message = "" if row.fetch_status == "success" else verification.message
+                phase_status, phase_error_code = "completed", ""
+                notes = [note for note in notes if note != NOTE_BLOCKED_REQUEST]
+                notes = [note for note in notes if not note.startswith("verify_")]
+            row.notes = "; ".join(notes)
+
+            row.phase_metadata[PHASE_FETCH] = SourcePhaseMetadata(
+                phase=PHASE_FETCH,
+                status=phase_status,
+                error=row.error_message if phase_status == "failed" else "",
+                error_code=phase_error_code,
+                started_at=row.fetched_at,
+                completed_at=row.fetched_at,
+                content_digest=row.sha256,
+                prompt_version=FETCH_VERIFICATION_VERSION,
+            )
+
+            # The markdown genuinely changed here, so the digest-comparing
+            # version is the right one — it stales exactly what is now outdated.
+            markdown_digest = (
+                hashlib.sha256(artifacts.markdown.encode("utf-8")).hexdigest()
+                if artifacts.markdown
+                else ""
+            )
+            staled = mark_downstream_stale(row, markdown_digest)
+
+            self._write_repository_source_metadata(row)
+            rows[row_index] = row
+            self._save_state_locked(
+                sources=rows,
+                citations=citations,
+                imports=state.get("imports", []),
+                column_configs=column_configs,
+            )
+            self._save_meta_locked(
+                {**self._load_meta_locked(), "updated_at": _utc_now_iso()}
+            )
+            self._rebuild_outputs_locked(rows, citations)
+
+            if verification.is_blocked:
+                message = (
+                    f"Captured, but the page still looks blocked: {verification.message} "
+                    "Try navigating past the challenge before capturing, or upload a saved copy."
+                )
+            else:
+                message = (
+                    f"Captured {len(written)} file(s) into source {row.id}. "
+                    "Re-run catalog, summary and rating from the browser when ready."
+                )
+
+            return RepositoryCaptureResponse(
+                status="still_blocked" if verification.is_blocked else "captured",
+                source_id=row.id,
+                fetch_status=row.fetch_status,
+                fetch_verification=row.fetch_verification,
+                fetch_method=row.fetch_method,
+                title=row.title,
+                final_url=row.final_url,
+                markdown_char_count=row.markdown_char_count,
+                written_files=written,
+                staled_phases=staled,
+                message=message,
+            )
+
+    def list_source_rows(self) -> list[SourceManifestRow]:
+        """Every source row, in display order. Read-only."""
+        if not self.is_attached:
+            return []
+        with self._writer_lock():
+            state = self._load_state_locked()
+            return self._sort_rows(_load_source_rows(state.get("sources", [])))
+
+    def fetch_verification_is_current(self) -> bool:
+        """Has this repository been scored by the verifier we ship today?"""
+        if not self.is_attached:
+            return True
+        with self._writer_lock():
+            meta = self._load_meta_locked()
+        return str(meta.get("fetch_verification_version") or "") == FETCH_VERIFICATION_VERSION
 
     def refresh_source_citation_readiness(self, source_id: str) -> dict[str, Any]:
         if not self.is_attached:
@@ -6669,6 +7055,14 @@ class AttachedRepositoryService:
             ]
             return queued, ""
 
+        if scope == "blocked":
+            blocked = [
+                row
+                for row in ordered_rows
+                if (row.fetch_status or "").strip().lower() == "blocked"
+            ]
+            return blocked, ""
+
         normalized_import_id = str(import_id or "").strip()
         if scope == "latest_import":
             latest = sorted(
@@ -6686,7 +7080,10 @@ class AttachedRepositoryService:
             scope = "import"
 
         if scope != "import":
-            raise ValueError("Invalid scope. Use `all`, `queued`, `import`, `latest_import`, or `empty_only`.")
+            raise ValueError(
+                "Invalid scope. Use `all`, `queued`, `blocked`, `import`, `latest_import`, "
+                "or `empty_only`."
+            )
         if not normalized_import_id:
             raise ValueError("`import_id` is required when scope is `import`.")
 
@@ -6967,7 +7364,7 @@ class AttachedRepositoryService:
 
             for dl_row in downloaded_rows:
                 # Skip rows that were not actually fetched
-                if (dl_row.fetch_status or "").strip() in {"", "queued", "failed"}:
+                if (dl_row.fetch_status or "").strip() in {"", "queued", "failed", "blocked"}:
                     skipped += 1
                     continue
 
@@ -10395,6 +10792,7 @@ def _row_priority(row: SourceManifestRow) -> tuple[int, int, int, int, int, int,
         "queued": 1,
         "": 1,
         "failed": 0,
+        "blocked": 0,
     }.get((row.fetch_status or "").strip().lower(), 0)
     return (
         status_rank,
@@ -10779,6 +11177,7 @@ def _duplicate_quality_score(row: SourceManifestRow, manifest: dict[str, Any]) -
         "queued": 10,
         "pending": 8,
         "failed": 0,
+        "blocked": 0,
     }.get(fetch_status, 4)
     score += 8 if row.llm_cleanup_file else 0
     score += 6 if row.markdown_file else 0
@@ -11347,6 +11746,9 @@ def _agent_fetch_status(row: SourceManifestRow) -> str:
     status = str(row.fetch_status or "").strip().lower()
     if status in {"success", "completed"}:
         return "completed"
+    # The agent vocabulary has no `blocked`; report it as the failure it is.
+    if status == "blocked":
+        return "failed"
     if status in {"partial", "failed", "queued"}:
         return status
     return "pending"

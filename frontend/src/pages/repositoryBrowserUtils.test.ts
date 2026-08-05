@@ -24,6 +24,8 @@ import {
   REPOSITORY_BROWSER_FILE_COLUMNS,
   REPOSITORY_BROWSER_PROVENANCE_COLUMNS,
   resolveRelatedSources,
+  labelFetchVerification,
+  statusTone,
 } from "./repositoryBrowserUtils";
 import type { RepositoryManifestRow, RepositorySourceFileKind } from "../api/types";
 
@@ -410,6 +412,20 @@ describe("repositoryBrowserUtils", () => {
     expect(failedPayload.include_rendered_html).toBe(true);
     expect(failedPayload.include_rendered_pdf).toBe(false);
     expect(failedPayload.include_markdown).toBe(false);
+
+    const blockedPayload = buildRepositoryBrowserDownloadTaskPayload({
+      draft,
+      scope: "blocked",
+      selectedSourceIds: ["000001"],
+      defaultProjectProfileName: "default.yaml",
+      runCleanup: false,
+    });
+    // Blocked rows are narrowed server-side, not by rerun_failed_only, and must
+    // be re-fetched outright since their artifacts are the block page.
+    expect(blockedPayload.scope).toBe("blocked");
+    expect(blockedPayload.source_ids).toEqual([]);
+    expect(blockedPayload.rerun_failed_only).toBe(false);
+    expect(blockedPayload.force_redownload).toBe(true);
   });
 
   it("forces markdown extraction when download cleanup is enabled", () => {
@@ -595,5 +611,40 @@ describe("provenance helpers", () => {
     expect(formatRelatedSourceLabel({ id: "000404", title: "", exists: false })).toBe(
       "000404 (deleted)",
     );
+  });
+});
+
+describe("statusTone", () => {
+  it("renders blocked statuses as errors", () => {
+    // "blocked" contains neither "fail" nor "error", so it needs naming
+    // explicitly or the badge falls through to neutral grey.
+    expect(statusTone("blocked")).toBe("error");
+    expect(statusTone("blocked_challenge")).toBe("error");
+    expect(statusTone("blocked_http")).toBe("error");
+    expect(statusTone("login_required")).toBe("error");
+    expect(statusTone("paywall")).toBe("error");
+    expect(statusTone("empty")).toBe("error");
+  });
+
+  it("keeps existing tones intact", () => {
+    expect(statusTone("success")).toBe("success");
+    expect(statusTone("ok")).toBe("success");
+    expect(statusTone("queued")).toBe("active");
+    expect(statusTone("partial")).toBe("warning");
+    expect(statusTone("thin_content")).toBe("warning");
+    expect(statusTone("failed")).toBe("error");
+    expect(statusTone("")).toBe("neutral");
+  });
+});
+
+describe("labelFetchVerification", () => {
+  it("gives each verification reason a readable label", () => {
+    expect(labelFetchVerification("blocked_challenge")).toBe("Bot wall / CAPTCHA");
+    expect(labelFetchVerification("login_required")).toBe("Sign-in required");
+    expect(labelFetchVerification("thin_content")).toBe("Almost no content");
+  });
+
+  it("passes through anything it does not recognise", () => {
+    expect(labelFetchVerification("something_new")).toBe("something_new");
   });
 });
