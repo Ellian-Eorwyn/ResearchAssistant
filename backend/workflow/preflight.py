@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
 
 from .models import Check, Preflight, na, nas
@@ -52,6 +53,26 @@ def _capabilities(*, refresh: bool = False) -> dict[str, Any]:
     }
     _capability_cache = (now, result)
     return result
+
+
+def _stale_agent_cli(repo_path: Any) -> str:
+    """Name of the installed `ra` if it differs from the shipped one, else ""."""
+    from backend.storage.agent_skills import AGENTS_DIR_NAME, BIN_DIR_NAME, bundled_agent_cli_dir
+
+    source_dir = bundled_agent_cli_dir()
+    if not source_dir.is_dir():
+        return ""
+    target_dir = Path(repo_path) / AGENTS_DIR_NAME / BIN_DIR_NAME
+    for source in sorted(source_dir.iterdir()):
+        if not source.is_file() or source.name.startswith("."):
+            continue
+        target = target_dir / source.name
+        try:
+            if target.read_bytes() != source.read_bytes():
+                return f".agents/{BIN_DIR_NAME}/{source.name}"
+        except OSError:
+            return f".agents/{BIN_DIR_NAME}/{source.name}"
+    return ""
 
 
 def run_preflight(
@@ -182,6 +203,32 @@ def run_preflight(
                     + (", ".join(models[:8]) or "(the backend listed none)")
                 ),
             )
+
+    # --- the tool the agent is holding ------------------------------------
+    #
+    # Provenance deliberately leaves an edited copy alone, but it reports that
+    # only at sync time -- so a copy that diverged once stays stale for good and
+    # nothing ever says so. The contract version does not catch it either: a
+    # stale `ra` speaking the same contract just quietly lacks commands and
+    # remedies added since.
+    if attached:
+        stale_cli = _stale_agent_cli(service.path)
+        add(
+            "agent_cli_current",
+            not stale_cli,
+            "warning",
+            (
+                f"{stale_cli} differs from the version this app ships."
+                if stale_cli
+                else "The bundled `ra` matches the one this app ships."
+            ),
+            (
+                "It was edited, so it is left alone. Delete it and re-attach the "
+                "repository to get the current one."
+                if stale_cli
+                else ""
+            ),
+        )
 
     # --- runtime ----------------------------------------------------------
     caps = _capabilities(refresh=refresh_capabilities)
