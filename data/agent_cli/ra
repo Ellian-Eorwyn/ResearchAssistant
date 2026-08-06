@@ -1,0 +1,764 @@
+#!/usr/bin/env python3
+"""ra -- drive a ResearchAssistant repository from the shell.
+
+Every command prints a short human summary, then `--- json ---`, then the same
+answer as compact JSON. Both go to stdout because an agent harness captures
+merged output.
+
+Two properties matter more than anything else here:
+
+* **Every command is safe to re-run.** Nothing is stored about where you are in
+  a workflow, so `ra where` is always the truth and repeating a step is a no-op
+  rather than a mistake.
+* **Every response carries `next`.** A caller that remembers nothing about the
+  previous step reads `next[0]` and is correct. Each entry says whether it may
+  be run straight away (`gate: "go"`) or needs the user's answer first
+  (`gate: "ask_user"`), so the checkpoint travels with the command rather than
+  depending on the caller remembering a rule from a skill document.
+
+Exit codes: 0 ok, 1 blockers or failures, 2 usage error, 3 contract mismatch,
+4 server unreachable.
+
+Standard library only, so this runs anywhere the repository does.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+# The client-side half of the gate, for entries a server built before this
+# contract, or this file built itself. Mirrors `gate_for` in
+# backend/workflow/models.py -- the server's answer wins when it sends one.
+GATED = re.compile(
+    r"--confirm-overwrite\b|--apply\b|\bra (fetch|retry|convert|run-column|set-constraints)\b"
+)
+
+# Bumped whenever a response shape this file reads changes. The server declares
+# its own; a mismatch means one side is stale, and saying so beats misbehaving.
+CLI_CONTRACT_VERSION = 2
+
+# Declared so a test can assert these fields still exist on the server models.
+# This is the check that would have caught a skill telling agents to report
+# column counters that were never in the response.
+RESPONSE_FIELDS: dict[str, tuple[str, ...]] = {
+    "Preflight": ("ok", "ok_to_fetch", "ok_to_run_columns", "checks", "summary", "next"),
+    "Orientation": (
+        "total_sources",
+        "sources_by_fetch_status",
+        "failures_by_code",
+        "columns",
+        "active_job",
+        "summary",
+        "next_actions",
+    ),
+    "TriageReport": ("phase", "total_failed", "groups", "summary", "next"),
+    "SheetPlan": ("sources", "columns", "skipped_columns", "anomalies", "layout", "summary"),
+    "RunOutcome": (
+        "run_id",
+        "state",
+        "terminal",
+        "counts",
+        "succeeded_rows",
+        "failed_rows",
+        "row_errors_truncated",
+        "coerced_rows",
+        "coercions",
+        "confirmation_required",
+        "summary",
+        "next",
+    ),
+    # Every `next` entry has this shape. Declared so the contract test fails if
+    # the gate is ever dropped from the response.
+    "NextAction": ("command", "gate", "why"),
+}
+
+EXIT_OK, EXIT_PROBLEM, EXIT_USAGE, EXIT_CONTRACT, EXIT_UNREACHABLE = 0, 1, 2, 3, 4
+
+
+# ---------------------------------------------------------------------------
+# discovery
+# ---------------------------------------------------------------------------
+
+
+def find_repo_root(start: Path | None = None) -> Path | None:
+    current = (start or Path.cwd()).resolve()
+    for candidate in [current, *current.parents]:
+        if (candidate / ".ra_repo").is_dir():
+            return candidate
+    return None
+
+
+def base_url() -> str:
+    explicit = os.environ.get("RA_BASE_URL", "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    return f"http://127.0.0.1:{os.environ.get('RA_PORT', '7995').strip() or '7995'}"
+
+
+def write_token(repo_root: Path | None) -> tuple[str, str]:
+    """Return `(token, where_it_came_from)`. The token itself is never printed."""
+    for name in ("RA_AGENT_WRITE_TOKEN", "RESEARCHASSISTANT_AGENT_WRITE_TOKEN"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value, f"env {name}"
+    if repo_root:
+        path = repo_root / ".ra_repo" / "agent_tokens.json"
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))["write_token"], ".ra_repo"
+        except Exception:
+            pass
+    return "", "not found"
+
+
+# ---------------------------------------------------------------------------
+# transport
+# ---------------------------------------------------------------------------
+
+
+class Problem(Exception):
+    def __init__(self, message: str, *, code: str = "error", remedy: str = "", exit_code: int = EXIT_PROBLEM):
+        super().__init__(message)
+        self.code = code
+        self.remedy = remedy
+        self.exit_code = exit_code
+
+
+def request(method: str, path: str, *, token: str, payload=None, params=None, timeout=300):
+    url = base_url() + path
+    if params:
+        url += "?" + urllib.parse.urlencode({k: v for k, v in params.items() if v not in (None, "")})
+    body = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=body, method=method)
+    req.add_header("Content-Type", "application/json")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return json.loads(response.read() or b"{}"), response.status
+    except urllib.error.HTTPError as exc:
+        try:
+            return json.loads(exc.read() or b"{}"), exc.code
+        except Exception:
+            raise Problem(f"HTTP {exc.code} from {path}", code="http_error") from exc
+    except urllib.error.URLError as exc:
+        raise Problem(
+            f"Could not reach the app at {base_url()}: {exc.reason}",
+            code="server_unreachable",
+            remedy="Start it with: .venv/bin/python run.py",
+            exit_code=EXIT_UNREACHABLE,
+        ) from exc
+
+
+def check_contract(token: str) -> None:
+    body, _ = request("GET", "/api/workflow/v1/version", token=token, timeout=15)
+    server = int((body.get("data") or {}).get("contract_version") or 0)
+    if server != CLI_CONTRACT_VERSION:
+        raise Problem(
+            f"This repository's ra speaks contract {CLI_CONTRACT_VERSION}; "
+            f"the server speaks {server}.",
+            code="contract_mismatch",
+            remedy="Restart the ResearchAssistant server, then re-attach this repository.",
+            exit_code=EXIT_CONTRACT,
+        )
+
+
+def data_of(body: dict, *, allow_error: bool = False) -> dict:
+    if body.get("status") == "error" and not allow_error:
+        error = body.get("error") or {}
+        raise Problem(error.get("message") or "The request failed.", code=error.get("code") or "error")
+    return body.get("data") or {}
+
+
+# ---------------------------------------------------------------------------
+# output
+# ---------------------------------------------------------------------------
+
+
+def next_actions(raw) -> list[dict]:
+    """Normalise `next` into gated entries.
+
+    A bare string is treated as needing the user's answer whenever it looks like
+    it starts work. Being wrong in that direction only costs a question; being
+    wrong the other way starts a fetch or several hundred model calls nobody
+    agreed to.
+    """
+    entries: list[dict] = []
+    for item in raw or []:
+        if isinstance(item, dict):
+            command = str(item.get("command") or "")
+            gate = str(item.get("gate") or "")
+            why = str(item.get("why") or "")
+        else:
+            command, gate, why = str(item), "", ""
+        if not command:
+            continue
+        if gate not in ("go", "ask_user"):
+            gate = "ask_user" if GATED.search(command) else "go"
+        entries.append({"command": command, "gate": gate, "why": why})
+    return entries
+
+
+def emit(command: str, *, ok: bool, summary: str, nxt=None, data=None, problems=None, json_only=False) -> None:
+    envelope = {
+        "ok": ok,
+        "command": command,
+        "summary": summary,
+        "next": next_actions(nxt),
+        "data": data if data is not None else {},
+        "problems": list(problems or []),
+    }
+    if not json_only:
+        print(summary)
+        for item in envelope["problems"]:
+            print(f"  ! {item.get('code', '')}: {item.get('message', '')}")
+            if item.get("remedy"):
+                print(f"    -> {item['remedy']}")
+        if envelope["next"]:
+            print("\nNext:")
+            for item in envelope["next"]:
+                if item["gate"] == "ask_user":
+                    print("  ASK THE USER FIRST — do not run this until they answer:")
+                    print(f"      {item['command']}")
+                    if item["why"]:
+                        print(f"      ({item['why']})")
+                else:
+                    print(f"  {item['command']}")
+        print("--- json ---")
+    print(json.dumps(envelope, ensure_ascii=False))
+
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+
+
+def cmd_version(args, token):
+    body, _ = request("GET", "/api/workflow/v1/version", token=token, timeout=15)
+    data = data_of(body)
+    return True, f"ra contract {CLI_CONTRACT_VERSION}, server contract {data.get('contract_version')}.", ["ra doctor"], data, []
+
+
+def cmd_doctor(args, token):
+    check_contract(token)
+    body, _ = request(
+        "GET", "/api/workflow/v1/preflight", token=token,
+        params={"refresh_capabilities": "true" if args.refresh_capabilities else None},
+    )
+    data = data_of(body, allow_error=True)
+    problems = [
+        {"code": c["id"], "message": c["detail"], "remedy": c.get("remedy", "")}
+        for c in data.get("checks", [])
+        if not c.get("ok") and c.get("severity") != "info"
+    ]
+    lines = [data.get("summary", "")]
+    lines.append(f"  fetch: {'ready' if data.get('ok_to_fetch') else 'BLOCKED'}")
+    lines.append(f"  columns: {'ready' if data.get('ok_to_run_columns') else 'BLOCKED'}")
+    return bool(data.get("ok_to_fetch")), "\n".join(lines), data.get("next"), data, problems
+
+
+def cmd_where(args, token):
+    check_contract(token)
+    body, _ = request("GET", "/api/workflow/v1/orientation", token=token)
+    data = data_of(body)
+    lines = [data.get("summary", "")]
+    for column in data.get("columns", [])[:20]:
+        if column.get("has_prompt"):
+            lines.append(
+                f"  {column['id']}  {column['label'][:44]:46} {column.get('filled_rows', 0)} filled"
+            )
+    return True, "\n".join(lines), data.get("next_actions"), data, []
+
+
+def cmd_plan_sheet(args, token):
+    check_contract(token)
+    path = Path(args.path).expanduser()
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    body, _ = request(
+        "POST", "/api/workflow/v1/sheet/parse", token=token,
+        payload={
+            "path": str(path),
+            "header_row": args.header_row,
+            "prompts_row": args.prompts_row,
+            "no_prompts_row": args.no_prompts_row,
+            "repair_encoding": args.repair_encoding,
+        },
+    )
+    data = data_of(body)
+
+    repo_root = find_repo_root()
+    if repo_root:
+        out = repo_root / ".ra_repo" / "workflow"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "sheet_plan.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    problems = [
+        {"code": a["code"], "message": a["message"], "remedy": ""}
+        for a in data.get("anomalies", [])
+    ]
+    blocking = {
+        "no_header_row_found", "no_url_column_found", "no_sources_found", "mojibake_unrepairable",
+    }
+    ok = not any(a["code"] in blocking for a in data.get("anomalies", []))
+    nxt = ["ra create-sources", "ra create-columns"] if ok else ["Fix the sheet, then run ra plan-sheet again"]
+    return ok, data.get("summary", ""), nxt, data, problems
+
+
+def _stored_plan():
+    repo_root = find_repo_root()
+    if not repo_root:
+        raise Problem("Not inside a repository.", code="no_repository", exit_code=EXIT_USAGE)
+    path = repo_root / ".ra_repo" / "workflow" / "sheet_plan.json"
+    if not path.is_file():
+        raise Problem(
+            "No parsed spreadsheet found.",
+            code="no_sheet_plan",
+            remedy="ra plan-sheet <spreadsheet>",
+            exit_code=EXIT_USAGE,
+        )
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+MAX_SHOWN_CHANGES = 12
+
+
+def _operation(command, operation, params, apply, token):
+    body, _ = request(
+        "POST", f"/api/workflow/v1/operations/{operation}", token=token,
+        payload={"params": params, "apply": apply},
+    )
+    data = data_of(body, allow_error=True)
+    plan = data.get("plan") or {}
+    problems = [
+        {"code": b["code"], "message": b["message"], "remedy": ""} for b in plan.get("blockers", [])
+    ]
+    ok = not problems
+
+    # A dry run whose consequences are only in the JSON is not a review. The
+    # `detail` line is where an operation says what it worked out -- the values
+    # it read out of a prompt, for instance -- and the user has to see it before
+    # agreeing to `--apply`.
+    lines = [data.get("summary", "")]
+    changes = plan.get("changes") or []
+    if changes and not apply:
+        for change in changes[:MAX_SHOWN_CHANGES]:
+            detail = change.get("detail") or change.get("after") or ""
+            lines.append(f"  {change.get('subject', '')}  {detail}")
+        if len(changes) > MAX_SHOWN_CHANGES:
+            lines.append(f"  ... and {len(changes) - MAX_SHOWN_CHANGES} more")
+    for warning in (plan.get("warnings") or [])[:MAX_SHOWN_CHANGES]:
+        lines.append(f"  - {warning.get('code', '')}: {warning.get('message', '')}")
+
+    nxt = data.get("next") or []
+    if ok and not apply:
+        nxt = [{
+            "command": f"ra {command} --apply",
+            "gate": "ask_user",
+            "why": f"Show the user these {len(changes)} change(s) and get their agreement first.",
+        }]
+    return ok, "\n".join(line for line in lines if line), nxt, data, problems
+
+
+def cmd_create_sources(args, token):
+    check_contract(token)
+    params = _stored_plan()["create_sources_params"]
+    return _operation("create-sources", "create_sources", params, args.apply, token)
+
+
+def cmd_create_columns(args, token):
+    check_contract(token)
+    params = _stored_plan()["create_columns_params"]
+    return _operation("create-columns", "create_columns", params, args.apply, token)
+
+
+def cmd_set_constraints(args, token):
+    check_contract(token)
+    ids = [i.strip() for i in (args.ids or "").split(",") if i.strip()]
+    params = {"column_ids": ids, "overwrite_existing": args.overwrite}
+    return _operation("set-constraints", "set_column_constraints", params, args.apply, token)
+
+
+def cmd_columns(args, token):
+    check_contract(token)
+    body, _ = request("GET", "/api/workflow/v1/orientation", token=token)
+    data = data_of(body)
+    columns = data.get("columns", [])
+    lines = [f"{len(columns)} column(s):"]
+    for column in columns:
+        if not column.get("has_prompt"):
+            continue
+        lines.append(
+            f"  {column['id']}  {column['label'][:44]:46} "
+            f"{column.get('filled_rows', 0)} filled / {column.get('empty_rows', 0)} empty"
+        )
+    # Same preference as `ra where`: a column whose prompt lists exact answers
+    # shows a misread prompt after one run instead of after all of them.
+    prompted = [c for c in columns if c.get("has_prompt") and not c.get("filled_rows")]
+    first = next((c for c in prompted if c.get("allowed_values")), prompted[0] if prompted else None)
+    nxt = [f"ra run-column {first['id']} --wait"] if first else ["ra create-columns"]
+    return True, "\n".join(lines), nxt, {"columns": columns}, []
+
+
+def cmd_fetch(args, token):
+    check_contract(token)
+    ids = [i.strip() for i in (args.ids or "").split(",") if i.strip()]
+    body, _ = request(
+        "POST", "/api/workflow/v1/runs/source-phases", token=token,
+        payload={
+            "phases": args.phases.split(","),
+            "scope": args.scope,
+            "source_ids": ids,
+            "force": args.force,
+            "limit": args.limit,
+            "wait_seconds": 120 if args.wait else 0,
+        },
+    )
+    data = data_of(body)
+    ok = not data.get("counts", {}).get("failed")
+    return ok, data.get("summary", ""), data.get("next"), data, []
+
+
+def cmd_convert(args, token):
+    args.phases, args.scope, args.limit = "convert", "all", None
+    return cmd_fetch(args, token)
+
+
+def cmd_triage(args, token):
+    check_contract(token)
+    body, _ = request("GET", "/api/workflow/v1/triage", token=token, params={"phase": args.phase})
+    data = data_of(body)
+    lines = [data.get("summary", "")]
+    for group in data.get("groups", []):
+        label = group["error_code"] + (f" / {group['detail_pattern']}" if group.get("detail_pattern") else "")
+        lines.append(f"\n[{label}]  x{group['count']}  ({group['classification']})")
+        lines.append(f"  {group['explanation']}")
+        for example in group.get("examples", [])[:3]:
+            lines.append(f"    {example['id']}  {example['url'][:66]}")
+        if group.get("remedy_command"):
+            lines.append(f"  -> {group['remedy_command']}")
+    return not data.get("total_failed"), "\n".join(lines), data.get("next"), data, []
+
+
+def cmd_retry(args, token):
+    check_contract(token)
+    body, _ = request("GET", "/api/workflow/v1/triage", token=token, params={"phase": "fetch"})
+    triage = data_of(body)
+    ids = [
+        source_id
+        for group in triage.get("groups", [])
+        if group.get("classification", "").startswith("retryable")
+        for source_id in group.get("source_ids", [])
+    ]
+    if not ids:
+        return True, "Nothing worth retrying.", ["ra triage"], {"source_ids": []}, []
+
+    args.ids, args.phases, args.scope = ",".join(ids), "fetch,convert", "all"
+    args.force, args.limit = False, None
+    return cmd_fetch(args, token)
+
+
+def _attach_remedies(blockers):
+    """Turn attach blockers into commands that can actually be run.
+
+    `--role` and `--overwrite` apply to every path in one invocation, so a batch
+    of mixed file types cannot succeed in a single call no matter what flags it
+    gets. Left to itself the caller sees five blockers, no remedy, and "fix the
+    blockers" -- the dead end this tool exists to remove. So group the offending
+    files by what they need and hand back one command per group.
+    """
+    # A page saved as HTML is the document; a print-to-PDF of that same page is
+    # the rendered copy. This mirrors what the attach skill documents.
+    role_for = {".pdf": "rendered_pdf_file", ".html": "raw_file", ".htm": "raw_file"}
+    groups: dict[tuple[str, bool], list[str]] = {}
+    for blocker in blockers:
+        subject = str(blocker.get("subject") or "")
+        if not subject:
+            continue
+        suffix = Path(subject).suffix.lower()
+        role = role_for.get(suffix)
+        if not role:
+            continue
+        overwrite = blocker.get("code") == "slot_occupied"
+        groups.setdefault((role, overwrite), []).append(subject)
+
+    remedies = []
+    for (role, overwrite), paths in sorted(groups.items()):
+        quoted = " ".join(shlex.quote(p) for p in sorted(set(paths)))
+        remedies.append(
+            f"ra attach {quoted} --role {role}"
+            + (" --overwrite" if overwrite else "")
+            + " --apply"
+        )
+    return remedies
+
+
+def cmd_attach(args, token):
+    check_contract(token)
+    hints = []
+    for path in args.paths:
+        hint = {"path": str(Path(path).expanduser().resolve())}
+        if args.role:
+            hint["role"] = args.role
+        if args.source_id:
+            hint["source_id"] = args.source_id
+        if args.overwrite:
+            hint["overwrite"] = True
+        hints.append(hint)
+    body, _ = request(
+        "POST", "/api/workflow/v1/attach", token=token,
+        payload={
+            "paths": [h["path"] for h in hints],
+            "hints": hints,
+            "scan_inbox": not args.paths,
+            "apply": args.apply,
+            "reconvert": not args.no_convert,
+            "wait_seconds": 120,
+        },
+    )
+    data = data_of(body, allow_error=True)
+    blockers = (data.get("plan") or {}).get("blockers", [])
+    remedies = _attach_remedies(blockers)
+    problems = [
+        {
+            "code": b["code"],
+            "message": b["message"],
+            # The same command answers every blocker in its group, so point each
+            # one at it rather than leaving the remedy blank.
+            "remedy": next(
+                (r for r in remedies if shlex.quote(str(b.get("subject") or "")) in r), ""
+            ),
+        }
+        for b in blockers
+    ]
+    ok = not blockers
+    if remedies:
+        nxt = remedies
+    elif ok and not args.apply:
+        nxt = data.get("next") or ["ra attach --apply"]
+    else:
+        nxt = data.get("next") or []
+    return ok, data.get("summary", ""), nxt, data, problems
+
+
+def cmd_run_column(args, token):
+    check_contract(token)
+    body, _ = request(
+        "POST", "/api/workflow/v1/runs/columns", token=token,
+        payload={
+            "column_id": args.column,
+            "scope": args.scope,
+            "source_ids": [i.strip() for i in (args.ids or "").split(",") if i.strip()],
+            "confirm_overwrite": args.confirm_overwrite,
+            "wait_seconds": 120 if args.wait else 0,
+        },
+    )
+    data = data_of(body)
+    if data.get("confirmation_required"):
+        entries = next_actions(data.get("next"))
+        return False, data.get("summary", ""), data.get("next"), data, [
+            {"code": "confirmation_required", "message": data.get("summary", ""),
+             "remedy": entries[0]["command"] if entries else ""}
+        ]
+
+    lines = [data.get("summary", "")]
+    # The rejected answers themselves, because the count alone does not say
+    # whether the prompt is being misread or the model is merely near-missing
+    # the spelling.
+    for item in data.get("coercions", [])[:MAX_SHOWN_CHANGES]:
+        lines.append(
+            f"  {item.get('source_id', '')}  returned {item.get('returned', '')!r}"
+            f" -> stored {item.get('stored', '')!r}"
+        )
+    return not data.get("failed_rows"), "\n".join(lines), data.get("next"), data, []
+
+
+def cmd_remap(args, token):
+    check_contract(token)
+    pairs = []
+    for item in args.pairs:
+        if "=" not in item:
+            raise Problem(
+                f"Expected URL=NEW_ID or id:000012=NEW_ID, got {item!r}.",
+                code="bad_pair",
+                remedy="ra remap https://example.com/a=5 https://example.com/b=3 --apply",
+                exit_code=EXIT_USAGE,
+            )
+        target, new_id = item.rsplit("=", 1)
+        key = "source_id" if target.startswith("id:") else "url"
+        pairs.append({key: target[3:] if key == "source_id" else target, "new_id": new_id.strip()})
+    return _operation("remap", "remap_source_ids", {"pairs": pairs}, args.apply, token)
+
+
+def cmd_watch(args, token):
+    check_contract(token)
+    body, _ = request(
+        "GET", f"/api/workflow/v1/runs/{args.run_id}", token=token,
+        params={"wait_seconds": 120 if args.wait else 0},
+    )
+    data = data_of(body)
+    return True, data.get("summary", ""), data.get("next"), data, []
+
+
+# ---------------------------------------------------------------------------
+# entry point
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    # Global flags go on a shared parent so they are accepted both before and
+    # after the subcommand. `ra doctor --json-only` failing on argument order
+    # is exactly the kind of trap this tool exists to remove.
+    common = argparse.ArgumentParser(add_help=False)
+    # SUPPRESS matters: without it the subparser's default would overwrite a
+    # value the top-level parser already saw, so the flag would only work in
+    # one of the two positions.
+    common.add_argument(
+        "--json-only",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Print only the JSON envelope.",
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="ra",
+        description="Drive a ResearchAssistant repository.",
+        parents=[common],
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    class sub:  # noqa: N801 - a tiny shim so every subcommand inherits the flags
+        @staticmethod
+        def add_parser(name, **kwargs):
+            return subparsers.add_parser(name, parents=[common], **kwargs)
+
+    p = sub.add_parser("version", help="Show the CLI and server contract versions.")
+    p.set_defaults(func=cmd_version)
+
+    p = sub.add_parser("doctor", help="Check everything is ready before a long job.")
+    p.add_argument("--refresh-capabilities", action="store_true")
+    p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("where", help="Where am I, and what should I do next?")
+    p.set_defaults(func=cmd_where)
+
+    p = sub.add_parser("plan-sheet", help="Read a planning spreadsheet.")
+    p.add_argument("path")
+    p.add_argument("--header-row", type=int, default=None, help="0-based, if detection is wrong.")
+    p.add_argument("--prompts-row", type=int, default=None)
+    p.add_argument("--no-prompts-row", action="store_true")
+    p.add_argument("--repair-encoding", choices=["auto", "never", "force"], default="auto")
+    p.set_defaults(func=cmd_plan_sheet)
+
+    p = sub.add_parser("create-sources", help="Create sources from the parsed sheet.")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_create_sources)
+
+    p = sub.add_parser("create-columns", help="Create columns from the parsed sheet.")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_create_columns)
+
+    p = sub.add_parser("columns", help="List columns and how full they are.")
+    p.set_defaults(func=cmd_columns)
+
+    p = sub.add_parser(
+        "set-constraints",
+        help="Restrict columns to the answers their own prompts list.",
+    )
+    p.add_argument("--ids", default="", help="Comma-separated column ids; default is all.")
+    p.add_argument("--overwrite", action="store_true", help="Replace constraints already set.")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_set_constraints)
+
+    p = sub.add_parser("fetch", help="Download sources.")
+    p.add_argument("--scope", default="queued",
+                   choices=["queued", "all", "import", "latest_import", "empty_only"])
+    p.add_argument("--ids", default="", help="Comma-separated ids; overrides --scope.")
+    p.add_argument("--phases", default="fetch,convert")
+    p.add_argument("--force", action="store_true", help="Re-fetch sources that already succeeded.")
+    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--wait", action="store_true")
+    p.set_defaults(func=cmd_fetch)
+
+    p = sub.add_parser("convert", help="Rebuild text from already-fetched files.")
+    p.add_argument("--ids", default="")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--wait", action="store_true")
+    p.set_defaults(func=cmd_convert)
+
+    p = sub.add_parser("triage", help="Group failures and say what to do about each.")
+    p.add_argument("--phase", default="fetch")
+    p.set_defaults(func=cmd_triage)
+
+    p = sub.add_parser("retry", help="Re-run every failure worth retrying.")
+    p.add_argument("--wait", action="store_true")
+    p.set_defaults(func=cmd_retry)
+
+    p = sub.add_parser("attach", help="Attach hand-downloaded documents, then rebuild their text.")
+    p.add_argument("paths", nargs="*")
+    p.add_argument("--role", default="", help="Artifact slot, for ambiguous file types.")
+    p.add_argument("--source-id", default="")
+    p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--apply", action="store_true")
+    p.add_argument("--no-convert", action="store_true")
+    p.set_defaults(func=cmd_attach)
+
+    p = sub.add_parser("run-column", help="Run one column's prompt over the sources.")
+    p.add_argument("column")
+    p.add_argument("--scope", default="empty_only",
+                   choices=["empty_only", "all", "filtered", "selected"])
+    p.add_argument("--ids", default="", help="Comma-separated source ids, with --scope selected.")
+    p.add_argument("--confirm-overwrite", action="store_true")
+    p.add_argument("--wait", action="store_true")
+    p.set_defaults(func=cmd_run_column)
+
+    p = sub.add_parser("remap", help="Renumber sources: ra remap URL=NEW_ID [...] --apply")
+    p.add_argument("pairs", nargs="+", metavar="URL=NEW_ID",
+                   help="Use id:000012=5 for a source with no URL.")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_remap)
+
+    p = sub.add_parser("watch", help="Report on a running job.")
+    p.add_argument("run_id")
+    p.add_argument("--wait", action="store_true")
+    p.set_defaults(func=cmd_watch)
+
+    return parser
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    token, _ = write_token(find_repo_root())
+    try:
+        ok, summary, nxt, data, problems = args.func(args, token)
+    except Problem as problem:
+        emit(
+            args.command, ok=False, summary=str(problem),
+            nxt=[problem.remedy] if problem.remedy else [],
+            problems=[{"code": problem.code, "message": str(problem), "remedy": problem.remedy}],
+            json_only=getattr(args, 'json_only', False),
+        )
+        return problem.exit_code
+    except Exception as exc:  # pragma: no cover - last resort
+        emit(
+            args.command, ok=False, summary=f"{type(exc).__name__}: {exc}",
+            problems=[{"code": "unexpected_error", "message": str(exc), "remedy": ""}],
+            json_only=getattr(args, 'json_only', False),
+        )
+        return EXIT_PROBLEM
+
+    emit(args.command, ok=ok, summary=summary, nxt=nxt, data=data, problems=problems,
+         json_only=getattr(args, 'json_only', False))
+    return EXIT_OK if ok else EXIT_PROBLEM
+
+
+if __name__ == "__main__":
+    sys.exit(main())

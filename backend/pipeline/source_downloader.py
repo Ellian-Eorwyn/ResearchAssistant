@@ -106,6 +106,7 @@ NOTE_RUNTIME_MISSING_TEXTUTIL = "runtime_missing_textutil"
 NOTE_RUNTIME_MISSING_TESSERACT = "runtime_missing_tesseract"
 NOTE_RUNTIME_MISSING_LLM_VISION = "runtime_missing_llm_vision"
 NOTE_BLOCKED_REQUEST = "blocked_request"
+NOTE_BLOCKED_RECOVERED_BY_BROWSER = "blocked_recovered_via_browser"
 NOTE_EXTRACTION_FAILURE = "extraction_failure"
 NOTE_OCR_LOCAL_USED = "ocr_local_used"
 NOTE_OCR_LLM_FALLBACK_USED = "ocr_llm_fallback_used"
@@ -2076,6 +2077,12 @@ class SourceDownloadOrchestrator:
             self._handle_pdf_response(row, response, notes)
         elif row.detected_type == "html":
             self._handle_html_response(row, response, normalized_url, renderer, notes)
+        elif classify_http_status(response.status_code) == "blocked_request":
+            # A refusal page describes the block, not the source. Some sites
+            # answer 403 with a `text/plain` note, which detects as a document
+            # and would otherwise route past the one handler that can retry the
+            # URL in a browser.
+            self._handle_html_response(row, response, normalized_url, renderer, notes)
         elif row.detected_type == "document":
             self._handle_document_response(row, response, notes)
         else:
@@ -2084,8 +2091,13 @@ class SourceDownloadOrchestrator:
         fetch_error_code = _phase_error_code(row.error_message)
         fetch_status = "completed"
         fetch_error = ""
+        # The row's own status is authoritative. A page recovered in the browser
+        # keeps the 4xx from the original request, so judging the phase on the
+        # status code alone would record a failure for a fetch that worked --
+        # and anything reading phase metadata would then chase a non-problem.
+        row_obtained_content = str(row.fetch_status or "").strip() in {"success", "partial"}
         if (
-            (row.http_status or 0) >= 400
+            (not row_obtained_content and (row.http_status or 0) >= 400)
             or fetch_error_code in {
                 "invalid_url",
                 "timeout",
@@ -2395,6 +2407,53 @@ class SourceDownloadOrchestrator:
             final_url=row.final_url,
         )
 
+        # A plain HTTP client gets refused by two different-looking things: an
+        # interstitial challenge page served with 200, and a bare 401/403/429.
+        # Both are worth one attempt in the headless browser -- it is a real
+        # browser, and it is the same renderer this pipeline already falls back
+        # to when extracted text looks thin. A 404 is not escalated: the page
+        # genuinely is not there.
+        status_looks_blocked = classify_http_status(response.status_code) == "blocked_request"
+
+        recovered_via_browser = False
+        if blocked_by_challenge or status_looks_blocked:
+            self._cancel_event.wait(self.fetch_delay)
+            escalated_html, escalate_error = renderer.render(normalized_url)
+            escalated_title = extract_title(escalated_html) if escalated_html else ""
+            escalated_markdown = ""
+            if escalated_html and not detect_blocked_page(
+                html_text=escalated_html,
+                title=escalated_title,
+                final_url=row.final_url,
+            ):
+                escalated_markdown, _, _ = extract_markdown_with_fallback(
+                    escalated_html, self.runtime_capabilities
+                )
+
+            # "Not detected as a challenge" is not enough on its own -- a
+            # Cloudflare interstitial can slip past the pattern check. Require
+            # the page to actually yield readable text, using the same
+            # threshold the pipeline uses everywhere else.
+            if escalated_markdown and markdown_score(escalated_markdown) >= MIN_MARKDOWN_SCORE:
+                raw_html = escalated_html
+                blocked_by_challenge = False
+                recovered_via_browser = True
+                row.fetch_method = "playwright"
+                row.title = escalated_title or row.title
+                row.canonical_url = extract_canonical_url(raw_html) or row.canonical_url
+                row.sha256 = hashlib.sha256(raw_html.encode("utf-8")).hexdigest()
+                if self.output_options.include_raw_file:
+                    raw_rel = self._raw_file_rel(row, ".html")
+                    self._write_text(raw_rel, raw_html)
+                    row.raw_file = raw_rel.as_posix()
+                if self.output_options.include_rendered_html:
+                    rendered_rel = self._rendered_html_rel(row)
+                    self._write_text(rendered_rel, escalated_html)
+                    row.rendered_file = rendered_rel.as_posix()
+                notes.append(NOTE_BLOCKED_RECOVERED_BY_BROWSER)
+            elif escalate_error:
+                notes.append(normalize_render_error_note(escalate_error))
+
         raw_markdown = ""
         raw_used_fallback = False
         raw_score = 0
@@ -2412,7 +2471,9 @@ class SourceDownloadOrchestrator:
         rendered_score = 0
 
         should_render = False
-        if not blocked_by_challenge:
+        # A recovery already produced the rendered page and stored it, so the
+        # normal fallback render would just fetch the same thing a second time.
+        if not blocked_by_challenge and not recovered_via_browser:
             should_render = self.output_options.include_rendered_html or (
                 self.run_convert
                 and (response.status_code >= 400 or raw_score < MIN_MARKDOWN_SCORE)
@@ -2470,7 +2531,7 @@ class SourceDownloadOrchestrator:
             row.error_message = blocked_error_message(response.status_code)
             return
 
-        if response.status_code >= 400:
+        if response.status_code >= 400 and not recovered_via_browser:
             reason = classify_http_status(response.status_code)
             notes.append(reason)
             row.fetch_status = "failed"

@@ -644,6 +644,181 @@ async def get_agent_resource(resource_id: str, request: Request):
         )
 
 
+# ---------------------------------------------------------------------------
+# Repository operations
+#
+# `plan` is read-only and takes the read token. `apply` mutates and takes the
+# write token. Note the lock discipline: `apply_repo_operation` acquires the
+# writer lock internally, so idempotency and audit calls -- which take it too --
+# must happen here, after it returns, never inside the engine.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/agent/v1/operations")
+async def list_repo_operations(request: Request):
+    request_id = _request_id(request)
+    auth_error = _authorize(request, access="read", request_id=request_id)
+    if auth_error is not None:
+        return auth_error
+
+    service = request.app.state.repository_service
+    items = [item.model_dump(mode="json") for item in service.list_repo_operations()]
+    return _response_envelope(
+        request_id=request_id,
+        status="ok",
+        data={"items": items, "total": len(items)},
+        links={"self": str(request.url)},
+    )
+
+
+@router.post("/agent/v1/operations/{operation}/plan")
+async def plan_repo_operation(
+    operation: str,
+    request: Request,
+    payload: dict[str, Any] = Body(default_factory=dict),
+):
+    request_id = _request_id(request)
+    auth_error = _authorize(request, access="read", request_id=request_id)
+    if auth_error is not None:
+        return auth_error
+
+    service = request.app.state.repository_service
+    try:
+        plan = service.plan_repo_operation(operation, payload.get("params") or {})
+    except ValueError as exc:
+        return _operation_error(request_id, exc)
+
+    # Blockers are data, not a transport error: the caller asked what would
+    # happen, and "it would be refused, here is why" is a valid answer.
+    return _response_envelope(
+        request_id=request_id,
+        status="ok",
+        data=plan.model_dump(mode="json"),
+        links={"self": str(request.url)},
+    )
+
+
+@router.post("/agent/v1/operations/{operation}/apply")
+async def apply_repo_operation(
+    operation: str,
+    request: Request,
+    payload: dict[str, Any] = Body(default_factory=dict),
+):
+    request_id = _request_id(request)
+    auth_error = _authorize(request, access="write", request_id=request_id)
+    if auth_error is not None:
+        return auth_error
+
+    service = request.app.state.repository_service
+    params = payload.get("params") or {}
+    idempotency_key = str(payload.get("idempotency_key") or "").strip()
+    expected_fingerprint = str(payload.get("state_fingerprint") or "").strip()
+
+    try:
+        fingerprint = service.repo_operation_fingerprint(operation, params)
+        if idempotency_key:
+            existing_run_id = service.resolve_agent_idempotency(idempotency_key, fingerprint)
+            if existing_run_id:
+                stored = service.get_repo_operation_run(existing_run_id)
+                return _response_envelope(
+                    request_id=request_id,
+                    status="ok",
+                    data=stored.model_dump(mode="json"),
+                    links={"self": str(request.url)},
+                    http_status=_operation_http_status(stored.status),
+                )
+
+        run_id = uuid.uuid4().hex[:12]
+        result = service.apply_repo_operation(
+            operation,
+            params,
+            run_id=run_id,
+            expected_fingerprint=expected_fingerprint,
+        )
+        if idempotency_key:
+            service.remember_agent_idempotency(idempotency_key, fingerprint, result.run_id)
+        _append_mutation_audit(
+            request,
+            action=f"operation:{operation}",
+            run_id=result.run_id,
+            request_id=request_id,
+            payload={
+                "operation": operation,
+                "params": params,
+                "status": result.status,
+                "applied_changes": result.applied_changes,
+            },
+        )
+        return _response_envelope(
+            request_id=request_id,
+            status="ok" if result.status in {"applied", "noop"} else "error",
+            data=result.model_dump(mode="json"),
+            links={"self": str(request.url)},
+            http_status=_operation_http_status(result.status),
+        )
+    except ValueError as exc:
+        return _operation_error(request_id, exc)
+
+
+@router.get("/agent/v1/operations/runs/{run_id}")
+async def get_repo_operation_run(run_id: str, request: Request):
+    request_id = _request_id(request)
+    auth_error = _authorize(request, access="read", request_id=request_id)
+    if auth_error is not None:
+        return auth_error
+
+    service = request.app.state.repository_service
+    try:
+        result = service.get_repo_operation_run(run_id)
+    except ValueError as exc:
+        return _operation_error(request_id, exc)
+    return _response_envelope(
+        request_id=request_id,
+        status="ok",
+        data=result.model_dump(mode="json"),
+        links={"self": str(request.url)},
+    )
+
+
+def _operation_http_status(status: str) -> int:
+    # `blocked` and `rolled_back` both mean the change did not take effect.
+    return 200 if status in {"applied", "noop"} else 409
+
+
+def _operation_error(request_id: str, exc: Exception) -> JSONResponse:
+    message = str(exc)
+    lowered = message.lower()
+    if lowered.startswith("unknown operation"):
+        code, http_status = "unknown_operation", 404
+    elif lowered.startswith("unknown run_id"):
+        code, http_status = "unknown_run", 404
+    elif "idempotency key already exists" in lowered:
+        code, http_status = "idempotency_conflict", 409
+    else:
+        code = _sanitize_error_code(message, fallback="operation_failed")
+        http_status = 400
+    return _error_response(
+        request_id=request_id,
+        code=code,
+        message=message,
+        http_status=http_status,
+    )
+
+
+# Tools that change the repository. Anything listed here requires the write
+# token; everything else accepts the read token.
+MCP_WRITE_TOOLS = frozenset(
+    {
+        "run_source_phases",
+        "cancel_run",
+        "apply_operation",
+        "create_column",
+        "update_column_prompt",
+        "run_column",
+    }
+)
+
+
 def _mcp_tool_definitions() -> list[dict[str, Any]]:
     return [
         {
@@ -652,7 +827,11 @@ def _mcp_tool_definitions() -> list[dict[str, Any]]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "scope": {"type": "string"},
+                    "scope": {
+                        "type": "string",
+                        "enum": ["queued", "all", "import", "latest_import", "empty_only"],
+                        "description": "Which sources to run. `source_ids` overrides this.",
+                    },
                     "import_id": {"type": "string"},
                     "source_ids": {"type": "array", "items": {"type": "string"}},
                     "phases": {
@@ -718,6 +897,140 @@ def _mcp_tool_definitions() -> list[dict[str, Any]]:
                 "type": "object",
                 "properties": {"source_id": {"type": "string"}},
                 "required": ["source_id"],
+            },
+        },
+        *_mcp_operation_tool_definitions(),
+        *_mcp_column_tool_definitions(),
+    ]
+
+
+def _operation_names() -> list[str]:
+    from backend.storage.repo_operations import OPERATIONS
+
+    return OPERATIONS.names()
+
+
+def _mcp_operation_tool_definitions() -> list[dict[str, Any]]:
+    # One generic pair rather than a tool per operation: `tools/list` stays
+    # small, and adding an operation costs no router changes.
+    operation_enum = {"type": "string", "enum": _operation_names()}
+    return [
+        {
+            "name": "list_operations",
+            "description": (
+                "List the reviewable repository mutations available, with a JSON Schema "
+                "for each one's parameters."
+            ),
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "plan_operation",
+            "description": (
+                "Preview a repository mutation without changing anything. Returns the exact "
+                "change set plus any blockers and warnings. Always call this and show the "
+                "result to the user before applying."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"operation": operation_enum, "params": {"type": "object"}},
+                "required": ["operation", "params"],
+            },
+        },
+        {
+            "name": "apply_operation",
+            "description": (
+                "Execute a repository mutation transactionally: snapshot, write, verify, and "
+                "roll back on any new integrity violation. Pass the state_fingerprint from "
+                "the plan so a stale review is rejected."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "operation": operation_enum,
+                    "params": {"type": "object"},
+                    "state_fingerprint": {"type": "string"},
+                    "idempotency_key": {"type": "string"},
+                },
+                "required": ["operation", "params"],
+            },
+        },
+    ]
+
+
+def _mcp_column_tool_definitions() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": "list_columns",
+            "description": (
+                "List repository table columns, including which can be run with an LLM and "
+                "the instruction prompt each currently uses."
+            ),
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "create_column",
+            "description": (
+                "Create a new custom column on the repository table, optionally setting its "
+                "instruction prompt and output constraint in the same call."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string"},
+                    "instruction_prompt": {"type": "string"},
+                    "output_constraint": {"type": "object"},
+                    "include_row_context": {"type": "boolean"},
+                    "include_source_text": {"type": "boolean"},
+                },
+            },
+        },
+        {
+            "name": "update_column_prompt",
+            "description": (
+                "Set a column's instruction prompt, label, output constraint, or context "
+                "options."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "column_id": {"type": "string"},
+                    "label": {"type": "string"},
+                    "instruction_prompt": {"type": "string"},
+                    "output_constraint": {"type": "object"},
+                    "include_row_context": {"type": "boolean"},
+                    "include_source_text": {"type": "boolean"},
+                },
+                "required": ["column_id"],
+            },
+        },
+        {
+            "name": "run_column",
+            "description": (
+                "Run a column's prompt over repository sources. Returns a job_id, or "
+                "status 'confirmation_required' when the scope would overwrite existing "
+                "values -- ask the user, then retry with confirm_overwrite true."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "column_id": {"type": "string"},
+                    "scope": {
+                        "type": "string",
+                        "enum": ["filtered", "all", "empty_only", "selected"],
+                    },
+                    "source_ids": {"type": "array", "items": {"type": "string"}},
+                    "confirm_overwrite": {"type": "boolean"},
+                },
+                "required": ["column_id"],
+            },
+        },
+        {
+            "name": "get_column_run_status",
+            "description": "Read progress for a column run started with run_column.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"job_id": {"type": "string"}},
+                "required": ["job_id"],
             },
         },
     ]
@@ -874,9 +1187,91 @@ def _mcp_error(request_id: Any, code: int, message: str, data: Any = None) -> JS
     return JSONResponse({"jsonrpc": "2.0", "id": request_id, "error": error})
 
 
-def _mcp_from_rest_response(request_id: Any, response: JSONResponse) -> JSONResponse:
+def _column_patch(arguments: dict[str, Any]) -> dict[str, Any]:
+    """The subset of a tool call that `update_column` understands."""
+    return {
+        key: arguments[key]
+        for key in (
+            "label",
+            "instruction_prompt",
+            "output_constraint",
+            "include_row_context",
+            "include_source_text",
+        )
+        if key in arguments
+    }
+
+
+def _mcp_column_tool_call(
+    request_id: Any,
+    service: Any,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> JSONResponse:
+    """Expose the existing column controls as MCP tools."""
+    from backend.models.repository import RepositoryColumnRunRequest
+
+    column_id = str(arguments.get("column_id") or "").strip()
+
+    if tool_name == "list_columns":
+        columns = service.list_columns()
+        data: Any = {"items": columns, "total": len(columns)}
+    elif tool_name == "create_column":
+        config = service.create_column(str(arguments.get("label") or ""))
+        patch = _column_patch(arguments)
+        # Setting the prompt here too halves the round trips when an agent is
+        # bootstrapping a whole spreadsheet's worth of columns.
+        if patch:
+            config = service.update_column(config.id, patch=patch)
+        data = config.model_dump(mode="json")
+    elif tool_name == "update_column_prompt":
+        data = service.update_column(column_id, patch=_column_patch(arguments)).model_dump(
+            mode="json"
+        )
+    elif tool_name == "run_column":
+        payload = RepositoryColumnRunRequest.model_validate(
+            {
+                "scope": arguments.get("scope") or "filtered",
+                "source_ids": arguments.get("source_ids") or [],
+                "confirm_overwrite": bool(arguments.get("confirm_overwrite")),
+            }
+        )
+        # `confirmation_required` is a normal outcome, not an error: the caller
+        # is meant to ask the user and retry with confirm_overwrite.
+        data = service.start_column_run(column_id, payload=payload).model_dump(mode="json")
+    else:  # get_column_run_status
+        data = service.get_column_run_status(str(arguments.get("job_id") or "")).model_dump(
+            mode="json"
+        )
+
+    return _mcp_success(
+        request_id,
+        {
+            "content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}],
+            "structuredContent": data,
+        },
+    )
+
+
+def _mcp_from_rest_response(
+    request_id: Any,
+    response: JSONResponse,
+    *,
+    data_statuses: tuple[int, ...] = (),
+) -> JSONResponse:
+    """Adapt a REST envelope into an MCP tool result.
+
+    `data_statuses` lists error statuses whose body should still reach the model
+    as data. An operation that was refused or rolled back answered the caller's
+    question correctly -- the blockers are the useful part -- so it should not
+    surface as a failed tool call.
+    """
     payload = json.loads(response.body.decode("utf-8"))
-    if response.status_code >= 400 or payload.get("status") == "error":
+    if response.status_code in data_statuses:
+        is_error = False
+    else:
+        is_error = response.status_code >= 400 or payload.get("status") == "error"
+    if is_error:
         return _mcp_error(
             request_id,
             -32002 if response.status_code < 500 else -32003,
@@ -904,7 +1299,7 @@ async def agent_mcp_endpoint(request: Request, payload: dict[str, Any] = Body(..
     required_access = "read"
     if method == "tools/call":
         tool_name = str(params.get("name") or "").strip()
-        if tool_name in {"run_source_phases", "cancel_run"}:
+        if tool_name in MCP_WRITE_TOOLS:
             required_access = "write"
     auth_error = _authorize(
         request,
@@ -978,8 +1373,55 @@ async def agent_mcp_endpoint(request: Request, payload: dict[str, Any] = Body(..
                 run_id = str(arguments.get("run_id") or "").strip()
                 response = await cancel_agent_run(run_id, request)
                 return _mcp_from_rest_response(request_id, response)
+            if tool_name == "list_operations":
+                response = await list_repo_operations(request)
+                return _mcp_from_rest_response(request_id, response)
+            if tool_name == "plan_operation":
+                response = await plan_repo_operation(
+                    str(arguments.get("operation") or ""),
+                    request,
+                    {"params": arguments.get("params") or {}},
+                )
+                return _mcp_from_rest_response(request_id, response)
+            if tool_name == "apply_operation":
+                response = await apply_repo_operation(
+                    str(arguments.get("operation") or ""),
+                    request,
+                    {
+                        "params": arguments.get("params") or {},
+                        "state_fingerprint": arguments.get("state_fingerprint") or "",
+                        "idempotency_key": arguments.get("idempotency_key") or "",
+                    },
+                )
+                # A blocked or rolled-back apply (409) is a real answer, not a
+                # transport failure: the blockers are what the model needs to
+                # relay. Genuine errors still surface as errors.
+                return _mcp_from_rest_response(request_id, response, data_statuses=(409,))
+            if tool_name in {
+                "list_columns",
+                "create_column",
+                "update_column_prompt",
+                "run_column",
+                "get_column_run_status",
+            }:
+                return _mcp_column_tool_call(request_id, service, tool_name, arguments)
             if tool_name == "search_sources":
-                result = service.list_agent_sources(**arguments)
+                # Filter to known parameters: an unexpected key would otherwise
+                # raise TypeError, which the handlers below do not catch, and a
+                # model passing a plausible-but-wrong filter would get a 500.
+                import inspect
+
+                accepted = {
+                    name
+                    for name in inspect.signature(service.list_agent_sources).parameters
+                    if name != "self"
+                }
+                unknown = sorted(set(arguments) - accepted)
+                result = service.list_agent_sources(
+                    **{k: v for k, v in arguments.items() if k in accepted}
+                )
+                if unknown and isinstance(result, dict):
+                    result["ignored_arguments"] = unknown
                 return _mcp_success(
                     request_id,
                     {
@@ -1011,6 +1453,9 @@ async def agent_mcp_endpoint(request: Request, payload: dict[str, Any] = Body(..
 
         return _mcp_error(request_id, -32601, f"Unknown method: {method}")
     except ValueError as exc:
-        return _mcp_error(request_id, -32002, str(exc))
+        # "A repository operation is already running" is transient, so give it
+        # the retryable code rather than the generic invalid-request one.
+        code = -32003 if "already running" in str(exc).lower() else -32002
+        return _mcp_error(request_id, code, str(exc))
     except RuntimeError as exc:
         return _mcp_error(request_id, -32003, str(exc))

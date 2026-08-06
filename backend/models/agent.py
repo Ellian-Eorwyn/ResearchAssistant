@@ -62,6 +62,11 @@ class AgentRunRecord(BaseModel):
     completed_at: str = ""
     cancel_requested: bool = False
     result_snapshot: AgentRunSnapshot = Field(default_factory=AgentRunSnapshot)
+    # The job's own state, so callers do not have to infer completion. Counting
+    # `processed` against `total` does not work -- rows with mixed phase
+    # outcomes match none of the count branches, so the two never reconcile.
+    state: str = ""  # idle|running|cancelling|completed|cancelled|failed
+    terminal: bool = False
 
 
 class AgentSourceArtifactUris(BaseModel):
@@ -120,6 +125,9 @@ class AgentResourceRecord(BaseModel):
     short_description: str = ""
     content_hash: str = ""
     mime_type: str = "text/markdown"
+    # "" for anything the app does not ship. For bundled skills: "bundled" when
+    # the file still matches what was installed, "bundled_modified" once edited.
+    provenance: str = ""
 
 
 class AgentResourceContent(BaseModel):

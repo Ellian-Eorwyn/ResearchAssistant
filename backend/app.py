@@ -24,6 +24,7 @@ from backend.routers import (
     sources,
     spreadsheets,
     upload,
+    workflow,
 )
 from backend.storage.attached_repository import AttachedRepositoryService
 from backend.storage.file_store import FileStore
@@ -126,6 +127,7 @@ def create_app() -> FastAPI:
     app.include_router(llm_logs.router, prefix="/api", tags=["llm"])
     app.include_router(search.router, prefix="/api", tags=["search"])
     app.include_router(spreadsheets.router, prefix="/api", tags=["spreadsheets"])
+    app.include_router(workflow.router, prefix="/api", tags=["workflow"])
 
     # Health check
     @app.get("/api/health")

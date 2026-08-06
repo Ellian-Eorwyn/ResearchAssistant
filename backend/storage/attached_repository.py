@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import mimetypes
+import os
 import re
 import shutil
 import tempfile
@@ -20,7 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
@@ -63,6 +64,7 @@ from backend.models.repository import (
     RepositoryColumnOutputConstraint,
     RepositoryColumnPromptFixResponse,
     RepositoryColumnRunRequest,
+    RepositoryColumnRunCoercion,
     RepositoryColumnRunRowError,
     RepositoryColumnRunStartResponse,
     RepositoryColumnRunStatus,
@@ -173,6 +175,13 @@ from backend.storage.project_profiles import (
 )
 from backend.storage.repository_bundle_viewer import build_repository_bundle_viewer_html
 
+if TYPE_CHECKING:
+    from backend.models.operations import (
+        OperationDescriptor,
+        OperationPlan,
+        OperationResult,
+    )
+
 try:  # pragma: no cover - POSIX only
     import fcntl
 except Exception:  # pragma: no cover - Windows fallback
@@ -194,6 +203,11 @@ AGENT_RESOURCES_FILE_NAME = "agent_resources.json"
 AGENT_TOKENS_FILE_NAME = "agent_tokens.json"
 AGENT_IDEMPOTENCY_FILE_NAME = "agent_idempotency.json"
 AGENT_AUDIT_FILE_NAME = "agent_audit.jsonl"
+AGENT_INBOX_DIR_NAME = "inbox"
+# Job states that mean "stop polling". Everything else is still in flight.
+TERMINAL_RUN_STATES = frozenset({"completed", "failed", "cancelled"})
+REPO_OPERATIONS_DIR_NAME = "operations"
+BUNDLED_SKILLS_FILE_NAME = "bundled_skills.json"
 DOCUMENTS_DIR_NAME = "documents"
 SOURCES_DIR_NAME = "sources"
 MANIFEST_CSV_NAME = "manifest.csv"
@@ -1004,6 +1018,10 @@ class AttachedRepositoryService:
         status.message = f"Running {status.column_label or column_id} for {len(source_ids)} row(s)."
         job_store.save_source_status(job_id, status.model_dump(mode="json"))
 
+        # Sources whose value for this column was recomputed from the text as it
+        # stands now, so any stale mark against them is discharged.
+        recomputed_ids: set[str] = set()
+
         try:
             for source_id in source_ids:
                 with self._writer_lock():
@@ -1031,16 +1049,37 @@ class AttachedRepositoryService:
 
                 try:
                     if _column_requires_llm(config):
+                        substituted: list[str] = []
                         next_value = self._generate_column_value_for_row(
                             config=config,
                             row=row,
                             manifest_record=manifest_record,
                             repo_settings=repo_settings,
+                            substituted=substituted,
                         )
+                        if substituted:
+                            # Not an error -- the cell holds a valid value. But
+                            # the fallback must not read as an answer the model
+                            # chose, or a column of fallbacks looks like a
+                            # confidently coded one.
+                            status.coerced_rows += 1
+                            if len(status.coercions) < 10:
+                                status.coercions.append(
+                                    RepositoryColumnRunCoercion(
+                                        source_id=source_id,
+                                        returned=substituted[0][:200],
+                                        stored=next_value,
+                                    )
+                                )
                         self.update_source(
                             source_id,
                             patch=_column_value_patch_for_field(config, next_value),
                         )
+                        # Cleared below rather than here: `update_source` applies
+                        # only its whitelisted field groups and drops anything
+                        # else, so the mark has to be removed where the run
+                        # writes the state itself.
+                        recomputed_ids.add(source_id)
                     else:
                         self._run_non_llm_column_for_row(
                             config=config,
@@ -1081,6 +1120,18 @@ class AttachedRepositoryService:
                 )
                 config.last_run_at = status.completed_at
                 config.last_run_status = "failed" if status.state == "failed" else "completed"
+                for item in rows:
+                    if item.id not in recomputed_ids:
+                        continue
+                    remaining = ",".join(
+                        sorted(
+                            c
+                            for c in str(item.stale_column_ids or "").split(",")
+                            if c and c != config.id
+                        )
+                    )
+                    if remaining != str(item.stale_column_ids or ""):
+                        item.stale_column_ids = remaining
                 if index is None:
                     column_configs.append(config)
                 else:
@@ -1112,6 +1163,7 @@ class AttachedRepositoryService:
         row: SourceManifestRow,
         manifest_record: dict[str, str | int | float | bool],
         repo_settings: EffectiveSettings,
+        substituted: list[str] | None = None,
     ) -> str:
         instruction_prompt = _effective_column_instruction_prompt(config)
         output_constraint = _effective_column_output_constraint(config) or RepositoryColumnOutputConstraint(
@@ -1192,6 +1244,7 @@ class AttachedRepositoryService:
         normalized_value = _coerce_column_output_value(
             payload.get("value"),
             output_constraint,
+            substituted,
         )
         normalized_value = _column_run_author_fallback(
             config=config,
@@ -1200,9 +1253,11 @@ class AttachedRepositoryService:
             manifest_record=manifest_record,
         )
         if normalized_status == "insufficient_evidence" and not normalized_value:
+            # The model declining is not the same as the model answering the
+            # fallback, but both store the same string. Say which happened.
+            if substituted is not None:
+                substituted.append("(declined: insufficient_evidence)")
             return str(output_constraint.fallback_value or "")
-        if not normalized_value and normalized_status == "insufficient_evidence":
-            return normalized_value
         if normalized_status not in {"ok", "insufficient_evidence"} and not normalized_value:
             return str(output_constraint.fallback_value or "")
         return normalized_value
@@ -3111,6 +3166,7 @@ class AttachedRepositoryService:
             source_id=str(getattr(status, "current_item_id", "") or ""),
             url=str(getattr(status, "current_url", "") or ""),
         )
+        run_state = str(getattr(status, "state", "") or "")
         return AgentRunRecord(
             run_id=normalized_run_id,
             scope=str(context.get("scope") or getattr(status, "selected_scope", "") or ""),
@@ -3125,6 +3181,8 @@ class AttachedRepositoryService:
             completed_at=str(getattr(status, "completed_at", "") or ""),
             cancel_requested=bool(getattr(status, "cancel_requested", False)),
             result_snapshot=snapshot,
+            state=run_state,
+            terminal=run_state in TERMINAL_RUN_STATES,
         )
 
     def cancel_agent_run(
@@ -8420,6 +8478,16 @@ class AttachedRepositoryService:
                 write_csv(empty_citations),
                 encoding="utf-8-sig",
             )
+
+        # Staging area for files a user wants attached by hand. It lives inside
+        # `.ra_repo` so `_iter_paths_named` never scans it.
+        (self._internal_dir() / AGENT_INBOX_DIR_NAME).mkdir(parents=True, exist_ok=True)
+        (self._internal_dir() / REPO_OPERATIONS_DIR_NAME).mkdir(parents=True, exist_ok=True)
+        # This is the one place guaranteed to run under the writer lock on every
+        # attach and create, so it is where a crashed operation gets undone.
+        self._recover_incomplete_operations_locked()
+        self._sync_bundled_agent_skills_locked()
+
         self._refresh_agent_resource_index_locked()
 
     def _default_meta(self) -> dict[str, Any]:
@@ -8525,7 +8593,7 @@ class AttachedRepositoryService:
             ),
         )
 
-    def _create_backup_snapshot_locked(self, reason: str) -> None:
+    def _create_backup_snapshot_locked(self, reason: str) -> Path:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         backup_dir = self._backups_dir() / f"{timestamp}_{reason}"
         backup_dir.mkdir(parents=True, exist_ok=True)
@@ -8539,6 +8607,9 @@ class AttachedRepositoryService:
         for src in candidates:
             if src.exists():
                 shutil.copy2(src, backup_dir / src.name)
+        # Returned so the operations engine can restore from this exact
+        # snapshot when it has to roll an operation back.
+        return backup_dir
 
     def _internal_dir(self) -> Path:
         return self.path / INTERNAL_DIR_NAME
@@ -8727,6 +8798,18 @@ class AttachedRepositoryService:
         root_memory = self.path / "CLAUDE.md"
         if root_memory.is_file():
             candidates.append(("memory", root_memory))
+        agents_memory = self.path / "AGENTS.md"
+        if agents_memory.is_file():
+            candidates.append(("memory", agents_memory))
+
+        # The canonical, vendor-neutral skill location. `.claude/skills/` is
+        # deliberately not scanned: it symlinks to these, and indexing both
+        # would give every skill two resource ids.
+        candidates.extend(
+            ("skill", path)
+            for path in sorted((self.path / ".agents" / "skills").glob("*/SKILL.md"))
+            if path.is_file()
+        )
 
         candidates.extend(
             ("skill", path)
@@ -8749,8 +8832,20 @@ class AttachedRepositoryService:
             if path.is_file()
         )
 
+        shipped_hashes = self._shipped_skill_hashes()
         resources: list[AgentResourceRecord] = []
+        seen_paths: set[Path] = set()
         for kind, source_path in candidates:
+            # Guard against a user symlinking the same file into two of the
+            # scanned directories.
+            try:
+                real_path = source_path.resolve()
+            except OSError:
+                real_path = source_path
+            if real_path in seen_paths:
+                continue
+            seen_paths.add(real_path)
+
             try:
                 content = source_path.read_text(encoding="utf-8", errors="replace")
             except OSError:
@@ -8780,6 +8875,7 @@ class AttachedRepositoryService:
                         if source_path.suffix.lower() in {".yaml", ".yml"}
                         else "text/markdown"
                     ),
+                    provenance=self._agent_resource_provenance(kind, source_path, shipped_hashes),
                 )
             )
 
@@ -8789,6 +8885,186 @@ class AttachedRepositoryService:
         )
         self._save_agent_resources_locked(resources)
         return resources
+
+    def _shipped_skill_hashes(self) -> dict[str, str]:
+        """What the app last installed for each bundled skill, by name."""
+        path = self._internal_dir() / BUNDLED_SKILLS_FILE_NAME
+        if not path.is_file():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        skills = data.get("skills") if isinstance(data, dict) else None
+        if not isinstance(skills, dict):
+            return {}
+        return {
+            str(name): str((entry or {}).get("shipped_hash") or "")
+            for name, entry in skills.items()
+            if isinstance(entry, dict)
+        }
+
+    def _agent_resource_provenance(
+        self,
+        kind: str,
+        source_path: Path,
+        shipped_hashes: dict[str, str],
+    ) -> str:
+        """Tell a bundled skill apart from one the user wrote or edited."""
+        if kind != "skill" or source_path.name != "SKILL.md":
+            return ""
+        skill_name = source_path.parent.name
+        expected = shipped_hashes.get(skill_name)
+        if not expected:
+            return "user"
+        try:
+            from backend.storage.agent_skills import skill_tree_hash
+
+            actual = skill_tree_hash(source_path.parent)
+        except Exception:
+            return "bundled"
+        return "bundled" if actual == expected else "bundled_modified"
+
+    def list_columns(self) -> list[dict[str, Any]]:
+        """Column metadata for agents: which are runnable and their prompts.
+
+        Reuses the same builder the browser table uses, so an agent sees
+        exactly the columns and prompts a user would.
+        """
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+        with self._writer_lock():
+            state = self._load_state_locked()
+            rows = _load_source_rows(state.get("sources", []))
+            column_configs = _load_column_configs(state.get("column_configs", []))
+            records = [
+                build_manifest_record(row, base_dir=self.path, column_configs=column_configs)
+                for row in rows[:1]
+            ]
+        return _build_manifest_column_metadata(records, column_configs)
+
+    # -- repository operations -------------------------------------------
+    #
+    # Each of these takes the writer lock exactly once and delegates. Nothing
+    # inside `repo_operations` may call a lock-taking public method: the lock
+    # opens a fresh file descriptor per entry, so re-entering it deadlocks.
+
+    def list_repo_operations(self) -> list["OperationDescriptor"]:
+        from backend.storage.repo_operations import list_operations
+
+        return list_operations()
+
+    def plan_repo_operation(self, operation: str, params: dict[str, Any]) -> "OperationPlan":
+        from backend.storage.repo_operations import plan_operation_locked
+
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+        with self._writer_lock():
+            self._ensure_scaffold_locked()
+            return plan_operation_locked(self, operation, params or {})
+
+    def apply_repo_operation(
+        self,
+        operation: str,
+        params: dict[str, Any],
+        *,
+        run_id: str = "",
+        expected_fingerprint: str = "",
+    ) -> "OperationResult":
+        from backend.storage.repo_operations import apply_operation_locked
+
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+        with self._writer_lock():
+            self._ensure_scaffold_locked()
+            return apply_operation_locked(
+                self,
+                operation,
+                params or {},
+                run_id=run_id,
+                expected_fingerprint=expected_fingerprint,
+            )
+
+    def get_repo_operation_run(self, run_id: str) -> "OperationResult":
+        from backend.storage.repo_operations import load_operation_result
+
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+        result = load_operation_result(self.path, run_id)
+        if result is None:
+            raise ValueError(f"Unknown run_id: {run_id}")
+        return result
+
+    def repo_operation_fingerprint(self, operation: str, params: dict[str, Any]) -> str:
+        from backend.storage.repo_operations import params_fingerprint
+
+        return params_fingerprint(operation, params or {})
+
+    def current_state_fingerprint(self) -> str:
+        from backend.storage.repo_operations import state_fingerprint_locked
+
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+        with self._writer_lock():
+            return state_fingerprint_locked(self)
+
+    def _sync_bundled_agent_skills_locked(self) -> None:
+        """Install the app's skills into this repo. Never fails an attach."""
+        from backend.storage.agent_skills import (
+            ensure_agents_md,
+            ensure_claude_skill_links,
+            ensure_mcp_config,
+            ensure_repo_gitignore,
+            sync_bundled_agent_cli,
+            sync_bundled_agent_skills,
+        )
+
+        try:
+            report = sync_bundled_agent_skills(
+                self.path,
+                manifest_path=self._internal_dir() / BUNDLED_SKILLS_FILE_NAME,
+            )
+            names = report.names
+            manifest_path = self._internal_dir() / BUNDLED_SKILLS_FILE_NAME
+            sync_bundled_agent_cli(self.path, manifest_path=manifest_path)
+            ensure_claude_skill_links(self.path, names)
+            ensure_agents_md(self.path, names)
+            ensure_mcp_config(self.path, port=os.getenv("RA_PORT", "7995"))
+            ensure_repo_gitignore(self.path)
+        except Exception:
+            # Scaffolding is convenience. A repository must still open without it.
+            return
+
+    def _recover_incomplete_operations_locked(self) -> list[str]:
+        """Undo any operation a crash left mid-apply. Lock must be held."""
+        from backend.storage.repo_operations import recover_incomplete_operations_locked
+
+        try:
+            recovered = recover_incomplete_operations_locked(self)
+        except Exception:
+            return []
+        for run_id in recovered:
+            # Write the audit line directly: `append_agent_audit_record` takes
+            # the writer lock, and we are already holding it.
+            try:
+                with self._agent_audit_path().open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps(
+                            {
+                                "timestamp": _utc_now_iso(),
+                                "action": "operation_recovered",
+                                "run_id": run_id,
+                                "payload": {
+                                    "detail": "Rolled back an operation interrupted by a crash."
+                                },
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+            except OSError:
+                continue
+        return recovered
 
     def list_agent_resources(self) -> list[AgentResourceRecord]:
         if not self.is_attached:
@@ -10218,9 +10494,21 @@ def _normalize_date_output(value: Any) -> str:
 def _coerce_column_output_value(
     value: Any,
     constraint: RepositoryColumnOutputConstraint,
+    substituted: list[str] | None = None,
 ) -> str:
+    """Coerce a model's answer to the column's constraint.
+
+    `substituted` collects a note whenever the stored value is the fallback
+    rather than something the model chose -- either because its answer was not
+    in the allowed values, or because it declined to answer. Both write the same
+    string into the cell, so without this a column of fallbacks is
+    indistinguishable from a column the model answered confidently.
+    """
     normalized = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
     if not normalized:
+        # An empty answer becomes the fallback just as surely as a wrong one.
+        if substituted is not None:
+            substituted.append("")
         return str(constraint.fallback_value or "")
 
     if constraint.kind == "yes_no":
@@ -10248,6 +10536,8 @@ def _coerce_column_output_value(
         if resolved is not None:
             single_line = resolved
         else:
+            if substituted is not None:
+                substituted.append(single_line)
             return str(constraint.fallback_value or "")
     if constraint.max_words is not None and constraint.max_words > 0:
         single_line = " ".join(single_line.split()[: constraint.max_words])
@@ -11725,10 +12015,14 @@ def _derive_agent_resource_metadata(
             or _extract_simple_yaml_value(content, "summary")
         )
     else:
+        # A SKILL.md carries its identity in the standard's `name` field, and
+        # its file is always literally "SKILL.md", so `stem` is useless here.
+        skill_name = str(front_matter.get("name") or "").strip() if kind == "skill" else ""
         title = (
             str(front_matter.get("title") or "").strip()
+            or skill_name
             or _extract_markdown_title(content)
-            or source_path.stem
+            or (source_path.parent.name if kind == "skill" else source_path.stem)
         )
         raw_tags = front_matter.get("tags") or _extract_markdown_tags(content)
         if isinstance(raw_tags, list):

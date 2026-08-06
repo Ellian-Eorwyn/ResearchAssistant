@@ -80,6 +80,13 @@ class SourceManifestRow(BaseModel):
     discovery_depth: int = 0
     custom_fields: dict[str, str] = Field(default_factory=dict)
     phase_metadata: dict[str, SourcePhaseMetadata] = Field(default_factory=dict)
+    # Column ids whose stored value was computed from this source's *previous*
+    # text. Set when a convert rewrites the text under values that already
+    # exist -- the case that matters is attaching a hand-downloaded document to
+    # a source whose columns were run against the blocked page's error text.
+    # Cleared per column as each is re-run. Deliberately absent from
+    # SOURCE_MANIFEST_COLUMNS so it lives in the state, not the user's CSV.
+    stale_column_ids: str = ""
 
 
 SOURCE_MANIFEST_COLUMNS = [

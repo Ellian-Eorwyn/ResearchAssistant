@@ -333,6 +333,19 @@ class RepositoryColumnRunRowError(BaseModel):
     message: str = ""
 
 
+class RepositoryColumnRunCoercion(BaseModel):
+    """An answer the column's allowed values rejected, and what was stored instead.
+
+    Without this a substituted answer is indistinguishable from the model
+    genuinely choosing the fallback, so a column full of "Not sure" reads as
+    honest uncertainty when it may be a prompt the model cannot follow.
+    """
+
+    source_id: str
+    returned: str = ""
+    stored: str = ""
+
+
 class RepositoryColumnRunRequest(BaseModel):
     filters: "RepositoryManifestFilterRequest" = Field(default_factory=lambda: RepositoryManifestFilterRequest())
     scope: Literal["filtered", "all", "empty_only", "selected"] = "filtered"
@@ -377,6 +390,8 @@ class RepositoryColumnRunStatus(BaseModel):
     started_at: str = ""
     completed_at: str = ""
     row_errors: list[RepositoryColumnRunRowError] = Field(default_factory=list)
+    coerced_rows: int = 0
+    coercions: list[RepositoryColumnRunCoercion] = Field(default_factory=list)
 
 
 class RepositoryManifestFilterRequest(BaseModel):
