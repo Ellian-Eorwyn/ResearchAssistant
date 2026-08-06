@@ -45,6 +45,21 @@ class _Planned:
         self.label = label
         self.column_id = column_id
         self.constraint = resolved_constraint(spec)
+        self.row_context = resolved_row_context(spec)
+
+
+def resolved_row_context(spec: ColumnSpec) -> bool:
+    """Send the row's metadata when the prompt tells the model to read it.
+
+    Left to the default of False, a prompt saying "use `discovered_media_urls`
+    in the row metadata" was handed an empty metadata block, so the instruction
+    referred to nothing at all.
+    """
+    if spec.include_row_context:
+        return True
+    from backend.workflow.constraints import needs_row_context
+
+    return needs_row_context(spec.instruction_prompt or "")
 
 
 def resolved_constraint(spec: ColumnSpec) -> dict[str, Any] | None:
@@ -159,6 +174,8 @@ def plan(
         prompt = item.spec.instruction_prompt.strip()
         values = list((item.constraint or {}).get("allowed_values") or [])
         detail = f"{len(prompt)} character prompt"
+        if item.row_context:
+            detail += "; reads the row's metadata"
         if values:
             # Shown in full: this is the review that makes reading values out of
             # a prompt safe, so the user has to be able to see what was read.
@@ -193,11 +210,14 @@ def plan(
 
     skipped = len([w for w in warnings if w.code == "column_label_exists"])
     constrained = len(planned) - len(unconstrained)
+    with_context = len([item for item in planned if item.row_context])
     parts = []
     if planned:
         parts.append(f"create {len(planned)} column(s)")
     if constrained:
         parts.append(f"constrain {constrained} to their listed answers")
+    if with_context:
+        parts.append(f"give {with_context} the row metadata their prompts read")
     if skipped:
         parts.append(f"skip {skipped} that already exist")
     summary = ("Will " + ", ".join(parts) + ".") if parts else "Nothing to create."
@@ -225,7 +245,7 @@ def apply(ctx: OperationContext, params: CreateColumnsParams, plan_obj: Any) -> 
                 kind="custom",
                 instruction_prompt=item.spec.instruction_prompt.strip(),
                 output_constraint=constraint,
-                include_row_context=bool(item.spec.include_row_context),
+                include_row_context=bool(item.row_context),
                 include_source_text=bool(item.spec.include_source_text),
             )
         )

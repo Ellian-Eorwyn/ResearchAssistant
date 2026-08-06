@@ -32,16 +32,23 @@ class SetColumnConstraintsParams(BaseModel):
 
 
 class _Planned:
-    def __init__(self, config: Any, constraint: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        config: Any,
+        constraint: dict[str, Any] | None,
+        *,
+        add_row_context: bool = False,
+    ) -> None:
         self.config = config
         self.constraint = constraint
+        self.add_row_context = add_row_context
 
 
 def _resolve(
     ctx: OperationContext,
     params: SetColumnConstraintsParams,
 ) -> tuple[list[_Planned], list[PlanIssue], list[PlanIssue]]:
-    from backend.workflow.constraints import derive_constraint
+    from backend.workflow.constraints import derive_constraint, needs_row_context
 
     blockers: list[PlanIssue] = []
     warnings: list[PlanIssue] = []
@@ -69,23 +76,34 @@ def _resolve(
         if config is None:
             continue
 
+        prompt = str(config.instruction_prompt or "")
+        # A prompt that reads the row's metadata but is not sent any is the more
+        # damaging of the two gaps, so it is checked even when the constraint is
+        # already set.
+        add_row_context = needs_row_context(prompt) and not bool(
+            getattr(config, "include_row_context", False)
+        )
+
         existing = getattr(config, "output_constraint", None)
         has_values = bool(getattr(existing, "allowed_values", None))
         if has_values and not params.overwrite_existing:
-            warnings.append(
-                PlanIssue(
-                    code="constraint_already_set",
-                    message=(
-                        f"{config.label!r} already restricts its answers; leaving it alone. "
-                        "Use overwrite_existing to replace it."
-                    ),
-                    subject=column_id,
+            if not add_row_context:
+                warnings.append(
+                    PlanIssue(
+                        code="constraint_already_set",
+                        message=(
+                            f"{config.label!r} already restricts its answers; leaving it alone. "
+                            "Use overwrite_existing to replace it."
+                        ),
+                        subject=column_id,
+                    )
                 )
-            )
+                continue
+            planned.append(_Planned(config, None, add_row_context=True))
             continue
 
-        constraint = derive_constraint(str(config.instruction_prompt or ""))
-        if not constraint:
+        constraint = derive_constraint(prompt)
+        if not constraint and not add_row_context:
             warnings.append(
                 PlanIssue(
                     code="column_without_allowed_values",
@@ -97,7 +115,7 @@ def _resolve(
                 )
             )
             continue
-        planned.append(_Planned(config, constraint))
+        planned.append(_Planned(config, constraint, add_row_context=add_row_context))
 
     return planned, blockers, warnings
 
@@ -108,32 +126,63 @@ def plan(
 ) -> tuple[list[PlanChange], list[PlanIssue], list[PlanIssue], str]:
     planned, blockers, warnings = _resolve(ctx, params)
 
-    changes = [
-        PlanChange(
-            kind="row_update",
-            subject=f"column:{item.config.id}",
-            field="output_constraint.allowed_values",
-            before=repr(list(getattr(getattr(item.config, "output_constraint", None), "allowed_values", None) or [])),
-            after=repr(item.constraint["allowed_values"]),
-            # The values in full: this line is the review, so it has to carry
-            # what was read out of the prompt, not just how many.
-            detail=(
-                f"{item.config.label} -> "
-                + " | ".join(item.constraint["allowed_values"])
-                + (
-                    f"   (anything else becomes {item.constraint['fallback_value']!r})"
-                    if item.constraint["fallback_value"]
-                    else "   (anything else becomes blank)"
+    changes: list[PlanChange] = []
+    for item in planned:
+        if item.add_row_context:
+            changes.append(
+                PlanChange(
+                    kind="row_update",
+                    subject=f"column:{item.config.id}",
+                    field="include_row_context",
+                    before="False",
+                    after="True",
+                    detail=(
+                        f"{item.config.label} -> its prompt reads the row's metadata, "
+                        "which was not being sent"
+                    ),
                 )
-            ),
+            )
+        if not item.constraint:
+            continue
+        changes.append(
+            PlanChange(
+                kind="row_update",
+                subject=f"column:{item.config.id}",
+                field="output_constraint.allowed_values",
+                before=repr(
+                    list(
+                        getattr(
+                            getattr(item.config, "output_constraint", None),
+                            "allowed_values",
+                            None,
+                        )
+                        or []
+                    )
+                ),
+                after=repr(item.constraint["allowed_values"]),
+                # The values in full: this line is the review, so it has to carry
+                # what was read out of the prompt, not just how many.
+                detail=(
+                    f"{item.config.label} -> "
+                    + " | ".join(item.constraint["allowed_values"])
+                    + (
+                        f"   (anything else becomes {item.constraint['fallback_value']!r})"
+                        if item.constraint["fallback_value"]
+                        else "   (anything else becomes blank)"
+                    )
+                ),
+            )
         )
-        for item in planned
-    ]
 
+    constrained = len([i for i in planned if i.constraint])
+    contexted = len([i for i in planned if i.add_row_context])
+    parts = []
+    if constrained:
+        parts.append(f"constrain {constrained} column(s) to the answers their prompts list")
+    if contexted:
+        parts.append(f"give {contexted} the row metadata their prompts read")
     summary = (
-        f"Will constrain {len(planned)} column(s) to the answers their prompts list."
-        if planned
-        else "No column needs its constraints changed."
+        ("Will " + ", ".join(parts) + ".") if parts else "Every column already matches its prompt."
     )
     return changes, blockers, warnings, summary
 
@@ -145,24 +194,31 @@ def apply(ctx: OperationContext, params: SetColumnConstraintsParams, plan_obj: A
 
     applied = 0
     for item in planned:
-        try:
-            item.config.output_constraint = RepositoryColumnOutputConstraint.model_validate(
-                item.constraint
-            )
-        except Exception:
-            continue
-        applied += 1
+        touched = False
+        if item.add_row_context:
+            item.config.include_row_context = True
+            touched = True
+        if item.constraint:
+            try:
+                item.config.output_constraint = RepositoryColumnOutputConstraint.model_validate(
+                    item.constraint
+                )
+                touched = True
+            except Exception:
+                pass
+        applied += 1 if touched else 0
     return applied
 
 
 DEFINITION = OperationDefinition(
     name="set_column_constraints",
-    title="Restrict columns to the answers their prompts list",
+    title="Make each column's settings match what its prompt asks for",
     description=(
-        "Read each column's own instruction prompt and, where it literally lists the answers "
-        "it allows, store them as the column's output constraint so a stray model answer is "
-        "replaced by the prompt's own fallback instead of landing in the data. Columns whose "
-        "prompts do not list their answers are left alone."
+        "Read each column's own instruction prompt and bring the column's settings into line "
+        "with it: store the answers it lists literally as the output constraint, so a stray "
+        "model answer becomes the prompt's own fallback instead of landing in the data, and "
+        "turn on the row metadata for a prompt that tells the model to read it. Columns whose "
+        "prompts ask for neither are left alone."
     ),
     params_model=SetColumnConstraintsParams,
     planner=plan,

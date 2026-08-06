@@ -1190,17 +1190,13 @@ class AttachedRepositoryService:
             row_metadata = {
                 key: value
                 for key, value in manifest_record.items()
+                # Only the large JSON blobs are withheld. File paths stay: a
+                # prompt asking to "return `ocr_pdf_file` exactly as given"
+                # cannot work without them, and stripping some paths while
+                # leaving `ocr_pdf_file` through made that column half-work in a
+                # way nothing reported.
                 if key
                 not in {
-                    "raw_file",
-                    "rendered_file",
-                    "rendered_pdf_file",
-                    "markdown_file",
-                    "llm_cleanup_file",
-                    "catalog_file",
-                    "summary_file",
-                    "rating_file",
-                    "metadata_file",
                     "rating_raw_json",
                     "citation_field_evidence_json",
                 }

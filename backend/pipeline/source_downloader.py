@@ -195,7 +195,28 @@ BLOCKED_PAGE_PATTERNS = [
     re.compile(r"\baccess denied\b", re.IGNORECASE),
     re.compile(r"\brequest blocked\b", re.IGNORECASE),
     re.compile(r"\bsecurity check\b", re.IGNORECASE),
+    # Weak on its own: prose about blocking can contain these too.
+    re.compile(r"\bcloudflare ray id\b", re.IGNORECASE),
+    re.compile(r"\b(?:you'?ve|you have) been blocked\b", re.IGNORECASE),
 ]
+
+# Boilerplate a block page prints and an article almost never quotes verbatim.
+# These decide on their own, because length is no help here: this runs on raw
+# HTML, where a block page is still a full document with scripts and styles.
+BLOCKED_PAGE_CERTAIN_PATTERNS = [
+    re.compile(r"blocked by network security", re.IGNORECASE),
+    re.compile(r"security service to protect itself", re.IGNORECASE),
+    re.compile(r"triggered the security solution", re.IGNORECASE),
+]
+
+# A page that extracts to almost nothing is either a block page or a failed
+# extraction. Either way the text is not the document, so this corroborates --
+# never on its own, so a short legitimate page is safe.
+BLOCKED_PAGE_SHORT_TEXT_CHARS = 600
+
+# Past this there is enough real content for the weak signals to be an article
+# *about* blocking rather than a block page, so they need one more.
+BLOCKED_PAGE_ARTICLE_TEXT_CHARS = 3000
 
 TRACKING_PARAM_EXACT = {"gclid", "fbclid", "msclkid"}
 TRACKING_PARAM_PREFIXES = ("utm_",)
@@ -2484,6 +2505,19 @@ class SourceDownloadOrchestrator:
             if render_error:
                 notes.append(normalize_render_error_note(render_error))
             elif rendered_html:
+                # The fallback render is the first place a JavaScript-gated
+                # block appears: the plain fetch returns an empty shell that
+                # looks merely thin, and only the real browser is shown the
+                # refusal. Without this check that page is stored as a
+                # successful fetch and its text analysed as if it were the
+                # document.
+                if detect_blocked_page(
+                    html_text=rendered_html,
+                    title=extract_title(rendered_html) or row.title,
+                    final_url=row.final_url,
+                ):
+                    blocked_by_challenge = True
+
                 if self.output_options.include_rendered_html:
                     rendered_rel = self._rendered_html_rel(row)
                     self._write_text(rendered_rel, rendered_html)
@@ -7028,7 +7062,8 @@ def blocked_error_message(status_code: int) -> str:
 
 
 def detect_blocked_page(html_text: str, title: str, final_url: str) -> bool:
-    sample = (html_text or "")[:20000]
+    full = html_text or ""
+    sample = full[:20000]
     title_lower = (title or "").strip().lower()
     url_lower = (final_url or "").strip().lower()
 
@@ -7036,6 +7071,14 @@ def detect_blocked_page(html_text: str, title: str, final_url: str) -> bool:
         return True
     if "just a moment" in title_lower:
         return True
+    # Searched over the whole document, not the sample: a rendered page can
+    # carry 20k of scripts and inlined styles before its body, which is exactly
+    # how a Reddit block page reached the analysis stage marked `success`. The
+    # weak signals below stay on the sample -- they are for the head, and
+    # scanning a large page for them invites false positives.
+    for pattern in BLOCKED_PAGE_CERTAIN_PATTERNS:
+        if pattern.search(full):
+            return True
 
     signals = 0
     for pattern in BLOCKED_PAGE_PATTERNS:
@@ -7046,8 +7089,15 @@ def detect_blocked_page(html_text: str, title: str, final_url: str) -> bool:
         signals += 1
     if "hcaptcha" in sample.lower() or "g-recaptcha" in sample.lower():
         signals += 1
+    # Length decides how much evidence is enough. A block page is a stub, so a
+    # short page needs less; a long one is far more likely to be an article
+    # *about* blocking that quotes these phrases, and needs more.
+    length = len(sample.strip())
+    if signals and length < BLOCKED_PAGE_SHORT_TEXT_CHARS:
+        signals += 1
+    required = 3 if length > BLOCKED_PAGE_ARTICLE_TEXT_CHARS else 2
 
-    return signals >= 2
+    return signals >= required
 
 
 def decode_bytes_to_text(data: bytes) -> str:

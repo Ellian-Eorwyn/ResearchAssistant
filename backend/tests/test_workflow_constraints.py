@@ -157,6 +157,134 @@ class CoercionTests(unittest.TestCase):
         self.assertEqual(self._coerce("Utility"), "Utility")
 
 
+class RowContextTests(unittest.TestCase):
+    """A prompt that reads row metadata must be sent row metadata.
+
+    12 of the 14 prompts in the first real spreadsheet told the model to use
+    fields like `discovered_media_urls`, while `include_row_context` defaulted
+    to False and the metadata block was empty -- so those instructions referred
+    to nothing, and six columns could not work at all.
+    """
+
+    def test_the_phrase_itself_is_enough(self) -> None:
+        from backend.workflow.constraints import needs_row_context
+
+        self.assertTrue(needs_row_context("Prefer the value in the row metadata."))
+
+    def test_a_named_manifest_field_is_enough(self) -> None:
+        from backend.workflow.constraints import needs_row_context
+
+        self.assertTrue(needs_row_context("Return `ocr_pdf_file` exactly as given."))
+        self.assertTrue(needs_row_context("If `discovered_media_count` is 1 or greater, answer Yes."))
+
+    def test_a_backticked_word_that_is_not_a_field_is_not(self) -> None:
+        from backend.workflow.constraints import needs_row_context
+
+        self.assertFalse(needs_row_context("Answer `Yes` or `No`, spelled exactly."))
+        self.assertFalse(needs_row_context(ORG_TYPE.replace("row metadata", "the document")))
+
+    def test_file_paths_reach_a_prompt_that_asks_for_them(self) -> None:
+        """`Source PDF` asks for raw_file and rendered_pdf_file by name."""
+        import inspect
+
+        from backend.storage.attached_repository import (
+            AttachedRepositoryService as Service,
+        )
+
+        source = inspect.getsource(Service._generate_column_value_for_row)
+        excluded = source.split("row_metadata = {")[1].split("}")[0]
+        for field in ("raw_file", "rendered_pdf_file", "ocr_pdf_file"):
+            self.assertNotIn(
+                f'"{field}"',
+                excluded,
+                f"{field} is stripped from row metadata, so a prompt naming it cannot work.",
+            )
+
+
+class BlockedPageTests(unittest.TestCase):
+    """Two block pages returned HTTP 200 and were stored as successful fetches.
+
+    Their text then went on to be analysed as though it were the document, and
+    the column dutifully answered "Not sure".
+    """
+
+    def _detect(self, text: str) -> bool:
+        from backend.pipeline.source_downloader import detect_blocked_page
+
+        return detect_blocked_page(text, "", "")
+
+    def test_catches_the_two_that_got_through(self) -> None:
+        self.assertTrue(
+            self._detect(
+                "You've been blocked by network security.\nIf you think you've been "
+                "blocked by mistake, file a ticket below.\nFile a ticket"
+            )
+        )
+        self.assertTrue(
+            self._detect(
+                "This website is using a security service to protect itself from online "
+                "attacks. The action you just performed triggered the security solution. "
+                "Cloudflare Ray ID: 8ab12"
+            )
+        )
+
+    def test_a_block_page_is_caught_in_its_raw_html(self) -> None:
+        """This runs on raw HTML, not extracted text.
+
+        A first attempt made a long page need an extra signal, which read
+        sensibly against extracted text and silently stopped catching real block
+        pages -- they are full HTML documents, scripts and all.
+        """
+        html = (
+            "<html><head><title>Blocked</title></head><body>"
+            + "<div>nav</div>" * 300
+            + "You've been blocked by network security. File a ticket below."
+            + "<script>x</script>" * 200
+            + "</body></html>"
+        )
+        self.assertTrue(self._detect(html))
+
+    def test_block_text_past_the_sample_window_is_still_caught(self) -> None:
+        """A rendered page can carry 20k of scripts before its body.
+
+        That is exactly how a Reddit block page reached the analysis stage
+        marked `success`: the phrase sat past the sampled prefix.
+        """
+        html = "<script>" + ("x" * 60000) + "</script>You've been blocked by network security."
+        self.assertTrue(self._detect(html))
+
+    def test_a_long_article_about_blocking_is_not_a_block_page(self) -> None:
+        """The reason length raises the bar rather than lowering it."""
+        text = (
+            ("An article about web security infrastructure. " * 40)
+            + " A Cloudflare Ray ID appears when you have been blocked by a WAF. "
+            + ("More prose about the topic. " * 200)
+        )
+        self.assertFalse(self._detect(text))
+
+    def test_a_short_ordinary_page_is_not_a_block_page(self) -> None:
+        self.assertFalse(self._detect("A short page about solar batteries in Victoria."))
+
+    def test_the_fallback_render_is_checked_for_a_block_page(self) -> None:
+        """A JavaScript-gated block only appears once a real browser loads it.
+
+        The plain fetch returns an empty shell that reads as merely thin, so
+        without this the refusal is stored as a successful fetch. Detection
+        alone is not enough -- it has to be called on the rendered page.
+        """
+        import inspect
+
+        from backend.pipeline import source_downloader
+
+        body = inspect.getsource(source_downloader)
+        rendered_branch = body.split("elif rendered_html:")[1].split("self._collect_media_links")[0]
+        self.assertIn(
+            "detect_blocked_page",
+            rendered_branch,
+            "The fallback render is no longer checked for a block page.",
+        )
+
+
 class SubstitutionReportingTests(unittest.TestCase):
     """A stored fallback must be distinguishable from a chosen answer.
 

@@ -94,6 +94,38 @@ def extract_allowed_values(prompt: str) -> list[str]:
     return values if len(values) >= MIN_VALUES else []
 
 
+def _known_row_fields() -> frozenset[str]:
+    """Every field name the row-metadata block can actually carry.
+
+    Read from the manifest's own column lists, so a prompt naming something
+    that does not exist is not mistaken for a metadata reference.
+    """
+    from backend.models.sources import SOURCE_MANIFEST_COLUMNS
+    from backend.pipeline.source_downloader import MANIFEST_DERIVED_COLUMNS
+
+    return frozenset(SOURCE_MANIFEST_COLUMNS) | frozenset(MANIFEST_DERIVED_COLUMNS)
+
+
+def needs_row_context(prompt: str) -> bool:
+    """Does this prompt tell the model to read the row's metadata?
+
+    12 of the 14 prompts in the first real spreadsheet did -- "use
+    `discovered_media_urls` in the row metadata", "return `ocr_pdf_file` exactly
+    as given" -- while `include_row_context` defaulted to False, so the metadata
+    block was empty and those instructions referred to nothing. The columns that
+    were *entirely* metadata-driven could not work at all, and Org Type lost
+    five rows whose publisher appears only in the URL.
+
+    Detection is literal: the phrase itself, or a backticked name that is
+    genuinely a manifest field.
+    """
+    text = prompt or ""
+    if re.search(r"\brow metadata\b", text, re.IGNORECASE):
+        return True
+    known = _known_row_fields()
+    return any(token in known for token in re.findall(r"`([a-z][a-z0-9_]*)`", text))
+
+
 def derive_constraint(prompt: str) -> dict | None:
     """Build an `output_constraint` for a prompt, or `None` to leave it alone."""
     values = extract_allowed_values(prompt)
