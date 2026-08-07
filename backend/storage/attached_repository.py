@@ -10502,10 +10502,14 @@ def _coerce_column_output_value(
     """
     normalized = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
     if not normalized:
-        # An empty answer becomes the fallback just as surely as a wrong one.
-        if substituted is not None:
+        fallback = str(constraint.fallback_value or "")
+        # Only a substitution if something actually replaced the answer. Plenty
+        # of prompts say to return an empty value when there is nothing to
+        # report -- for those, empty is the answer, and flagging it would make a
+        # correct column look untrustworthy.
+        if substituted is not None and fallback:
             substituted.append("")
-        return str(constraint.fallback_value or "")
+        return fallback
 
     if constraint.kind == "yes_no":
         lowered = normalized.lower()

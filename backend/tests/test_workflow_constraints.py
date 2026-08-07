@@ -314,13 +314,27 @@ class SubstitutionReportingTests(unittest.TestCase):
         self.assertEqual(_coerce_column_output_value("Not sure", self._constraint(), notes), "Not sure")
         self.assertEqual(notes, [], "the model chose this value; it was not substituted")
 
-    def test_an_empty_answer_is_reported(self) -> None:
-        """An empty answer also becomes the fallback, so it counts too."""
+    def test_an_empty_answer_is_reported_when_a_fallback_replaces_it(self) -> None:
         from backend.storage.attached_repository import _coerce_column_output_value
 
         notes: list[str] = []
         self.assertEqual(_coerce_column_output_value("", self._constraint(), notes), "Not sure")
         self.assertEqual(notes, [""])
+
+    def test_an_empty_answer_is_not_reported_when_empty_is_the_answer(self) -> None:
+        """`Video link (URL)` says to return an empty value when there is no video.
+
+        27 of its 42 rows were correctly blank, and counting each as a
+        substitution made a column with zero misses and zero inventions look
+        like it needed checking.
+        """
+        from backend.models.repository import RepositoryColumnOutputConstraint
+        from backend.storage.attached_repository import _coerce_column_output_value
+
+        free_text = RepositoryColumnOutputConstraint(kind="text", fallback_value="")
+        notes: list[str] = []
+        self.assertEqual(_coerce_column_output_value("", free_text, notes), "")
+        self.assertEqual(notes, [], "empty is this column's correct answer, not a decline")
 
     def test_update_source_cannot_carry_the_stale_mark(self) -> None:
         """Why the mark is cleared in the run's own state write, not via a patch.
