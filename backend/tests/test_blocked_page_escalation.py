@@ -5,8 +5,10 @@ that serve normal content to a real browser. The pipeline already ships a
 headless renderer and already falls back to it when extracted text looks thin;
 these tests cover using it on the one case where it was previously skipped.
 
-A page that genuinely requires solving a CAPTCHA or signing in still fails --
-recovering those is not something the pipeline attempts.
+A page that genuinely requires solving a CAPTCHA or signing in is not recovered
+-- that is not something the pipeline attempts. Such a row reports `blocked`
+rather than `failed`: the wall was reached and verified, which is a different
+outcome from a page that is simply not there (a 404 still reports `failed`).
 """
 
 from __future__ import annotations
@@ -163,7 +165,9 @@ class BlockedPageEscalationTests(unittest.TestCase):
         row, notes = self.run_fetch(renderer)
 
         self.assertEqual(renderer.render_calls, 1)
-        self.assertEqual(row.fetch_status, "failed")
+        # `blocked`, not `failed`: the wall was reached and verified. A fetch
+        # that is missing (404) still reports `failed` -- see the 404 test.
+        self.assertEqual(row.fetch_status, "blocked")
         self.assertIn(NOTE_BLOCKED_REQUEST, notes)
         self.assertNotIn(NOTE_BLOCKED_RECOVERED_BY_BROWSER, notes)
 
@@ -171,7 +175,9 @@ class BlockedPageEscalationTests(unittest.TestCase):
         renderer = _Renderer(error="playwright_not_installed")
         row, notes = self.run_fetch(renderer)
 
-        self.assertEqual(row.fetch_status, "failed")
+        # The page is a challenge page whether or not a browser was available
+        # to try it, so the row records what it is rather than how we gave up.
+        self.assertEqual(row.fetch_status, "blocked")
         self.assertIn(NOTE_BLOCKED_REQUEST, notes)
         # The reason the escalation could not help is recorded for the report.
         self.assertTrue(any("playwright" in note for note in notes))
@@ -239,7 +245,9 @@ class BlockedPageEscalationTests(unittest.TestCase):
         row, notes = self.run_fetch(renderer, status=403)
 
         self.assertEqual(renderer.render_calls, 1)
-        self.assertEqual(row.fetch_status, "failed")
+        # Evading the pattern check is not evading verification: the interstitial
+        # yields no readable text, so the row is `blocked` rather than recovered.
+        self.assertEqual(row.fetch_status, "blocked")
         self.assertNotIn(NOTE_BLOCKED_RECOVERED_BY_BROWSER, notes)
 
     def test_a_plain_text_refusal_still_reaches_the_escalation(self) -> None:

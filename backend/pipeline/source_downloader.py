@@ -16,7 +16,7 @@ import tempfile
 import threading
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypeVar
@@ -54,6 +54,14 @@ from backend.models.sources import (
     SourceManifestArtifact,
     SourceManifestRow,
     SourcePhaseMetadata,
+)
+from backend.pipeline.fetch_verification import (
+    BLOCKED_ERROR_CODES,
+    FETCH_VERIFICATION_VERSION,
+    FetchVerdict,
+    FetchVerification,
+    looks_blocked,
+    verify_fetch,
 )
 from backend.pipeline.media_links import (
     DiscoveredMedia,
@@ -608,6 +616,200 @@ def _set_phase_metadata(
     row.phase_metadata[canonical] = metadata
 
 
+DOWNSTREAM_PHASE_STATUS_FIELDS: tuple[tuple[str, str], ...] = (
+    (PHASE_CLEANUP, "llm_cleanup_status"),
+    (PHASE_TITLE, "title_status"),
+    (PHASE_CATALOG, "catalog_status"),
+    (PHASE_CITATION_VERIFY, ""),
+    (PHASE_SUMMARY, "summary_status"),
+    (PHASE_RATING, "rating_status"),
+)
+
+
+def mark_downstream_stale(row: SourceManifestRow, markdown_digest: str) -> list[str]:
+    """Stale every LLM phase whose recorded input digest no longer matches.
+
+    Also *clears* stale on phases that do still match, so re-running conversion
+    without changing the text does not leave false staleness behind.
+    """
+    staled: list[str] = []
+    for phase, status_field in DOWNSTREAM_PHASE_STATUS_FIELDS:
+        metadata = _get_phase_metadata(row, phase)
+        if metadata is None:
+            continue
+        if not metadata.content_digest or metadata.content_digest == markdown_digest:
+            metadata.stale = False
+            _set_phase_metadata(row, phase, metadata)
+            continue
+        metadata.status = "stale"
+        metadata.stale = True
+        metadata.completed_at = _utc_now_iso()
+        _set_phase_metadata(row, phase, metadata)
+        if status_field:
+            setattr(row, status_field, "stale")
+        staled.append(phase)
+    return staled
+
+
+# Phase status values that mean real derived output exists for a row.
+DERIVED_OUTPUT_STATUSES = frozenset(
+    {"existing", "generated", "cleaned", "extracted", "completed"}
+)
+
+
+def mark_downstream_stale_for_blocked(row: SourceManifestRow) -> list[str]:
+    """Stale every LLM phase unconditionally after a row is revealed as blocked.
+
+    Distinct from `mark_downstream_stale` because retroactive re-verification
+    does not rewrite the markdown: the bytes are identical, so digests still
+    match and the digest-comparing version would clear staleness rather than set
+    it. What changed is our understanding of the *input* — those summaries and
+    ratings describe a bot wall, and have to be redone.
+
+    Older rows often carry a completed `*_status` with no matching phase
+    metadata, so both are consulted before deciding a phase produced nothing.
+    """
+    staled: list[str] = []
+    for phase, status_field in DOWNSTREAM_PHASE_STATUS_FIELDS:
+        metadata = _get_phase_metadata(row, phase)
+        field_status = (
+            str(getattr(row, status_field, "") or "").strip().lower() if status_field else ""
+        )
+        has_metadata_output = metadata is not None and (
+            metadata.status in {"completed", "stale"} or bool(metadata.completed_at)
+        )
+        has_field_output = field_status in DERIVED_OUTPUT_STATUSES
+        if not has_metadata_output and not has_field_output:
+            continue
+
+        if metadata is None:
+            metadata = SourcePhaseMetadata(phase=phase)
+        metadata.status = "stale"
+        metadata.stale = True
+        metadata.completed_at = _utc_now_iso()
+        _set_phase_metadata(row, phase, metadata)
+        if status_field:
+            setattr(row, status_field, "stale")
+        staled.append(phase)
+    return staled
+
+
+# Artifact paths. These live at module level so anything writing into a source
+# — the downloader, an interactive capture, a manual upload — produces the exact
+# same filenames rather than inventing a parallel convention.
+
+
+def source_file_rel(
+    source_id: str,
+    filename: str,
+    subdir: str,
+    *,
+    writes_to_repository: bool,
+) -> Path:
+    if writes_to_repository:
+        return Path("sources") / source_id / filename
+    return Path(subdir) / filename
+
+
+def raw_file_rel(source_id: str, suffix: str, *, writes_to_repository: bool) -> Path:
+    return source_file_rel(
+        source_id, f"{source_id}_source{suffix}", "originals",
+        writes_to_repository=writes_to_repository,
+    )
+
+
+def rendered_html_rel(source_id: str, *, writes_to_repository: bool) -> Path:
+    return source_file_rel(
+        source_id, f"{source_id}_rendered.html", "rendered",
+        writes_to_repository=writes_to_repository,
+    )
+
+
+def rendered_pdf_rel(source_id: str, *, writes_to_repository: bool) -> Path:
+    return source_file_rel(
+        source_id, f"{source_id}_rendered.pdf", "rendered",
+        writes_to_repository=writes_to_repository,
+    )
+
+
+def ocr_pdf_rel(source_id: str, *, writes_to_repository: bool) -> Path:
+    return source_file_rel(
+        source_id, f"{source_id}_source.ocr.pdf", "originals",
+        writes_to_repository=writes_to_repository,
+    )
+
+
+def markdown_rel(source_id: str, *, writes_to_repository: bool) -> Path:
+    return source_file_rel(
+        source_id, f"{source_id}_clean.md", "markdown",
+        writes_to_repository=writes_to_repository,
+    )
+
+
+def metadata_rel(source_id: str, *, writes_to_repository: bool) -> Path:
+    if writes_to_repository:
+        return Path("sources") / source_id / f"{source_id}_metadata.json"
+    return Path("metadata") / f"{source_id}.json"
+
+
+# Every signal the verifier looks at lives in the head of the document, so a
+# retroactive pass never needs to read a whole file.
+REVERIFY_READ_BYTES = 65536
+
+
+def effective_markdown_rel_path(row: SourceManifestRow, base_dir: Path) -> str:
+    """The markdown that best represents this source right now.
+
+    Prefers the LLM-cleaned copy, but only while it is current — a stale cleanup
+    describes an older fetch.
+    """
+    cleanup_metadata = _get_phase_metadata(row, PHASE_CLEANUP)
+    cleanup_is_current = not (
+        cleanup_metadata is not None
+        and (cleanup_metadata.stale or str(cleanup_metadata.status or "").strip().lower() == "stale")
+    )
+    if cleanup_is_current and row.llm_cleanup_file and _has_output_file(base_dir, row.llm_cleanup_file):
+        return row.llm_cleanup_file
+    if row.markdown_file and _has_output_file(base_dir, row.markdown_file):
+        return row.markdown_file
+    # Metadata snapshots sometimes lost the path; fall back to the convention.
+    conventional = f"sources/{row.id}/{row.id}_clean.md"
+    if _has_output_file(base_dir, conventional):
+        return conventional
+    return ""
+
+
+def reverify_row_from_artifacts(
+    row: SourceManifestRow,
+    base_dir: Path,
+) -> FetchVerification | None:
+    """Re-score an already-fetched row from what is on disk. No network."""
+    if row.source_kind == "uploaded_document":
+        return None
+    if str(row.fetch_status or "").strip().lower() == "not_applicable":
+        return None
+
+    rel_path = effective_markdown_rel_path(row, base_dir)
+    text = ""
+    if rel_path:
+        try:
+            with (base_dir / rel_path).open("r", encoding="utf-8", errors="replace") as handle:
+                text = handle.read(REVERIFY_READ_BYTES)
+        except OSError:
+            text = ""
+
+    return verify_fetch(
+        http_status=row.http_status,
+        final_url=row.final_url or row.original_url,
+        title=row.title,
+        raw_html="",
+        extracted_text=text,
+        content_type=row.content_type,
+        detected_type=row.detected_type,
+        source_kind=row.source_kind,
+    )
+
+
 def _normalize_row_phase_metadata(row: SourceManifestRow) -> SourceManifestRow:
     if not row.phase_metadata:
         return row
@@ -631,6 +833,69 @@ def _normalize_row_phase_metadata(row: SourceManifestRow) -> SourceManifestRow:
     return row
 
 
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+DEFAULT_ACCEPT_HEADER = (
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+)
+
+BROWSER_PROFILE_DIR_NAME = "browser_profile"
+BROWSER_STORAGE_STATE_FILE = "storage_state.json"
+BROWSER_PROFILE_META_FILE = "profile.json"
+
+
+@dataclass
+class BrowserProfile:
+    """Cookies and identity captured from a real browsing session.
+
+    Reused by automated fetches so a challenge the user solved once keeps
+    working. The user agent matters as much as the cookies: `cf_clearance` is
+    bound to IP *and* user agent, so replaying the cookie under a different
+    agent string voids it.
+    """
+
+    storage_state_path: Path | None = None
+    user_agent: str = ""
+    cookies: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def effective_user_agent(self) -> str:
+        return self.user_agent or DEFAULT_USER_AGENT
+
+
+def load_browser_profile(repo_internal_dir: Path | None) -> BrowserProfile:
+    """Read whatever the interactive browser last saved. Missing is fine."""
+    profile = BrowserProfile()
+    if repo_internal_dir is None:
+        return profile
+
+    profile_root = repo_internal_dir / BROWSER_PROFILE_DIR_NAME
+    storage_state = profile_root / BROWSER_STORAGE_STATE_FILE
+    if storage_state.is_file():
+        profile.storage_state_path = storage_state
+        try:
+            payload = json.loads(storage_state.read_text(encoding="utf-8"))
+            for cookie in payload.get("cookies", []) or []:
+                name = str(cookie.get("name") or "")
+                if name:
+                    profile.cookies[name] = str(cookie.get("value") or "")
+        except Exception:
+            logger.debug("could not read captured cookies", exc_info=True)
+
+    meta = profile_root / BROWSER_PROFILE_META_FILE
+    if meta.is_file():
+        try:
+            profile.user_agent = str(
+                json.loads(meta.read_text(encoding="utf-8")).get("user_agent") or ""
+            )
+        except Exception:
+            logger.debug("could not read captured user agent", exc_info=True)
+
+    return profile
+
+
 class PlaywrightRenderer:
     """Lazily initialized Playwright HTML renderer."""
 
@@ -639,12 +904,19 @@ class PlaywrightRenderer:
         timeout_ms: int = PLAYWRIGHT_TIMEOUT_MS,
         startup_error: str = "",
         ocr_fallback_enabled: bool = True,
+        browser_profile: BrowserProfile | None = None,
     ):
         self.timeout_ms = timeout_ms
         self.ocr_fallback_enabled = ocr_fallback_enabled
+        self.browser_profile = browser_profile or BrowserProfile()
         self._playwright = None
         self._browser = None
+        self._context = None
         self._startup_error: str = startup_error
+
+    def _new_page(self, **kwargs):
+        """Pages come from the shared context so captured cookies apply."""
+        return self._context.new_page(**kwargs)
 
     def render(self, url: str) -> tuple[str, str]:
         if self._startup_error:
@@ -655,7 +927,7 @@ class PlaywrightRenderer:
             self._startup_error = _normalize_playwright_error(exc)
             return "", self._startup_error
 
-        page = self._browser.new_page()
+        page = self._new_page()
         try:
             page.goto(url, wait_until="networkidle", timeout=self.timeout_ms)
             return page.content(), ""
@@ -673,7 +945,7 @@ class PlaywrightRenderer:
             self._startup_error = _normalize_playwright_error(exc)
             return b"", self._startup_error, []
 
-        page = self._browser.new_page(
+        page = self._new_page(
             viewport={
                 "width": PLAYWRIGHT_VIEWPORT_WIDTH,
                 "height": PLAYWRIGHT_VIEWPORT_HEIGHT,
@@ -800,9 +1072,29 @@ class PlaywrightRenderer:
         from playwright.sync_api import sync_playwright
 
         self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch(headless=True)
+        self._browser = self._playwright.chromium.launch(
+            headless=True,
+            ignore_default_args=["--enable-automation"],
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context_options: dict = {
+            "viewport": {
+                "width": PLAYWRIGHT_VIEWPORT_WIDTH,
+                "height": PLAYWRIGHT_VIEWPORT_HEIGHT,
+            },
+            "user_agent": self.browser_profile.effective_user_agent,
+            "locale": "en-US",
+        }
+        if self.browser_profile.storage_state_path is not None:
+            context_options["storage_state"] = str(self.browser_profile.storage_state_path)
+        self._context = self._browser.new_context(**context_options)
 
     def close(self) -> None:
+        try:
+            if self._context is not None:
+                self._context.close()
+        except Exception:
+            pass
         try:
             if self._browser is not None:
                 self._browser.close()
@@ -1053,6 +1345,7 @@ class SourceDownloadOrchestrator:
             success_count=counts["success"],
             failed_count=counts["failed"],
             partial_count=counts["partial"],
+            blocked_count=counts["blocked"],
         )
         self.store.save_artifact(
             self.job_id, "06_sources_manifest", artifact.model_dump()
@@ -1145,9 +1438,15 @@ class SourceDownloadOrchestrator:
                     renderer_startup_error = (
                         f"playwright_not_installed: run `{INSTALL_BOOTSTRAP_COMMAND}`"
                     )
+            # Cookies and the user agent from any interactive session the user
+            # ran, so a challenge solved once keeps working for later fetches.
+            browser_profile = load_browser_profile(
+                self.output_dir / ".ra_repo" if self.writes_to_repository else None
+            )
             renderer = PlaywrightRenderer(
                 startup_error=renderer_startup_error,
                 ocr_fallback_enabled=self.output_options.include_ocr_pdf,
+                browser_profile=browser_profile,
             )
 
             cancelled = False
@@ -1155,9 +1454,14 @@ class SourceDownloadOrchestrator:
                 with httpx.Client(
                     timeout=timeout,
                     follow_redirects=True,
+                    cookies=browser_profile.cookies or None,
                     headers={
-                        "User-Agent": "ResearchAssistant/0.1 (+local source downloader)",
-                        "Accept": "*/*",
+                        # A bot-shaped user agent is itself a common cause of
+                        # soft blocks, and it must match the captured browser or
+                        # cookies bound to that agent are void.
+                        "User-Agent": browser_profile.effective_user_agent,
+                        "Accept": DEFAULT_ACCEPT_HEADER,
+                        "Accept-Language": "en-US,en;q=0.9",
                     },
                 ) as client:
                     for idx, target in enumerate(targets):
@@ -1238,6 +1542,7 @@ class SourceDownloadOrchestrator:
                 success_count=counts["success"],
                 failed_count=counts["failed"],
                 partial_count=counts["partial"],
+                blocked_count=counts["blocked"],
             )
             output_summary = summarize_output_rows(final_rows)
 
@@ -1584,28 +1889,61 @@ class SourceDownloadOrchestrator:
             metadata.prompt_version = prompt_version
         _set_phase_metadata(row, canonical, metadata)
 
+    def _verify_row(
+        self,
+        row: SourceManifestRow,
+        *,
+        http_status: int | None,
+        raw_html: str = "",
+        extracted_text: str = "",
+    ) -> FetchVerification:
+        """Score what was fetched and record the verdict on the row."""
+        verification = verify_fetch(
+            http_status=http_status,
+            final_url=row.final_url,
+            title=row.title,
+            raw_html=raw_html,
+            extracted_text=extracted_text,
+            content_type=row.content_type,
+            detected_type=row.detected_type,
+            source_kind=row.source_kind,
+        )
+        # Without conversion there is no text to judge, so "empty" would report a
+        # verdict we never actually reached. Leave the field blank instead.
+        if verification.verdict == FetchVerdict.EMPTY and not self.run_convert:
+            row.fetch_verification = ""
+        else:
+            row.fetch_verification = verification.reason
+        return verification
+
+    def _skip_phase_for_blocked_fetch(
+        self,
+        row: SourceManifestRow,
+        phase: str,
+        status_field: str,
+    ) -> bool:
+        """Keep an LLM phase from running against a block page.
+
+        Cataloguing and rating a Cloudflare interstitial burns tokens and, worse,
+        writes plausible-looking metadata that describes the wall rather than the
+        source. Conversion is deliberately *not* gated: the extracted block text
+        is the evidence the Resolve Fetches page shows the user.
+        """
+        if str(row.fetch_status or "").strip().lower() != "blocked":
+            return False
+        if status_field:
+            setattr(row, status_field, "skipped_blocked_fetch")
+        self._complete_row_phase(
+            row,
+            phase,
+            status="skipped",
+            error="blocked_fetch: source content is a block or challenge page",
+            error_code="blocked_fetch",
+        )
+        return True
+
     def _mark_downstream_stale(self, row: SourceManifestRow, markdown_digest: str) -> None:
-        for phase, status_field in (
-            (PHASE_CLEANUP, "llm_cleanup_status"),
-            (PHASE_TITLE, "title_status"),
-            (PHASE_CATALOG, "catalog_status"),
-            (PHASE_CITATION_VERIFY, ""),
-            (PHASE_SUMMARY, "summary_status"),
-            (PHASE_RATING, "rating_status"),
-        ):
-            metadata = _get_phase_metadata(row, phase)
-            if metadata is None:
-                continue
-            if not metadata.content_digest or metadata.content_digest == markdown_digest:
-                metadata.stale = False
-                _set_phase_metadata(row, phase, metadata)
-                continue
-            metadata.status = "stale"
-            metadata.stale = True
-            metadata.completed_at = _utc_now_iso()
-            _set_phase_metadata(row, phase, metadata)
-            if status_field:
-                setattr(row, status_field, "stale")
+        mark_downstream_stale(row, markdown_digest)
 
     def _effective_markdown_rel_path(self, row: SourceManifestRow) -> str:
         cleanup_metadata = _get_phase_metadata(row, PHASE_CLEANUP)
@@ -1631,21 +1969,21 @@ class SourceDownloadOrchestrator:
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
     def _source_file_rel(self, row: SourceManifestRow, filename: str, subdir: str) -> Path:
-        if self.writes_to_repository:
-            return Path("sources") / row.id / filename
-        return Path(subdir) / filename
+        return source_file_rel(
+            row.id, filename, subdir, writes_to_repository=self.writes_to_repository
+        )
 
     def _raw_file_rel(self, row: SourceManifestRow, suffix: str) -> Path:
-        return self._source_file_rel(row, f"{row.id}_source{suffix}", "originals")
+        return raw_file_rel(row.id, suffix, writes_to_repository=self.writes_to_repository)
 
     def _rendered_html_rel(self, row: SourceManifestRow) -> Path:
-        return self._source_file_rel(row, f"{row.id}_rendered.html", "rendered")
+        return rendered_html_rel(row.id, writes_to_repository=self.writes_to_repository)
 
     def _rendered_pdf_rel(self, row: SourceManifestRow) -> Path:
-        return self._source_file_rel(row, f"{row.id}_rendered.pdf", "rendered")
+        return rendered_pdf_rel(row.id, writes_to_repository=self.writes_to_repository)
 
     def _ocr_pdf_rel(self, row: SourceManifestRow) -> Path:
-        return self._source_file_rel(row, f"{row.id}_source.ocr.pdf", "originals")
+        return ocr_pdf_rel(row.id, writes_to_repository=self.writes_to_repository)
 
     def _video_rel(self, row: SourceManifestRow, suffix: str) -> Path:
         return self._source_file_rel(row, f"{row.id}_video{suffix}", "media")
@@ -1657,7 +1995,7 @@ class SourceDownloadOrchestrator:
         return self._source_file_rel(row, f"{row.id}_thumbnail{suffix}", "media")
 
     def _markdown_rel(self, row: SourceManifestRow) -> Path:
-        return self._source_file_rel(row, f"{row.id}_clean.md", "markdown")
+        return markdown_rel(row.id, writes_to_repository=self.writes_to_repository)
 
     def _llm_cleanup_rel(self, row: SourceManifestRow) -> Path:
         return self._source_file_rel(row, f"{row.id}_llm_clean.md", "markdown")
@@ -1672,9 +2010,7 @@ class SourceDownloadOrchestrator:
         return self._source_file_rel(row, f"{row.id}_rating.json", "ratings")
 
     def _metadata_rel(self, row: SourceManifestRow) -> Path:
-        if self.writes_to_repository:
-            return Path("sources") / row.id / f"{row.id}_metadata.json"
-        return Path("metadata") / f"{row.id}.json"
+        return metadata_rel(row.id, writes_to_repository=self.writes_to_repository)
 
     def _should_skip_successful_target(
         self, target: SourceTarget, rows_by_id: dict[str, SourceManifestRow]
@@ -1689,7 +2025,9 @@ class SourceDownloadOrchestrator:
             return False
         if self.force_redownload:
             return False
-        if existing_row.fetch_status == "failed":
+        # A blocked row has artifacts on disk, but they are the block page, so
+        # the artifact checks below would wrongly conclude there is nothing to do.
+        if existing_row.fetch_status in {"failed", "blocked"}:
             return False
         if existing_row.fetch_status in {"", "queued"}:
             return False
@@ -1803,6 +2141,7 @@ class SourceDownloadOrchestrator:
         item = self._status_items.get(row.id)
         if item:
             item.fetch_status = row.fetch_status
+            item.fetch_verification = row.fetch_verification
             item.catalog_status = row.catalog_status
             item.citation_verification_status = _row_citation_verification_status(
                 row, self.output_dir
@@ -1832,6 +2171,8 @@ class SourceDownloadOrchestrator:
             self.status.skipped_count += 1
         else:
             self.status.failed_count += 1
+        if str(row.fetch_status or "").strip().lower() == "blocked":
+            self.status.blocked_count += 1
         self.status.message = self._compose_status_message(
             f"Processed {self.status.processed_urls}/{self.status.total_urls} URLs"
         )
@@ -1885,13 +2226,15 @@ class SourceDownloadOrchestrator:
         self.status.success_count = artifact.success_count
         self.status.failed_count = artifact.failed_count
         self.status.partial_count = artifact.partial_count
+        self.status.blocked_count = artifact.blocked_count
         self.status.completed_at = _utc_now_iso()
         self.status.stop_after_current_item = False
         self.status.current_item_id = ""
         self.status.current_url = ""
+        blocked_detail = f", {artifact.blocked_count} blocked" if artifact.blocked_count else ""
         self.status.message = self._compose_status_message(
             f"Completed: {artifact.success_count} success, "
-            f"{artifact.partial_count} partial, {artifact.failed_count} failed"
+            f"{artifact.partial_count} partial, {artifact.failed_count} failed{blocked_detail}"
         )
         self.status.bundle_file = bundle_path.name if bundle_path else ""
         self.status.output_summary = output_summary
@@ -1931,6 +2274,7 @@ class SourceDownloadOrchestrator:
         self.status.success_count = artifact.success_count
         self.status.failed_count = artifact.failed_count
         self.status.partial_count = artifact.partial_count
+        self.status.blocked_count = artifact.blocked_count
         self.status.processed_urls = min(self.status.processed_urls, self.status.total_urls)
         detail = (
             "Stopped after the current item"
@@ -2109,6 +2453,7 @@ class SourceDownloadOrchestrator:
                 content_digest=row.sha256,
                 error="not_applicable: uploaded repository document",
                 error_code="not_applicable",
+                prompt_version=FETCH_VERIFICATION_VERSION,
             )
             self._activate_postprocess_phases()
             return self._finalize_row(row, notes, event, update_fetched_at=False)
@@ -2143,6 +2488,7 @@ class SourceDownloadOrchestrator:
                     if row.fetch_status == "failed"
                     else ""
                 ),
+                prompt_version=FETCH_VERIFICATION_VERSION,
             )
             self._activate_postprocess_phases()
             return self._finalize_row(row, notes, event)
@@ -2211,7 +2557,8 @@ class SourceDownloadOrchestrator:
         # and anything reading phase metadata would then chase a non-problem.
         row_obtained_content = str(row.fetch_status or "").strip() in {"success", "partial"}
         if (
-            (not row_obtained_content and (row.http_status or 0) >= 400)
+            row.fetch_status == "blocked"
+            or (not row_obtained_content and (row.http_status or 0) >= 400)
             or fetch_error_code in {
                 "invalid_url",
                 "timeout",
@@ -2219,6 +2566,7 @@ class SourceDownloadOrchestrator:
                 "blocked_request",
                 "unsupported_content",
             }
+            or fetch_error_code in BLOCKED_ERROR_CODES
         ):
             fetch_status = "failed"
             fetch_error = row.error_message
@@ -2229,6 +2577,7 @@ class SourceDownloadOrchestrator:
             content_digest=row.sha256,
             error=fetch_error,
             error_code=fetch_error_code if fetch_status == "failed" else "",
+            prompt_version=FETCH_VERIFICATION_VERSION,
         )
         self._activate_postprocess_phases()
 
@@ -2281,6 +2630,11 @@ class SourceDownloadOrchestrator:
         response: httpx.Response,
         notes: list[str],
     ) -> None:
+        # Publishers routinely serve a login or challenge interstitial from a
+        # `.pdf` URL. Judge it as the HTML page it really is.
+        if self._handle_interstitial_at_binary_url(row, response, notes):
+            return
+
         if self.output_options.include_raw_file:
             rel_path = self._raw_file_rel(row, ".pdf")
             row.raw_file = rel_path.as_posix()
@@ -2294,6 +2648,7 @@ class SourceDownloadOrchestrator:
         else:
             self._write_searchable_pdf_copy(row, response.content, notes)
             if not self.run_convert:
+                self._verify_row(row, http_status=response.status_code)
                 row.fetch_status = "success"
                 return
 
@@ -2301,6 +2656,18 @@ class SourceDownloadOrchestrator:
                 response.content
             )
             notes.extend(conversion_notes)
+
+            verification = self._verify_row(
+                row,
+                http_status=response.status_code,
+                extracted_text=markdown_text,
+            )
+            if verification.is_blocked:
+                notes.append(NOTE_BLOCKED_REQUEST)
+                notes.append(f"verify_{verification.reason}")
+                row.fetch_status = "blocked"
+                row.error_message = f"{verification.reason}: {verification.message}"
+                return
 
             if markdown_text:
                 markdown_rel = self._markdown_rel(row)
@@ -2313,6 +2680,44 @@ class SourceDownloadOrchestrator:
                 row.fetch_status = "partial"
                 row.error_message = "extraction_failure: markdown not generated"
                 notes.append(NOTE_EXTRACTION_FAILURE)
+
+    def _handle_interstitial_at_binary_url(
+        self,
+        row: SourceManifestRow,
+        response: httpx.Response,
+        notes: list[str],
+    ) -> bool:
+        """Catch an HTML wall served where a binary document was expected.
+
+        Returns True when the response was a block page and the row has been
+        marked accordingly.
+        """
+        body = response.content or b""
+        head = body[:1024].lstrip().lower()
+        if not (head.startswith(b"<!doctype html") or head.startswith(b"<html")):
+            return False
+
+        html_text = decode_bytes_to_text(body)
+        verification = verify_fetch(
+            http_status=response.status_code,
+            final_url=row.final_url,
+            title=extract_title(html_text) or row.title,
+            raw_html=html_text,
+            extracted_text="",
+            content_type=row.content_type,
+            detected_type="html",
+            source_kind=row.source_kind,
+        )
+        if not verification.is_blocked:
+            return False
+
+        row.fetch_verification = verification.reason
+        row.fetch_status = "blocked"
+        row.error_message = f"{verification.reason}: {verification.message}"
+        row.title = row.title or extract_title(html_text)
+        notes.append(NOTE_BLOCKED_REQUEST)
+        notes.append(f"verify_{verification.reason}")
+        return True
 
     def _collect_media_links(
         self,
@@ -2727,6 +3132,7 @@ class SourceDownloadOrchestrator:
 
         self._collect_media_links(row, raw_html, rendered_html, notes)
 
+        markdown_to_write = ""
         if self.run_convert:
             markdown_to_write = raw_markdown
             used_fallback = raw_used_fallback
@@ -2746,9 +3152,31 @@ class SourceDownloadOrchestrator:
                     f"{extraction_method}_fallback" if used_fallback else extraction_method
                 )
 
+        # Judge what we actually got. A bot wall or cookie gate answers 200 with
+        # a perfectly valid page, so the HTTP status alone proves nothing.
+        #
+        # A page recovered in the browser is judged on what the browser got, not
+        # on the status the plain client was refused with. That 4xx belongs to a
+        # request this row no longer holds the body of, and counting it as
+        # evidence marks a fetch that worked as blocked.
+        verification = self._verify_row(
+            row,
+            http_status=None if recovered_via_browser else response.status_code,
+            raw_html=rendered_html or raw_html,
+            extracted_text=markdown_to_write,
+        )
+
+        if verification.is_blocked:
+            notes.append(NOTE_BLOCKED_REQUEST)
+            notes.append(f"verify_{verification.reason}")
+            row.fetch_status = "blocked"
+            row.error_message = f"{verification.reason}: {verification.message}"
+            return
+
         if blocked_by_challenge:
             notes.append(NOTE_BLOCKED_REQUEST)
-            row.fetch_status = "failed"
+            row.fetch_status = "blocked"
+            row.fetch_verification = FetchVerdict.BLOCKED_CHALLENGE.value
             row.error_message = blocked_error_message(response.status_code)
             return
 
@@ -2764,6 +3192,12 @@ class SourceDownloadOrchestrator:
             return
 
         if row.markdown_file:
+            # Content came through, but there was barely any of it.
+            if verification.verdict == FetchVerdict.THIN_CONTENT:
+                row.fetch_status = "partial"
+                notes.append(NOTE_EXTRACTION_FAILURE)
+                row.error_message = f"{verification.reason}: {verification.message}"
+                return
             row.fetch_status = "success"
             return
 
@@ -2782,6 +3216,9 @@ class SourceDownloadOrchestrator:
         response: httpx.Response,
         notes: list[str],
     ) -> None:
+        if self._handle_interstitial_at_binary_url(row, response, notes):
+            return
+
         extension = infer_document_extension(
             final_url=row.final_url,
             content_type=row.content_type,
@@ -2802,6 +3239,7 @@ class SourceDownloadOrchestrator:
 
         notes.append("download_only")
         if not self.run_convert:
+            self._verify_row(row, http_status=response.status_code)
             row.fetch_status = "success"
             return
 
@@ -2810,6 +3248,18 @@ class SourceDownloadOrchestrator:
             binary_content=response.content,
         )
         notes.extend(conversion_notes)
+
+        verification = self._verify_row(
+            row,
+            http_status=response.status_code,
+            extracted_text=markdown_text,
+        )
+        if verification.is_blocked:
+            notes.append(NOTE_BLOCKED_REQUEST)
+            notes.append(f"verify_{verification.reason}")
+            row.fetch_status = "blocked"
+            row.error_message = f"{verification.reason}: {verification.message}"
+            return
 
         if markdown_text:
             markdown_rel = self._markdown_rel(row)
@@ -3176,6 +3626,10 @@ class SourceDownloadOrchestrator:
                 row.llm_cleanup_status = "not_requested"
             return
 
+        if self._skip_phase_for_blocked_fetch(row, PHASE_CLEANUP, "llm_cleanup_status"):
+            row.llm_cleanup_needed = False
+            return
+
         if not row.markdown_file:
             row.llm_cleanup_status = "missing_markdown"
             row.llm_cleanup_needed = False
@@ -3284,6 +3738,9 @@ class SourceDownloadOrchestrator:
         if not self.run_catalog:
             if not row.catalog_status and not str(row.catalog_file or "").strip():
                 row.catalog_status = "not_requested"
+            return
+
+        if self._skip_phase_for_blocked_fetch(row, PHASE_CATALOG, "catalog_status"):
             return
 
         source_digest = self._effective_markdown_digest(row)
@@ -3432,6 +3889,9 @@ class SourceDownloadOrchestrator:
         notes: list[str],
     ) -> None:
         if not self.run_citation_verify:
+            return
+
+        if self._skip_phase_for_blocked_fetch(row, PHASE_CITATION_VERIFY, ""):
             return
 
         source_digest = self._effective_markdown_digest(row)
@@ -3742,6 +4202,9 @@ class SourceDownloadOrchestrator:
                 row.title_status = "not_requested"
             return
 
+        if self._skip_phase_for_blocked_fetch(row, PHASE_TITLE, "title_status"):
+            return
+
         if row.title and not self.force_title:
             row.title_status = row.title_status or "existing"
             sync_catalog_title()
@@ -3831,6 +4294,9 @@ class SourceDownloadOrchestrator:
                 row.summary_status = row.summary_status or "existing"
             elif not row.summary_status:
                 row.summary_status = "not_requested"
+            return
+
+        if self._skip_phase_for_blocked_fetch(row, PHASE_SUMMARY, "summary_status"):
             return
 
         source_digest = self._effective_markdown_digest(row)
@@ -3971,6 +4437,9 @@ class SourceDownloadOrchestrator:
                 row.rating_status = row.rating_status or "existing"
             elif not row.rating_status:
                 row.rating_status = "not_requested"
+            return
+
+        if self._skip_phase_for_blocked_fetch(row, PHASE_RATING, "rating_status"):
             return
 
         source_digest = self._effective_markdown_digest(row)
@@ -6194,7 +6663,7 @@ def build_ris_record(citation: CitationMetadata) -> str:
 
 
 def _count_fetch_outcomes(rows: list[SourceManifestRow]) -> dict[str, int]:
-    counts = {"success": 0, "failed": 0, "partial": 0}
+    counts = {"success": 0, "failed": 0, "partial": 0, "blocked": 0}
     for row in rows:
         outcome = _row_task_outcome(row)
         if outcome == "success":
@@ -6203,6 +6672,10 @@ def _count_fetch_outcomes(rows: list[SourceManifestRow]) -> dict[str, int]:
             counts["partial"] += 1
         elif outcome == "failed":
             counts["failed"] += 1
+        # Blocked rows also count as failed above; this is the subset the user
+        # can actually do something about from the Resolve Fetches page.
+        if str(row.fetch_status or "").strip().lower() == "blocked":
+            counts["blocked"] += 1
     return counts
 
 
@@ -6359,6 +6832,7 @@ def _phase_status_outcome(value: str) -> str:
         return "skipped"
     if normalized in {
         "failed",
+        "blocked",
         "missing_markdown",
         "missing_project_profile",
         "invalid_url",
@@ -7273,42 +7747,12 @@ def blocked_error_message(status_code: int) -> str:
 
 
 def detect_blocked_page(html_text: str, title: str, final_url: str) -> bool:
-    full = html_text or ""
-    sample = full[:20000]
-    title_lower = (title or "").strip().lower()
-    url_lower = (final_url or "").strip().lower()
+    """Pre-render check: is the raw HTML obviously a challenge page?
 
-    if "cdn-cgi/challenge-platform" in url_lower:
-        return True
-    if "just a moment" in title_lower:
-        return True
-    # Searched over the whole document, not the sample: a rendered page can
-    # carry 20k of scripts and inlined styles before its body, which is exactly
-    # how a Reddit block page reached the analysis stage marked `success`. The
-    # weak signals below stay on the sample -- they are for the head, and
-    # scanning a large page for them invites false positives.
-    for pattern in BLOCKED_PAGE_CERTAIN_PATTERNS:
-        if pattern.search(full):
-            return True
-
-    signals = 0
-    for pattern in BLOCKED_PAGE_PATTERNS:
-        if pattern.search(sample):
-            signals += 1
-
-    if "cf-ray" in sample.lower() or "__cf_bm" in sample.lower():
-        signals += 1
-    if "hcaptcha" in sample.lower() or "g-recaptcha" in sample.lower():
-        signals += 1
-    # Length decides how much evidence is enough. A block page is a stub, so a
-    # short page needs less; a long one is far more likely to be an article
-    # *about* blocking that quotes these phrases, and needs more.
-    length = len(sample.strip())
-    if signals and length < BLOCKED_PAGE_SHORT_TEXT_CHARS:
-        signals += 1
-    required = 3 if length > BLOCKED_PAGE_ARTICLE_TEXT_CHARS else 2
-
-    return signals >= required
+    Delegates to `fetch_verification.looks_blocked`; kept as a named function
+    because a decisive result here skips a 20-second Playwright render.
+    """
+    return looks_blocked(raw_html=html_text, title=title, final_url=final_url)
 
 
 def decode_bytes_to_text(data: bytes) -> str:

@@ -13,6 +13,7 @@ interface NavEntry {
 
 export const PRIMARY_NAV: NavEntry[] = [
   { label: "Browser", to: "/browser" },
+  { label: "Resolve Fetches", to: "/resolve-fetches" },
   { label: "Search", to: "/search" },
   { label: "Spreadsheets", to: "/spreadsheets" },
   { label: "AI Guidance", to: "/ai-guidance" },
@@ -166,7 +167,9 @@ export function AppShell() {
   ]);
 
   const repoState = repositoryStatus?.download_state || "idle";
-  const isBrowserRoute = location.pathname === "/browser";
+  // These pages manage their own scrolling (a virtualised table, a canvas
+  // sized to its pane), so the shell must not add a scrollbar around them.
+  const isFullBleedRoute = ["/browser", "/resolve-fetches"].includes(location.pathname);
 
   const refreshLlmLog = useCallback(async () => {
     try {
@@ -344,7 +347,7 @@ export function AppShell() {
         <main
           className={[
             "thin-scrollbar flex min-h-0 flex-1 flex-col bg-surface-container-lowest p-4 pb-24 md:p-6 md:pb-24",
-            isBrowserRoute ? "overflow-hidden" : "overflow-y-auto",
+            isFullBleedRoute ? "overflow-hidden" : "overflow-y-auto",
           ].join(" ")}
         >
           <div className="mb-4 font-mono text-label-sm uppercase tracking-[0.08em] text-on-surface-variant/70">

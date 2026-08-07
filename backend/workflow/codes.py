@@ -53,6 +53,13 @@ CODE_TABLE: dict[str, CodeMeaning] = {
         "browser and was refused again, so another attempt will not help. Download the "
         "document by hand and attach it.",
     ),
+    "blocked_fetch": CodeMeaning(
+        "needs_manual_document",
+        "The phase did not run because the stored content is a block or challenge "
+        "page rather than the document, and analysing it would describe the wall. "
+        "Get the real document -- by hand, or through Resolve Fetches -- and the "
+        "phase will run against it.",
+    ),
     "invalid_url": CodeMeaning(
         "broken_url",
         "The address is not usable. Fix the cell in the source spreadsheet.",

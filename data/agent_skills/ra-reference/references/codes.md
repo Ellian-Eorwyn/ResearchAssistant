@@ -14,6 +14,7 @@ split out for you. `ra triage` groups by them and gives you the remedy.
 
 | code | what it means | worth retrying? |
 |---|---|---|
+| `blocked_fetch` | The phase did not run because the stored content is a block or challenge page rather than the document, and analysing it would describe the wall. Get the real document -- by hand, or through Resolve Fetches -- and the phase will run against it. | no — get the document by hand |
 | `blocked_request` | The site refused the request. The pipeline already retried it in a headless browser and was refused again, so another attempt will not help. Download the document by hand and attach it. | no — get the document by hand |
 | `convert_missing_prerequisite` | There is nothing to convert because the fetched file is missing. Fetch first, or attach the document by hand. | yes, with convert |
 | `extraction_failure` | The page was fetched but no readable text came out of it. Usually a viewer or an app shell. Save the document by hand and attach it. | no — get the document by hand |

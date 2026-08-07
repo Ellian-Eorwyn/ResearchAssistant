@@ -12,6 +12,7 @@ import type {
 
 export { AiGuidancePage } from "./AiGuidancePage";
 export { RepositoryBrowserPage } from "./RepositoryBrowserPage";
+export { ResolveFetchesPage } from "./ResolveFetchesPage";
 export { SearchPage } from "./SearchPage";
 export { SettingsPage } from "./SettingsPage";
 export { SpreadsheetsPage } from "./SpreadsheetsPage";

@@ -30,11 +30,13 @@ class SourceManifestRow(BaseModel):
     citation_number: str = ""
     original_url: str = ""
     final_url: str = ""
-    fetch_status: str = ""
+    fetch_status: str = ""  # queued | success | partial | blocked | failed | not_applicable
+    # ok | blocked_challenge | blocked_http | login_required | paywall | thin_content | empty
+    fetch_verification: str = ""
     http_status: int | None = None
     content_type: str = ""
     detected_type: str = ""  # pdf | html | document | unsupported
-    fetch_method: str = ""  # http | playwright
+    fetch_method: str = ""  # http | playwright | yt_dlp | manual_capture | manual_upload
     title: str = ""
     title_status: str = ""  # not_requested | existing | extracted | generated | failed | skipped_*
     author_names: str = ""
@@ -101,6 +103,7 @@ SOURCE_MANIFEST_COLUMNS = [
     "original_url",
     "final_url",
     "fetch_status",
+    "fetch_verification",
     "http_status",
     "content_type",
     "detected_type",
@@ -155,6 +158,7 @@ class SourceManifestArtifact(BaseModel):
     success_count: int = 0
     failed_count: int = 0
     partial_count: int = 0
+    blocked_count: int = 0
 
 
 class SourceItemStatus(BaseModel):
@@ -164,6 +168,7 @@ class SourceItemStatus(BaseModel):
     source_kind: str = "url"
     status: str = "pending"  # pending | running | completed | failed | skipped | cancelled
     fetch_status: str = ""
+    fetch_verification: str = ""
     catalog_status: str = ""
     citation_verification_status: str = ""
     title_status: str = ""
@@ -257,6 +262,7 @@ class SourceDownloadStatus(BaseModel):
     success_count: int = 0
     failed_count: int = 0
     partial_count: int = 0
+    blocked_count: int = 0
     skipped_count: int = 0
     duplicate_urls_removed: int = 0
     started_at: str | None = None

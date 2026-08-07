@@ -15,6 +15,7 @@ from backend.models.settings import AppSettings, LLMBackendConfig, RepoSettings
 from backend.llm.call_log import get_llm_call_logger
 from backend.routers import (
     agent,
+    capture,
     llm_logs,
     pipeline,
     repository,
@@ -26,6 +27,7 @@ from backend.routers import (
     upload,
     workflow,
 )
+from backend.pipeline.interactive_browser import InteractiveBrowserManager
 from backend.storage.attached_repository import AttachedRepositoryService
 from backend.storage.file_store import FileStore
 from backend.storage.spreadsheet_workspace import SpreadsheetWorkspaceService
@@ -128,6 +130,19 @@ def create_app() -> FastAPI:
     app.include_router(search.router, prefix="/api", tags=["search"])
     app.include_router(spreadsheets.router, prefix="/api", tags=["spreadsheets"])
     app.include_router(workflow.router, prefix="/api", tags=["workflow"])
+    app.include_router(capture.router, prefix="/api", tags=["capture"])
+
+    # The interactive browser binds Playwright's async API to the serving event
+    # loop, so it must be started there rather than lazily inside a request.
+    app.state.interactive_browser = InteractiveBrowserManager()
+
+    @app.on_event("startup")
+    async def _start_interactive_browser() -> None:
+        await app.state.interactive_browser.start()
+
+    @app.on_event("shutdown")
+    async def _stop_interactive_browser() -> None:
+        await app.state.interactive_browser.shutdown()
 
     # Health check
     @app.get("/api/health")

@@ -7,6 +7,7 @@ describe("app navigation config", () => {
   it("keeps the primary nav destinations at top level", () => {
     expect(PRIMARY_NAV).toEqual([
       { label: "Browser", to: "/browser" },
+      { label: "Resolve Fetches", to: "/resolve-fetches" },
       { label: "Search", to: "/search" },
       { label: "Spreadsheets", to: "/spreadsheets" },
       { label: "AI Guidance", to: "/ai-guidance" },

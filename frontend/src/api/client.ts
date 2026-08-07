@@ -1,5 +1,8 @@
 import type {
   AppSettings,
+  CaptureAvailabilityResponse,
+  CaptureInputEvent,
+  CaptureSessionInfo,
   DirectoryListingResponse,
   IngestionProfile,
   IngestionProfileActionResponse,
@@ -18,6 +21,9 @@ import type {
   RepoSettings,
   RepositoryActionResponse,
   RepositoryBundleExportRequest,
+  RepositoryCaptureResponse,
+  RepositoryReverifyFetchesResponse,
+  ResolveSourceListResponse,
   RepositoryColumnConfig,
   RepositoryColumnPromptFixResponse,
   RepositoryColumnRunStartResponse,
@@ -478,4 +484,66 @@ export const api = {
     apiPost<SearchImportResponse>(`search/${encodeURIComponent(jobId)}/import`, {
       min_relevance: minRelevance,
     }),
+
+  // Resolve Fetches
+  reverifyFetches: (payload: { scope?: "all" | "selected"; source_ids?: string[]; force?: boolean }) =>
+    apiPost<RepositoryReverifyFetchesResponse>("repository/reverify-fetches", payload),
+  getCaptureAvailability: () => apiGet<CaptureAvailabilityResponse>("capture/availability"),
+  listBlockedSources: (include: string) =>
+    apiGet<ResolveSourceListResponse>(`capture/blocked-sources?include=${encodeURIComponent(include)}`),
+  createCaptureSession: (payload: {
+    source_id: string;
+    url?: string;
+    viewport_width?: number;
+    viewport_height?: number;
+  }) => apiPost<CaptureSessionInfo>("capture/sessions", payload),
+  getCaptureSession: (sessionId: string) =>
+    apiGet<CaptureSessionInfo>(`capture/sessions/${encodeURIComponent(sessionId)}`),
+  navigateCaptureSession: (
+    sessionId: string,
+    payload: { url?: string; action?: "goto" | "back" | "forward" | "reload" },
+  ) =>
+    apiPost<CaptureSessionInfo>(
+      `capture/sessions/${encodeURIComponent(sessionId)}/navigate`,
+      payload,
+    ),
+  sendCaptureInput: (
+    sessionId: string,
+    payload: { canvas_width: number; canvas_height: number; events: CaptureInputEvent[] },
+  ) =>
+    apiPost<{ seq: number; current_url: string }>(
+      `capture/sessions/${encodeURIComponent(sessionId)}/input`,
+      payload,
+    ),
+  captureSessionIntoSource: (
+    sessionId: string,
+    payload: {
+      source_id: string;
+      include_raw_html: boolean;
+      include_rendered_html: boolean;
+      include_rendered_pdf: boolean;
+      include_markdown: boolean;
+    },
+  ) =>
+    apiPost<RepositoryCaptureResponse>(
+      `capture/sessions/${encodeURIComponent(sessionId)}/capture`,
+      payload,
+    ),
+  closeCaptureSession: (sessionId: string) =>
+    apiDelete<{ status: string }>(`capture/sessions/${encodeURIComponent(sessionId)}`),
+  manualUploadIntoSource: async (sourceId: string, file: File, finalUrl: string) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("final_url", finalUrl);
+    const resp = await fetch(
+      `/api/capture/sources/${encodeURIComponent(sourceId)}/manual-upload`,
+      { method: "POST", body: formData },
+    );
+    return parseApiResponse<RepositoryCaptureResponse>(resp);
+  },
 };
+
+/** URL the canvas long-polls for the next painted frame. */
+export function captureFrameUrl(sessionId: string, afterSeq: number, timeoutMs = 15000): string {
+  return `/api/capture/sessions/${encodeURIComponent(sessionId)}/frame?after_seq=${afterSeq}&timeout_ms=${timeoutMs}`;
+}
