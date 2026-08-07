@@ -43,6 +43,7 @@ import {
   buildRepositoryBrowserSourceTaskQueue,
   buildRepositoryManifestFilterPayload,
   clampRepositoryBrowserColumnWidth,
+  buildRepositoryBrowserColumnCategories,
   buildRepositoryBrowserQuery,
   buildRepositoryBrowserStorageKey,
   buildFileHref,
@@ -56,7 +57,6 @@ import {
   moveRepositoryBrowserColumnToEnd,
   reorderRepositoryBrowserColumns,
   resolveRepositoryBrowserColumnWidth,
-  REPOSITORY_BROWSER_COLUMN_CATEGORIES,
   REPOSITORY_BROWSER_DEFAULT_VISIBLE_COLUMNS,
   REPOSITORY_BROWSER_FILE_COLUMNS,
   REPOSITORY_BROWSER_PAGE_SIZE,
@@ -2463,23 +2463,10 @@ export function RepositoryBrowserPage() {
     [columnWidths, renderedColumns],
   );
   const actionRowWidth = tableWidth + REPOSITORY_BROWSER_ACTION_RAIL_WIDTH;
-  const columnVisibilityCategories = useMemo(() => {
-    const configuredKeys = new Set(
-      REPOSITORY_BROWSER_COLUMN_CATEGORIES.flatMap((category) => category.columnKeys),
-    );
-    const otherKeys = allColumns
-      .map((column) => column.key)
-      .filter((columnKey) => !configuredKeys.has(columnKey));
-    if (otherKeys.length === 0) return REPOSITORY_BROWSER_COLUMN_CATEGORIES;
-    return [
-      ...REPOSITORY_BROWSER_COLUMN_CATEGORIES,
-      {
-        id: "other",
-        label: "Other",
-        columnKeys: otherKeys,
-      },
-    ];
-  }, [allColumns]);
+  const columnVisibilityCategories = useMemo(
+    () => buildRepositoryBrowserColumnCategories(allColumns),
+    [allColumns],
+  );
 
   useEffect(() => {
     const tableScroller = tableScrollRef.current;

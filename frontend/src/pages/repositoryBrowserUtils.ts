@@ -286,6 +286,35 @@ export const REPOSITORY_BROWSER_COLUMN_CATEGORIES: RepositoryBrowserColumnCatego
   },
 ];
 
+/**
+ * Sections for the column visibility panel. The static categories only cover
+ * built-in keys, so the repository's own custom columns lead the list — a column
+ * the user deliberately created is the one they are most likely to look for —
+ * and anything still uncategorized falls through to "Other".
+ */
+export function buildRepositoryBrowserColumnCategories(
+  allColumns: RepositoryManifestColumn[],
+): RepositoryBrowserColumnCategory[] {
+  const configuredKeys = new Set(
+    REPOSITORY_BROWSER_COLUMN_CATEGORIES.flatMap((category) => category.columnKeys),
+  );
+  const customKeys = allColumns
+    .filter((column) => column.kind === "custom")
+    .map((column) => column.key);
+  const customKeySet = new Set(customKeys);
+  const otherKeys = allColumns
+    .map((column) => column.key)
+    .filter((columnKey) => !configuredKeys.has(columnKey) && !customKeySet.has(columnKey));
+
+  return [
+    ...(customKeys.length
+      ? [{ id: "custom", label: "Custom Columns", columnKeys: customKeys }]
+      : []),
+    ...REPOSITORY_BROWSER_COLUMN_CATEGORIES,
+    ...(otherKeys.length ? [{ id: "other", label: "Other", columnKeys: otherKeys }] : []),
+  ];
+}
+
 export const REPOSITORY_BROWSER_PAGE_SIZE = 250;
 
 export function buildRepositoryBrowserStorageKey(repositoryPath: string): string {

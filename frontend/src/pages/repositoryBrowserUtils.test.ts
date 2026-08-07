@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  buildRepositoryBrowserColumnCategories,
   buildRepositoryBrowserDownloadTaskPayload,
   buildRepositoryBrowserSourceTaskQueue,
   REPOSITORY_BROWSER_BIBLIOGRAPHY_COLUMNS,
@@ -25,10 +26,21 @@ import {
   REPOSITORY_BROWSER_PROVENANCE_COLUMNS,
   resolveRelatedSources,
 } from "./repositoryBrowserUtils";
-import type { RepositoryManifestRow, RepositorySourceFileKind } from "../api/types";
+import type {
+  RepositoryManifestColumn,
+  RepositoryManifestRow,
+  RepositorySourceFileKind,
+} from "../api/types";
 
 function manifestRow(overrides: Partial<RepositoryManifestRow>): RepositoryManifestRow {
   return { id: "000001", ...overrides } as RepositoryManifestRow;
+}
+
+function manifestColumn(
+  key: string,
+  kind: RepositoryManifestColumn["kind"] = "builtin",
+): RepositoryManifestColumn {
+  return { key, label: key, kind } as RepositoryManifestColumn;
 }
 
 describe("repositoryBrowserUtils", () => {
@@ -49,6 +61,43 @@ describe("repositoryBrowserUtils", () => {
       label: "Bibliography",
       columnKeys: REPOSITORY_BROWSER_BIBLIOGRAPHY_COLUMNS,
     });
+  });
+
+  it("leads the visibility sections with the repository's own custom columns", () => {
+    const sections = buildRepositoryBrowserColumnCategories([
+      manifestColumn("title"),
+      manifestColumn("custom_bb22", "custom"),
+      manifestColumn("custom_aa11", "custom"),
+    ]);
+
+    expect(sections[0]).toEqual({
+      id: "custom",
+      label: "Custom Columns",
+      columnKeys: ["custom_bb22", "custom_aa11"],
+    });
+    expect(sections[1].id).toBe("bibliography");
+  });
+
+  it("keeps custom columns out of the uncategorized 'Other' section", () => {
+    const sections = buildRepositoryBrowserColumnCategories([
+      manifestColumn("title"),
+      manifestColumn("custom_aa11", "custom"),
+      manifestColumn("dynamic_field"),
+    ]);
+
+    const other = sections[sections.length - 1];
+    expect(other).toEqual({
+      id: "other",
+      label: "Other",
+      columnKeys: ["dynamic_field"],
+    });
+    expect(sections.filter((section) => section.columnKeys.includes("custom_aa11"))).toHaveLength(1);
+  });
+
+  it("omits the custom section entirely when the repository has no custom columns", () => {
+    expect(
+      buildRepositoryBrowserColumnCategories([manifestColumn("title"), manifestColumn("notes")]),
+    ).toEqual(REPOSITORY_BROWSER_COLUMN_CATEGORIES);
   });
 
   it("builds repository-browser query parameters including threshold filters", () => {
