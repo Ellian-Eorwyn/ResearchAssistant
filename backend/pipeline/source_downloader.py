@@ -235,6 +235,60 @@ ALTERNATE_URL_FORMS: list[tuple[re.Pattern[str], str]] = [
 ]
 
 
+# Titles a refusal page carries. A source whose text has been replaced by a real
+# document keeps this until something notices, and it then travels into
+# citations and exports as if it were the work's title.
+BLOCKED_PAGE_TITLE_PATTERNS = [
+    re.compile(r"attention required", re.IGNORECASE),
+    re.compile(r"just a moment", re.IGNORECASE),
+    re.compile(r"access denied", re.IGNORECASE),
+    re.compile(r"^\s*blocked\b", re.IGNORECASE),
+    re.compile(r"you have been blocked", re.IGNORECASE),
+]
+
+
+def pdf_seed_title(markdown_text: str) -> str:
+    """The first line of a converted PDF that reads like a title.
+
+    `first_nonempty_line` is no use here: the converter opens with its own
+    `## Page 1` marker, usually followed by a page number, so the naive answer
+    is the marker itself.
+    """
+    for raw in str(markdown_text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if re.fullmatch(r"#{1,6}\s*page\s+\d+", line, re.IGNORECASE):
+            continue
+        line = line.lstrip("#").strip()
+        if not line or line.isdigit():
+            continue
+        # Needs enough letters to be a title rather than a stray figure label.
+        if sum(c.isalpha() for c in line) < 8:
+            continue
+        return line[:500]
+    return ""
+
+
+def looks_like_blocked_title(title: str) -> bool:
+    text = str(title or "").strip()
+    return bool(text) and any(p.search(text) for p in BLOCKED_PAGE_TITLE_PATTERNS)
+
+
+def looks_like_placeholder_title(title: str) -> bool:
+    """A stored title that describes no document and should be re-derived.
+
+    Two kinds: what a refusal page called itself, and the PDF converter's own
+    `## Page 1` marker, which a naive first-line rule picks up.
+    """
+    text = str(title or "").strip()
+    if not text:
+        return False
+    if looks_like_blocked_title(text):
+        return True
+    return bool(re.fullmatch(r"#{1,6}\s*page\s+\d+", text, re.IGNORECASE))
+
+
 def _detected_type_for_suffix(ext: str) -> str:
     """How the convert phase should read a file with this extension."""
     normalized = str(ext or "").strip().lower()
@@ -2825,6 +2879,14 @@ class SourceDownloadOrchestrator:
                 )
                 row.detected_type = actual
 
+        # A title left over from a refusal page describes nothing in this
+        # repository, and travels into citations and exports as if it were the
+        # work's own. Drop it so the branches below derive one from the document.
+        if looks_like_placeholder_title(row.title):
+            notes.append(f"placeholder_title_discarded: {row.title[:80]}")
+            row.title = ""
+            row.title_status = ""
+
         if row.detected_type == "pdf":
             if not raw_exists or raw_path is None:
                 row.error_message = "convert_missing_prerequisite: raw_file_not_found"
@@ -2841,6 +2903,9 @@ class SourceDownloadOrchestrator:
             row.markdown_file = markdown_rel.as_posix()
             row.markdown_char_count = len(markdown_text)
             row.extraction_method = extraction_method
+            if not row.title:
+                # A PDF that arrived by hand has no HTML <title> to fall back on.
+                row.title = pdf_seed_title(markdown_text)
             return
 
         if row.detected_type == "document":

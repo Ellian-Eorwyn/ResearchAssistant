@@ -308,6 +308,51 @@ class BlockedPageTests(unittest.TestCase):
                 f"{replacement} is not on the same site as the address it replaces.",
             )
 
+    def test_a_refusal_page_title_is_not_kept_as_the_works_title(self) -> None:
+        """It otherwise travels into citations and exports as the real title.
+
+        The Berkeley Lab report kept "Attention Required! | Cloudflare" after
+        the actual PDF was attached over the blocked fetch.
+        """
+        from backend.pipeline.source_downloader import looks_like_blocked_title
+
+        for title in (
+            "Attention Required! | Cloudflare",
+            "Just a moment...",
+            "Access denied | reddit.com",
+            "You have been blocked",
+        ):
+            self.assertTrue(looks_like_blocked_title(title), title)
+
+        for title in (
+            "Insights into Scaling Virtual Power Plants",
+            "ELI5 what is a VPP (Virtual Power Plant)? : explainlikeimfive",
+            "How utilities blocked rooftop solar",  # 'blocked' mid-sentence
+            "",
+        ):
+            self.assertFalse(looks_like_blocked_title(title), title)
+
+    def test_a_pdf_title_skips_the_converters_own_page_marker(self) -> None:
+        """The naive first non-empty line is `## Page 1`."""
+        from backend.pipeline.source_downloader import pdf_seed_title
+
+        markdown = (
+            "## Page 1\n\n1\n  \n \n \nInsights into Scaling Virtual Power Plants \n"
+            "Real-World Findings for Successful Deployment \nJanuary 2025 \n"
+        )
+        self.assertEqual(pdf_seed_title(markdown), "Insights into Scaling Virtual Power Plants")
+        self.assertEqual(pdf_seed_title("## Page 1\n\n1\n \n"), "")
+        self.assertEqual(pdf_seed_title(""), "")
+
+    def test_a_page_marker_is_a_placeholder_title(self) -> None:
+        """Deriving a title is not enough; a junk one already stored must go."""
+        from backend.pipeline.source_downloader import looks_like_placeholder_title
+
+        for title in ("## Page 1", "# page 12", "Attention Required! | Cloudflare"):
+            self.assertTrue(looks_like_placeholder_title(title), title)
+        for title in ("Insights into Scaling Virtual Power Plants", "Page layout in reports", ""):
+            self.assertFalse(looks_like_placeholder_title(title), title)
+
     def test_the_fallback_render_is_checked_for_a_block_page(self) -> None:
         """A JavaScript-gated block only appears once a real browser loads it.
 
