@@ -265,6 +265,49 @@ class BlockedPageTests(unittest.TestCase):
     def test_a_short_ordinary_page_is_not_a_block_page(self) -> None:
         self.assertFalse(self._detect("A short page about solar batteries in Victoria."))
 
+    def test_reddit_falls_back_to_its_own_legacy_interface(self) -> None:
+        from backend.pipeline.source_downloader import alternate_urls
+
+        self.assertEqual(
+            alternate_urls("https://www.reddit.com/r/explainlikeimfive/comments/1j3k95m/eli5/"),
+            ["https://old.reddit.com/r/explainlikeimfive/comments/1j3k95m/eli5/"],
+        )
+        self.assertEqual(
+            alternate_urls("http://reddit.com/r/x/"), ["https://old.reddit.com/r/x/"]
+        )
+
+    def test_a_site_with_no_published_alternate_gets_none(self) -> None:
+        from backend.pipeline.source_downloader import alternate_urls
+
+        for url in (
+            "https://emp.lbl.gov/publications/virtual-power-plants-insights",
+            "https://old.reddit.com/r/x/",  # already the alternate
+            "",
+        ):
+            self.assertEqual(alternate_urls(url), [], url)
+
+    def test_alternates_are_first_party_addresses_only(self) -> None:
+        """The line this must not cross.
+
+        An alternate is a public address the site serves itself. A third-party
+        mirror, proxy, or cache would be an evasion, which this project does not
+        implement -- a refused alternate goes to manual download like anything
+        else.
+        """
+        from urllib.parse import urlsplit
+
+        from backend.pipeline.source_downloader import ALTERNATE_URL_FORMS
+
+        for pattern, replacement in ALTERNATE_URL_FORMS:
+            host = urlsplit(replacement).hostname or ""
+            registrable = ".".join(host.split(".")[-2:])
+            matched = pattern.pattern.replace("\\", "")  # the pattern escapes its dots
+            self.assertIn(
+                registrable,
+                matched,
+                f"{replacement} is not on the same site as the address it replaces.",
+            )
+
     def test_the_fallback_render_is_checked_for_a_block_page(self) -> None:
         """A JavaScript-gated block only appears once a real browser loads it.
 

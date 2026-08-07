@@ -107,6 +107,7 @@ NOTE_RUNTIME_MISSING_TESSERACT = "runtime_missing_tesseract"
 NOTE_RUNTIME_MISSING_LLM_VISION = "runtime_missing_llm_vision"
 NOTE_BLOCKED_REQUEST = "blocked_request"
 NOTE_BLOCKED_RECOVERED_BY_BROWSER = "blocked_recovered_via_browser"
+NOTE_BLOCKED_RECOVERED_VIA_ALTERNATE_URL = "blocked_recovered_via_alternate_url"
 NOTE_EXTRACTION_FAILURE = "extraction_failure"
 NOTE_OCR_LOCAL_USED = "ocr_local_used"
 NOTE_OCR_LLM_FALLBACK_USED = "ocr_llm_fallback_used"
@@ -217,6 +218,32 @@ BLOCKED_PAGE_SHORT_TEXT_CHARS = 600
 # Past this there is enough real content for the weak signals to be an article
 # *about* blocking rather than a block page, so they need one more.
 BLOCKED_PAGE_ARTICLE_TEXT_CHARS = 3000
+
+# Alternate interfaces a site publishes for the same content, tried only after
+# the primary address has actually been refused.
+#
+# This is not an evasion and must not become one: each entry is a public
+# first-party address the site serves itself, listed because it renders
+# server-side rather than behind a script the fetcher cannot run. Nothing here
+# forges a header, imitates a browser fingerprint, or answers a challenge -- if
+# the alternate refuses too, the fetch fails in the ordinary way and the source
+# is sent to manual download like any other.
+ALTERNATE_URL_FORMS: list[tuple[re.Pattern[str], str]] = [
+    # old.reddit.com is Reddit's own legacy interface, served without the
+    # client-side app the modern one requires.
+    (re.compile(r"^https?://(?:www\.)?reddit\.com/", re.IGNORECASE), "https://old.reddit.com/"),
+]
+
+
+def alternate_urls(url: str) -> list[str]:
+    """Public alternate addresses for the same page, in order of preference."""
+    candidates: list[str] = []
+    for pattern, replacement in ALTERNATE_URL_FORMS:
+        candidate = pattern.sub(replacement, str(url or ""), count=1)
+        if candidate != url and candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
 
 TRACKING_PARAM_EXACT = {"gclid", "fbclid", "msclkid"}
 TRACKING_PARAM_PREFIXES = ("utm_",)
@@ -2097,13 +2124,13 @@ class SourceDownloadOrchestrator:
         if row.detected_type == "pdf":
             self._handle_pdf_response(row, response, notes)
         elif row.detected_type == "html":
-            self._handle_html_response(row, response, normalized_url, renderer, notes)
+            self._handle_html_response(row, response, normalized_url, renderer, notes, client)
         elif classify_http_status(response.status_code) == "blocked_request":
             # A refusal page describes the block, not the source. Some sites
             # answer 403 with a `text/plain` note, which detects as a document
             # and would otherwise route past the one handler that can retry the
             # URL in a browser.
-            self._handle_html_response(row, response, normalized_url, renderer, notes)
+            self._handle_html_response(row, response, normalized_url, renderer, notes, client)
         elif row.detected_type == "document":
             self._handle_document_response(row, response, notes)
         else:
@@ -2390,6 +2417,50 @@ class SourceDownloadOrchestrator:
             row.fetch_status = "success"
             row.media_status = "downloaded"
 
+    def _try_alternate_urls(
+        self,
+        normalized_url: str,
+        renderer: PlaywrightRenderer,
+        client: httpx.Client | None,
+        notes: list[str],
+    ) -> tuple[str, str] | None:
+        """Fetch a public alternate interface for a page that has been refused.
+
+        Returns `(url, html)` for the first alternate that yields readable text,
+        or `None`. Called from both places a block can be discovered: the early
+        check on the first response, and the fallback render -- a
+        JavaScript-gated block is invisible until a browser loads the page, so
+        by then the early path is long past.
+        """
+        for candidate in alternate_urls(normalized_url):
+            self._cancel_event.wait(self.fetch_delay)
+            html, error = "", ""
+            # These are listed precisely because they render server-side, so
+            # ask over plain HTTP first: it is the cheaper request, and for at
+            # least one of them the browser is refused where a normal GET
+            # is not.
+            if client is not None:
+                try:
+                    alternate = client.get(candidate)
+                    if alternate.status_code < 400:
+                        html = alternate.text
+                except httpx.HTTPError as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+            if not html:
+                html, error = renderer.render(candidate)
+            if error:
+                notes.append(normalize_render_error_note(error))
+            if not html or detect_blocked_page(
+                html_text=html, title=extract_title(html), final_url=candidate
+            ):
+                continue
+            markdown, _, _ = extract_markdown_with_fallback(html, self.runtime_capabilities)
+            # Not being detected as a challenge is not enough on its own; the
+            # page has to actually yield readable text.
+            if markdown and markdown_score(markdown) >= MIN_MARKDOWN_SCORE:
+                return candidate, html
+        return None
+
     def _handle_html_response(
         self,
         row: SourceManifestRow,
@@ -2397,6 +2468,7 @@ class SourceDownloadOrchestrator:
         normalized_url: str,
         renderer: PlaywrightRenderer,
         notes: list[str],
+        client: httpx.Client | None = None,
     ) -> None:
         raw_html = decode_html(response)
         if raw_html:
@@ -2438,42 +2510,68 @@ class SourceDownloadOrchestrator:
 
         recovered_via_browser = False
         if blocked_by_challenge or status_looks_blocked:
-            self._cancel_event.wait(self.fetch_delay)
-            escalated_html, escalate_error = renderer.render(normalized_url)
-            escalated_title = extract_title(escalated_html) if escalated_html else ""
-            escalated_markdown = ""
-            if escalated_html and not detect_blocked_page(
-                html_text=escalated_html,
-                title=escalated_title,
-                final_url=row.final_url,
-            ):
-                escalated_markdown, _, _ = extract_markdown_with_fallback(
-                    escalated_html, self.runtime_capabilities
-                )
+            # The page's own address first; only if that is refused, any public
+            # alternate interface the site publishes for the same content.
+            candidates: list[str] = [normalized_url]
+            for candidate in candidates:
+                self._cancel_event.wait(self.fetch_delay)
+                escalated_html, escalate_error = renderer.render(candidate)
+                escalated_title = extract_title(escalated_html) if escalated_html else ""
+                escalated_markdown = ""
+                if escalated_html and not detect_blocked_page(
+                    html_text=escalated_html,
+                    title=escalated_title,
+                    final_url=candidate,
+                ):
+                    escalated_markdown, _, _ = extract_markdown_with_fallback(
+                        escalated_html, self.runtime_capabilities
+                    )
 
-            # "Not detected as a challenge" is not enough on its own -- a
-            # Cloudflare interstitial can slip past the pattern check. Require
-            # the page to actually yield readable text, using the same
-            # threshold the pipeline uses everywhere else.
-            if escalated_markdown and markdown_score(escalated_markdown) >= MIN_MARKDOWN_SCORE:
-                raw_html = escalated_html
-                blocked_by_challenge = False
-                recovered_via_browser = True
-                row.fetch_method = "playwright"
-                row.title = escalated_title or row.title
-                row.canonical_url = extract_canonical_url(raw_html) or row.canonical_url
-                row.sha256 = hashlib.sha256(raw_html.encode("utf-8")).hexdigest()
-                if self.output_options.include_raw_file:
-                    raw_rel = self._raw_file_rel(row, ".html")
-                    self._write_text(raw_rel, raw_html)
-                    row.raw_file = raw_rel.as_posix()
-                if self.output_options.include_rendered_html:
-                    rendered_rel = self._rendered_html_rel(row)
-                    self._write_text(rendered_rel, escalated_html)
-                    row.rendered_file = rendered_rel.as_posix()
-                notes.append(NOTE_BLOCKED_RECOVERED_BY_BROWSER)
-            elif escalate_error:
-                notes.append(normalize_render_error_note(escalate_error))
+                # "Not detected as a challenge" is not enough on its own -- a
+                # Cloudflare interstitial can slip past the pattern check.
+                # Require the page to actually yield readable text, using the
+                # same threshold the pipeline uses everywhere else.
+                if escalated_markdown and markdown_score(escalated_markdown) >= MIN_MARKDOWN_SCORE:
+                    raw_html = escalated_html
+                    blocked_by_challenge = False
+                    recovered_via_browser = True
+                    row.fetch_method = "playwright"
+                    row.title = escalated_title or row.title
+                    row.canonical_url = extract_canonical_url(raw_html) or row.canonical_url
+                    row.sha256 = hashlib.sha256(raw_html.encode("utf-8")).hexdigest()
+                    if self.output_options.include_raw_file:
+                        raw_rel = self._raw_file_rel(row, ".html")
+                        self._write_text(raw_rel, raw_html)
+                        row.raw_file = raw_rel.as_posix()
+                    if self.output_options.include_rendered_html:
+                        rendered_rel = self._rendered_html_rel(row)
+                        self._write_text(rendered_rel, escalated_html)
+                        row.rendered_file = rendered_rel.as_posix()
+                    if candidate != normalized_url:
+                        # Recorded so the row says where its text actually came
+                        # from, rather than implying the original URL worked.
+                        row.final_url = candidate
+                        notes.append(NOTE_BLOCKED_RECOVERED_VIA_ALTERNATE_URL)
+                    notes.append(NOTE_BLOCKED_RECOVERED_BY_BROWSER)
+                    break
+                if escalate_error:
+                    notes.append(normalize_render_error_note(escalate_error))
+
+            # The browser was refused too, so try any alternate interface.
+            if blocked_by_challenge or (status_looks_blocked and not recovered_via_browser):
+                recovered = self._try_alternate_urls(normalized_url, renderer, client, notes)
+                if recovered:
+                    row.final_url, raw_html = recovered
+                    blocked_by_challenge = False
+                    recovered_via_browser = True
+                    row.title = extract_title(raw_html) or row.title
+                    row.canonical_url = extract_canonical_url(raw_html) or row.canonical_url
+                    row.sha256 = hashlib.sha256(raw_html.encode("utf-8")).hexdigest()
+                    if self.output_options.include_raw_file:
+                        raw_rel = self._raw_file_rel(row, ".html")
+                        self._write_text(raw_rel, raw_html)
+                        row.raw_file = raw_rel.as_posix()
+                    notes.append(NOTE_BLOCKED_RECOVERED_VIA_ALTERNATE_URL)
 
         raw_markdown = ""
         raw_used_fallback = False
@@ -2517,6 +2615,29 @@ class SourceDownloadOrchestrator:
                     final_url=row.final_url,
                 ):
                     blocked_by_challenge = True
+                    # First sight of the block, so the alternates have not been
+                    # tried yet: the early path saw only an empty shell.
+                    recovered = self._try_alternate_urls(
+                        normalized_url, renderer, client, notes
+                    )
+                    if recovered:
+                        row.final_url, rendered_html = recovered
+                        raw_html = rendered_html
+                        blocked_by_challenge = False
+                        row.title = extract_title(rendered_html) or row.title
+                        row.canonical_url = (
+                            extract_canonical_url(rendered_html) or row.canonical_url
+                        )
+                        row.sha256 = hashlib.sha256(rendered_html.encode("utf-8")).hexdigest()
+                        if self.output_options.include_raw_file:
+                            raw_rel = self._raw_file_rel(row, ".html")
+                            self._write_text(raw_rel, rendered_html)
+                            row.raw_file = raw_rel.as_posix()
+                        raw_markdown, raw_used_fallback, _ = extract_markdown_with_fallback(
+                            raw_html, self.runtime_capabilities
+                        )
+                        raw_score = markdown_score(raw_markdown)
+                        notes.append(NOTE_BLOCKED_RECOVERED_VIA_ALTERNATE_URL)
 
                 if self.output_options.include_rendered_html:
                     rendered_rel = self._rendered_html_rel(row)
