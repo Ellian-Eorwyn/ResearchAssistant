@@ -240,6 +240,29 @@ def column_run_outcome(service: Any, job_id: str) -> RunOutcome:
 # ---------------------------------------------------------------------------
 
 
+# A run is registered a moment before its first status is written, so asking
+# for the status immediately can raise even though the run started fine.
+STATUS_GRACE_SECONDS = 10.0
+
+
+def _outcome_once(fetch_outcome, *, grace_seconds: float = STATUS_GRACE_SECONDS) -> RunOutcome:
+    """Fetch the outcome, tolerating a status that has not appeared yet.
+
+    Without this, `--wait` reports "Column run status not found" for a run that
+    is running perfectly well, and the obvious retry then fails with "a
+    repository operation is already running" -- two misleading errors for a
+    healthy job.
+    """
+    deadline = time.monotonic() + max(0.0, grace_seconds)
+    while True:
+        try:
+            return fetch_outcome()
+        except Exception:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.25)
+
+
 def wait_for(
     fetch_outcome,
     *,
@@ -257,7 +280,7 @@ def wait_for(
     last_signature = None
     last_change = time.monotonic()
 
-    outcome = fetch_outcome()
+    outcome = _outcome_once(fetch_outcome)
     while not outcome.terminal:
         signature = (outcome.state, outcome.processed_rows, tuple(sorted(outcome.counts.items())))
         if signature != last_signature:
@@ -272,6 +295,6 @@ def wait_for(
             return outcome
 
         time.sleep(min(poll_seconds, max(0.1, deadline - time.monotonic())))
-        outcome = fetch_outcome()
+        outcome = _outcome_once(fetch_outcome)
 
     return outcome

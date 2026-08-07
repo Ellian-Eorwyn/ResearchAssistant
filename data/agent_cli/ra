@@ -30,6 +30,7 @@ import os
 import re
 import shlex
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -169,6 +170,62 @@ def check_contract(token: str) -> None:
             remedy="Restart the ResearchAssistant server, then re-attach this repository.",
             exit_code=EXIT_CONTRACT,
         )
+
+
+# How long `--wait` will keep following a run before handing back `ra watch`.
+FOLLOW_BUDGET_SECONDS = 3600.0
+
+
+def running_job_id(token: str) -> str:
+    """The id of whatever is running, or "". Used to explain a rejection."""
+    try:
+        body, _ = request("GET", "/api/workflow/v1/orientation", token=token, timeout=30)
+        job = (body.get("data") or {}).get("active_job") or {}
+        return str(job.get("job_id") or "") if job.get("running") else ""
+    except Exception:
+        return ""
+
+
+def raise_if_busy(body: dict, token: str) -> None:
+    """Turn "a repository operation is already running" into a command.
+
+    The server knows which job is running but the rejection does not say, so a
+    caller is told only that it cannot proceed -- and the obvious response, try
+    again, fails the same way.
+    """
+    if body.get("status") != "error":
+        return
+    error = body.get("error") or {}
+    message = str(error.get("message") or "")
+    if "already running" not in message.lower():
+        return
+    job = running_job_id(token)
+    raise Problem(
+        message,
+        code=str(error.get("code") or "run_rejected"),
+        remedy=f"ra watch {job} --wait" if job else "ra where",
+    )
+
+
+def follow(run_id: str, token: str, *, budget_seconds: float = FOLLOW_BUDGET_SECONDS) -> dict:
+    """Keep watching until the run is finished.
+
+    The server's own wait budget is bounded because it is holding an HTTP
+    connection, so `--wait` used to come back mid-run and leave the caller to
+    write a polling loop. Starting a column and seeing it through is the most
+    common thing anyone does here; a caller that has to script it is a missing
+    capability, not a caller error.
+    """
+    deadline = time.monotonic() + budget_seconds
+    data: dict = {}
+    while time.monotonic() < deadline:
+        body, _ = request(
+            "GET", f"/api/workflow/v1/runs/{run_id}", token=token, params={"wait_seconds": 120}
+        )
+        data = data_of(body)
+        if data.get("terminal"):
+            break
+    return data
 
 
 def data_of(body: dict, *, allow_error: bool = False) -> dict:
@@ -422,7 +479,10 @@ def cmd_fetch(args, token):
             "wait_seconds": 120 if args.wait else 0,
         },
     )
+    raise_if_busy(body, token)
     data = data_of(body)
+    if args.wait and not data.get("terminal") and data.get("run_id"):
+        data = follow(data["run_id"], token) or data
     ok = not data.get("counts", {}).get("failed")
     return ok, data.get("summary", ""), data.get("next"), data, []
 
@@ -561,7 +621,10 @@ def cmd_run_column(args, token):
             "wait_seconds": 120 if args.wait else 0,
         },
     )
+    raise_if_busy(body, token)
     data = data_of(body)
+    if args.wait and not data.get("terminal") and data.get("run_id"):
+        data = follow(data["run_id"], token) or data
     if data.get("confirmation_required"):
         entries = next_actions(data.get("next"))
         return False, data.get("summary", ""), data.get("next"), data, [

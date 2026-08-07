@@ -235,6 +235,31 @@ class CheckpointTests(unittest.TestCase):
         self.assertEqual(args.ids, "000024,000029")
         self.assertEqual(args.scope, "selected")
 
+    def test_wait_follows_a_run_to_the_end(self) -> None:
+        """`--wait` must not hand back a half-finished run.
+
+        The server's budget is bounded because it holds an HTTP connection, so
+        `--wait` returned mid-run with `next: ra watch <id>`. Anything that then
+        wanted the result had to write a polling loop -- and a loop that skipped
+        `next` started the next column into "already running".
+        """
+        source = (ROOT / "data" / "agent_cli" / "ra").read_text(encoding="utf-8")
+        for command in ("def cmd_fetch", "def cmd_run_column"):
+            body = source.split(command)[1].split("\ndef ")[0]
+            self.assertIn(
+                "follow(",
+                body,
+                f"{command} no longer follows a run to completion under --wait.",
+            )
+
+    def test_a_busy_rejection_says_what_to_watch(self) -> None:
+        """"Already running" without an id leaves the only sensible retry failing."""
+        source = (ROOT / "data" / "agent_cli" / "ra").read_text(encoding="utf-8")
+        self.assertIn("def raise_if_busy", source)
+        for command in ("def cmd_fetch", "def cmd_run_column"):
+            body = source.split(command)[1].split("\ndef ")[0]
+            self.assertIn("raise_if_busy(", body, f"{command} does not explain a busy repository.")
+
     def test_the_contract_version_was_bumped_together(self) -> None:
         from backend.workflow import WORKFLOW_CONTRACT_VERSION
 
