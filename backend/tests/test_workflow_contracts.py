@@ -252,6 +252,39 @@ class CheckpointTests(unittest.TestCase):
                 f"{command} no longer follows a run to completion under --wait.",
             )
 
+    def test_an_attach_remedy_keeps_the_role_the_caller_chose(self) -> None:
+        """Guessing the role from the extension must never override an explicit one.
+
+        A `.pdf` is the rendered copy of a page also saved as HTML, but it is
+        the document itself when that is all there is. Overriding
+        `--role raw_file` with a guess sent the user's only copy of a report to
+        the wrong slot.
+        """
+        from test_workflow_cli import load_cli_module
+
+        cli = load_cli_module()
+        blockers = [{"code": "slot_occupied", "subject": "docs/report.pdf"}]
+
+        guessed = cli._attach_remedies(blockers)
+        self.assertIn("--role rendered_pdf_file", guessed[0])
+
+        explicit = cli._attach_remedies(blockers, role="raw_file", source_id="000034")
+        self.assertIn("--role raw_file", explicit[0])
+        self.assertIn("--source-id 000034", explicit[0])
+        self.assertNotIn("rendered_pdf_file", explicit[0])
+
+    def test_no_remedy_is_offered_for_a_blocker_flags_cannot_fix(self) -> None:
+        """A command that cannot work is worse than no command."""
+        from test_workflow_cli import load_cli_module
+
+        cli = load_cli_module()
+        for code in ("file_not_found", "path_outside_repository", "unknown_source_id"):
+            self.assertEqual(
+                cli._attach_remedies([{"code": code, "subject": "docs/missing.pdf"}]),
+                [],
+                f"{code} cannot be fixed by re-running with different flags.",
+            )
+
     def test_a_busy_rejection_says_what_to_watch(self) -> None:
         """"Already running" without an id leaves the only sensible retry failing."""
         source = (ROOT / "data" / "agent_cli" / "ra").read_text(encoding="utf-8")

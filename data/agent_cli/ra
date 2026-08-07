@@ -526,35 +526,42 @@ def cmd_retry(args, token):
     return cmd_fetch(args, token)
 
 
-def _attach_remedies(blockers):
+def _attach_remedies(blockers, *, role: str = "", source_id: str = ""):
     """Turn attach blockers into commands that can actually be run.
 
     `--role` and `--overwrite` apply to every path in one invocation, so a batch
     of mixed file types cannot succeed in a single call no matter what flags it
-    gets. Left to itself the caller sees five blockers, no remedy, and "fix the
+    gets. Left to itself the caller sees the blockers, no remedy, and "fix the
     blockers" -- the dead end this tool exists to remove. So group the offending
     files by what they need and hand back one command per group.
+
+    An explicit `--role` or `--source-id` is carried through untouched. Guessing
+    a role from the extension is only ever a fallback: a `.pdf` is the rendered
+    copy of a page saved as HTML, but it is the document itself when that is all
+    there is, and only the caller knows which.
     """
-    # A page saved as HTML is the document; a print-to-PDF of that same page is
-    # the rendered copy. This mirrors what the attach skill documents.
     role_for = {".pdf": "rendered_pdf_file", ".html": "raw_file", ".htm": "raw_file"}
     groups: dict[tuple[str, bool], list[str]] = {}
     for blocker in blockers:
         subject = str(blocker.get("subject") or "")
-        if not subject:
+        # Only the slot conflicts are answerable with different flags. A missing
+        # file or a path outside the repository needs the user to do something,
+        # and offering a command that cannot work is worse than offering none.
+        if not subject or blocker.get("code") not in ("slot_occupied", "ambiguous_slot"):
             continue
-        suffix = Path(subject).suffix.lower()
-        role = role_for.get(suffix)
-        if not role:
+        chosen = role or role_for.get(Path(subject).suffix.lower(), "")
+        if not chosen:
             continue
         overwrite = blocker.get("code") == "slot_occupied"
-        groups.setdefault((role, overwrite), []).append(subject)
+        groups.setdefault((chosen, overwrite), []).append(subject)
 
     remedies = []
-    for (role, overwrite), paths in sorted(groups.items()):
+    for (chosen, overwrite), paths in sorted(groups.items()):
         quoted = " ".join(shlex.quote(p) for p in sorted(set(paths)))
         remedies.append(
-            f"ra attach {quoted} --role {role}"
+            f"ra attach {quoted}"
+            + (f" --source-id {source_id}" if source_id else "")
+            + f" --role {chosen}"
             + (" --overwrite" if overwrite else "")
             + " --apply"
         )
@@ -586,7 +593,7 @@ def cmd_attach(args, token):
     )
     data = data_of(body, allow_error=True)
     blockers = (data.get("plan") or {}).get("blockers", [])
-    remedies = _attach_remedies(blockers)
+    remedies = _attach_remedies(blockers, role=args.role, source_id=args.source_id)
     problems = [
         {
             "code": b["code"],

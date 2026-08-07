@@ -235,6 +235,18 @@ ALTERNATE_URL_FORMS: list[tuple[re.Pattern[str], str]] = [
 ]
 
 
+def _detected_type_for_suffix(ext: str) -> str:
+    """How the convert phase should read a file with this extension."""
+    normalized = str(ext or "").strip().lower()
+    if normalized == ".pdf":
+        return "pdf"
+    if normalized in {".html", ".htm"}:
+        return "html"
+    if normalized in {".doc", ".docx", ".md", ".rtf", ".txt"}:
+        return "document"
+    return ""
+
+
 def alternate_urls(url: str) -> list[str]:
     """Public alternate addresses for the same page, in order of preference."""
     candidates: list[str] = []
@@ -2799,6 +2811,19 @@ class SourceDownloadOrchestrator:
             if row.rendered_file and _has_output_file(self.output_dir, row.rendered_file)
             else None
         )
+
+        # `detected_type` was set by the fetch, but the raw file can be replaced
+        # afterwards -- attaching a hand-downloaded PDF over a blocked HTML
+        # fetch, say. Reading a PDF with the HTML parser does not fail; it
+        # writes several million characters of the PDF's own bytes as the
+        # source's text, which then goes on to be analysed as the document.
+        if raw_exists and raw_path is not None:
+            actual = _detected_type_for_suffix(raw_path.suffix.lower())
+            if actual and actual != "unsupported" and actual != row.detected_type:
+                notes.append(
+                    f"detected_type_corrected: {row.detected_type or '(blank)'} -> {actual}"
+                )
+                row.detected_type = actual
 
         if row.detected_type == "pdf":
             if not raw_exists or raw_path is None:

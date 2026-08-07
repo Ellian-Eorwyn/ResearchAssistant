@@ -506,6 +506,19 @@ def apply(ctx: OperationContext, params: AttachFilesParams, plan_obj: Any) -> in
         if candidate.slot == "raw_file":
             row.sha256 = candidate.sha256
             row.content_type = mimetypes.guess_type(candidate.path.name)[0] or row.content_type
+            # `detected_type` decides how the convert phase reads the file. Left
+            # at whatever the original fetch guessed, a PDF attached over a
+            # failed HTML fetch is parsed as HTML, and the source's text becomes
+            # several million characters of the PDF's own bytes.
+            detected = _local_document_detected_type(candidate.path.suffix.lower())
+            if detected:
+                row.detected_type = detected
+            if candidate.replaced_path is not None:
+                # The old title describes the artifact just replaced -- for a
+                # blocked fetch that is "Attention Required! | Cloudflare".
+                # Clear it so it is derived from this file instead.
+                row.title = ""
+                row.title_status = ""
 
         phase = _SLOT_PHASE.get(candidate.slot, "")
         if phase:
