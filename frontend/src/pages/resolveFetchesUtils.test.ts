@@ -1,14 +1,22 @@
 import { describe, expect, it } from "vitest";
 
-import type { CaptureInputEvent, ResolveSourceRow } from "../api/types";
+import type {
+  CaptureInputEvent,
+  RepositorySourceTaskRequest,
+  ResolveSourceRow,
+} from "../api/types";
 import {
+  buildResolveProcessingQueue,
   cdpMouseButton,
   coalesceInputEvents,
   domKeyEventToCdp,
   filterResolveRows,
+  formatFileAge,
+  formatFileSize,
   hostFromUrl,
   mapCanvasPointToViewport,
   modifierMask,
+  nextUnresolvedId,
 } from "./resolveFetchesUtils";
 
 function row(overrides: Partial<ResolveSourceRow>): ResolveSourceRow {
@@ -162,5 +170,140 @@ describe("cdpMouseButton", () => {
     expect(cdpMouseButton(0)).toBe("left");
     expect(cdpMouseButton(1)).toBe("middle");
     expect(cdpMouseButton(2)).toBe("right");
+  });
+});
+
+describe("nextUnresolvedId", () => {
+  const rows = [row({ id: "000001" }), row({ id: "000002" }), row({ id: "000003" })];
+
+  it("moves to the next source below the one just resolved", () => {
+    expect(nextUnresolvedId(rows, "000001", ["000001"])).toBe("000002");
+  });
+
+  it("skips sources already resolved in this pass", () => {
+    expect(nextUnresolvedId(rows, "000001", ["000001", "000002"])).toBe("000003");
+  });
+
+  it("wraps so a pass started mid-list still finishes", () => {
+    expect(nextUnresolvedId(rows, "000003", ["000003"])).toBe("000001");
+  });
+
+  it("returns nothing when every source is resolved", () => {
+    expect(nextUnresolvedId(rows, "000003", ["000001", "000002", "000003"])).toBe("");
+  });
+
+  it("falls back to the first unresolved row when the current id is gone", () => {
+    expect(nextUnresolvedId(rows, "999999", ["000001"])).toBe("000002");
+  });
+
+  it("handles an empty list", () => {
+    expect(nextUnresolvedId([], "000001", [])).toBe("");
+  });
+});
+
+describe("formatFileAge", () => {
+  const now = 1_800_000_000_000;
+
+  it("counts seconds, minutes, hours and days", () => {
+    expect(formatFileAge(now - 12_000, now)).toBe("12s ago");
+    expect(formatFileAge(now - 4 * 60_000, now)).toBe("4m ago");
+    expect(formatFileAge(now - 3 * 3_600_000, now)).toBe("3h ago");
+    expect(formatFileAge(now - 2 * 86_400_000, now)).toBe("2d ago");
+  });
+
+  it("never reports a negative age for a clock skew", () => {
+    expect(formatFileAge(now + 5_000, now)).toBe("0s ago");
+  });
+});
+
+describe("formatFileSize", () => {
+  it("scales the unit to the size", () => {
+    expect(formatFileSize(512)).toBe("512 B");
+    expect(formatFileSize(2048)).toBe("2 KB");
+    expect(formatFileSize(5 * 1024 * 1024)).toBe("5.0 MB");
+  });
+});
+
+describe("buildResolveProcessingQueue", () => {
+  const draft = { project_profile_name: "" } as unknown as RepositorySourceTaskRequest;
+
+  const build = (overrides: Partial<Parameters<typeof buildResolveProcessingQueue>[0]> = {}) =>
+    buildResolveProcessingQueue({
+      sourceIds: ["000001", "000002"],
+      draft,
+      defaultProjectProfileName: "profile.yaml",
+      ...overrides,
+    });
+
+  it("never re-downloads, because fetching these rows reproduces the block", () => {
+    for (const task of build()) {
+      expect(task.payload.run_download).toBe(false);
+      expect(task.payload.force_redownload).toBe(false);
+    }
+  });
+
+  it("never re-converts, because the capture already wrote the markdown", () => {
+    for (const task of build()) {
+      expect(task.payload.run_convert).toBe(false);
+      expect(task.payload.force_convert).toBe(false);
+    }
+  });
+
+  it("selects rows by id under the 'all' scope the backend understands", () => {
+    for (const task of build()) {
+      expect(task.payload.scope).toBe("all");
+      expect(task.payload.source_ids).toEqual(["000001", "000002"]);
+      expect(task.payload.import_id).toBe("");
+    }
+  });
+
+  it("forces cleanup and title, which skip on presence rather than digest", () => {
+    const tasks = build();
+    const cleanup = tasks.find((task) => task.id === "cleanup");
+    const title = tasks.find((task) => task.id === "title");
+    expect(cleanup?.payload.force_llm_cleanup).toBe(true);
+    expect(title?.payload.force_title).toBe(true);
+  });
+
+  it("leaves the digest-gated phases unforced unless overwriting", () => {
+    const tasks = build();
+    expect(tasks.find((task) => task.id === "catalog")?.payload.force_catalog).toBe(false);
+    expect(tasks.find((task) => task.id === "summary")?.payload.force_summary).toBe(false);
+    expect(tasks.find((task) => task.id === "rating")?.payload.force_rating).toBe(false);
+
+    const forced = build({ overwriteExisting: true });
+    expect(forced.find((task) => task.id === "catalog")?.payload.force_catalog).toBe(true);
+    expect(forced.find((task) => task.id === "summary")?.payload.force_summary).toBe(true);
+  });
+
+  it("emits one job per phase, in dependency order", () => {
+    expect(build().map((task) => task.id)).toEqual([
+      "cleanup",
+      "title",
+      "catalog",
+      "citation_verify",
+      "summary",
+      "rating",
+    ]);
+    for (const task of build()) {
+      expect(task.payload.selected_phases).toEqual([task.id]);
+    }
+  });
+
+  it("honours a narrowed phase selection but keeps the canonical order", () => {
+    expect(build({ phases: ["summary", "cleanup"] }).map((task) => task.id)).toEqual([
+      "cleanup",
+      "summary",
+    ]);
+  });
+
+  it("falls back to the repository's default project profile", () => {
+    expect(build()[0].payload.project_profile_name).toBe("profile.yaml");
+  });
+
+  it("returns nothing when there is nothing to process", () => {
+    expect(build({ sourceIds: [] })).toEqual([]);
+    expect(build({ sourceIds: ["  "] })).toEqual([]);
+    expect(build({ phases: [] })).toEqual([]);
   });
 });

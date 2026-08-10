@@ -127,11 +127,28 @@ def _leading_code(node: ast.AST, constants: dict[str, str]) -> str | None:
     return None
 
 
+def verification_codes() -> set[str]:
+    """Codes the fetch verifier records when the bytes back are a wall.
+
+    These are built from an `Enum` in another module and handed to
+    `_complete_row_phase` through a variable, so scanning the downloader for
+    string literals cannot see them. Left out, `blocked_challenge` and its three
+    siblings reached `ra triage` as codes with no classification and no remedy --
+    on a corpus of commercial sites, some of the most common failures there are.
+
+    Imported rather than parsed: the enum is the definition, so reading it is
+    the one way this cannot drift.
+    """
+    from backend.pipeline.fetch_verification import BLOCKED_ERROR_CODES
+
+    return set(BLOCKED_ERROR_CODES)
+
+
 def phase_error_codes() -> set[str]:
     """Codes the download pipeline records against a phase."""
     tree = ast.parse(DOWNLOADER.read_text(encoding="utf-8"))
     constants = _module_constants(tree)
-    codes: set[str] = set()
+    codes: set[str] = set(verification_codes())
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):

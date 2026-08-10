@@ -31,6 +31,10 @@ class ColumnSpec(BaseModel):
     output_constraint: dict[str, Any] | None = None
     include_row_context: bool = False
     include_source_text: bool = True
+    # A column holding data the user supplied rather than answers the model
+    # writes. It is never run, so it is the one kind of column allowed to have
+    # no prompt; `set_column_values` fills it.
+    provided: bool = False
 
 
 class CreateColumnsParams(BaseModel):
@@ -107,7 +111,7 @@ def _resolve(
                 PlanIssue(code="label_required", message="Every column needs a label.", subject=subject)
             )
             continue
-        if not str(spec.instruction_prompt or "").strip():
+        if not str(spec.instruction_prompt or "").strip() and not spec.provided:
             blockers.append(
                 PlanIssue(
                     code="prompt_required",
@@ -173,6 +177,19 @@ def plan(
         subject = f"column:{item.column_id}"
         prompt = item.spec.instruction_prompt.strip()
         values = list((item.constraint or {}).get("allowed_values") or [])
+        if item.spec.provided:
+            # Never run, so a missing prompt and a missing constraint are the
+            # point rather than an omission worth warning about.
+            changes.append(
+                PlanChange(
+                    kind="row_create",
+                    subject=subject,
+                    field="label",
+                    after=item.label,
+                    detail="holds provided data; not run by the model",
+                )
+            )
+            continue
         detail = f"{len(prompt)} character prompt"
         if item.row_context:
             detail += "; reads the row's metadata"
@@ -209,11 +226,14 @@ def plan(
         )
 
     skipped = len([w for w in warnings if w.code == "column_label_exists"])
-    constrained = len(planned) - len(unconstrained)
+    provided = [item for item in planned if item.spec.provided]
+    constrained = len(planned) - len(provided) - len(unconstrained)
     with_context = len([item for item in planned if item.row_context])
     parts = []
     if planned:
         parts.append(f"create {len(planned)} column(s)")
+    if provided:
+        parts.append(f"{len(provided)} of them for provided data, not for the model")
     if constrained:
         parts.append(f"constrain {constrained} to their listed answers")
     if with_context:

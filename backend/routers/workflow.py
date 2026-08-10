@@ -7,9 +7,11 @@ previous step still knows what to do.
 
 from __future__ import annotations
 
+import functools
 from typing import Any
 
 from fastapi import APIRouter, Body, Query, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
 from backend.routers.agent import _authorize, _error_response, _request_id, _response_envelope
@@ -20,6 +22,24 @@ from backend.workflow.sheet import SheetReadError
 router = APIRouter()
 
 PREFIX = "/workflow/v1"
+
+
+async def _offload(func, *args, **kwargs):
+    """Run a blocking service call off the event loop.
+
+    Every `wait_seconds` path ends in `workflow.runs.wait_for`, which polls with
+    `time.sleep` for up to two minutes. Called inline from an `async def` route,
+    that sleeps uvicorn's one event-loop thread: the server keeps listening and
+    answers nothing, so the app in the browser goes blank for the whole length
+    of a fetch. `ra fetch --wait` -- which the workflow skill tells agents to
+    run -- re-issues that poll back to back, so the blackout lasts as long as
+    the download does.
+
+    Use this for **any** handler that can block, not only the ones taking
+    `wait_seconds`. A route that reaches disk or the network under a lock is the
+    same hazard with a shorter fuse.
+    """
+    return await run_in_threadpool(functools.partial(func, *args, **kwargs))
 
 
 def _service(request: Request) -> WorkflowService:
@@ -66,7 +86,9 @@ async def workflow_preflight(
     if auth_error is not None:
         return auth_error
     try:
-        report = _service(request).preflight(refresh_capabilities=refresh_capabilities)
+        report = await _offload(
+            _service(request).preflight, refresh_capabilities=refresh_capabilities
+        )
     except Exception as exc:
         return _fail(request_id, exc)
     return _response_envelope(
@@ -88,7 +110,9 @@ async def workflow_orientation(
     if auth_error is not None:
         return auth_error
     try:
-        report = _service(request).orientation(include_column_stats=include_column_stats)
+        report = await _offload(
+            _service(request).orientation, include_column_stats=include_column_stats
+        )
     except Exception as exc:
         return _fail(request_id, exc)
     return _response_envelope(
@@ -103,7 +127,7 @@ async def workflow_triage(request: Request, phase: str = Query(default="fetch"))
     if auth_error is not None:
         return auth_error
     try:
-        report = _service(request).triage(phase=phase)
+        report = await _offload(_service(request).triage, phase=phase)
     except Exception as exc:
         return _fail(request_id, exc)
     return _response_envelope(
@@ -130,12 +154,14 @@ async def workflow_parse_sheet(
             http_status=400,
         )
     try:
-        plan = _service(request).parse_sheet(
+        plan = await _offload(
+            _service(request).parse_sheet,
             path,
             header_row=payload.get("header_row"),
             prompts_row=payload.get("prompts_row"),
             no_prompts_row=bool(payload.get("no_prompts_row")),
             repair_encoding=str(payload.get("repair_encoding") or "auto"),
+            merge_duplicate_urls=bool(payload.get("merge_duplicate_urls")),
         )
     except SheetReadError as exc:
         return _fail(request_id, exc, code="sheet_unreadable")
@@ -145,6 +171,7 @@ async def workflow_parse_sheet(
     data = plan.model_dump(mode="json")
     data["create_sources_params"] = _service(request).sheet_to_params(plan, "create_sources")
     data["create_columns_params"] = _service(request).sheet_to_params(plan, "create_columns")
+    data["set_values_params"] = _service(request).sheet_to_params(plan, "set_values")
     return _response_envelope(request_id=request_id, status="ok", data=data)
 
 
@@ -163,7 +190,8 @@ async def workflow_run_operation(
         return auth_error
 
     try:
-        result = _service(request).run_operation(
+        result = await _offload(
+            _service(request).run_operation,
             operation,
             payload.get("params") or {},
             apply=apply,
@@ -196,7 +224,8 @@ async def workflow_run_source_phases(
     if auth_error is not None:
         return auth_error
     try:
-        outcome = _service(request).run_source_phases(
+        outcome = await _offload(
+            _service(request).run_source_phases,
             phases=list(payload.get("phases") or ["fetch"]),
             scope=str(payload.get("scope") or "queued"),
             source_ids=list(payload.get("source_ids") or []),
@@ -234,7 +263,8 @@ async def workflow_run_column(
             http_status=400,
         )
     try:
-        outcome = _service(request).run_column(
+        outcome = await _offload(
+            _service(request).run_column,
             column_id,
             scope=str(payload.get("scope") or "empty_only"),
             source_ids=list(payload.get("source_ids") or []),
@@ -262,7 +292,7 @@ async def workflow_watch(
     if auth_error is not None:
         return auth_error
     try:
-        outcome = _service(request).watch(run_id, wait_seconds=wait_seconds)
+        outcome = await _offload(_service(request).watch, run_id, wait_seconds=wait_seconds)
     except Exception as exc:
         return _fail(request_id, exc, code="unknown_run", status=404)
     return _response_envelope(
@@ -283,7 +313,8 @@ async def workflow_attach(
     if auth_error is not None:
         return auth_error
     try:
-        outcome = _service(request).attach_files(
+        outcome = await _offload(
+            _service(request).attach_files,
             paths=list(payload.get("paths") or []),
             hints=list(payload.get("hints") or []),
             scan_inbox=bool(payload.get("scan_inbox", True)),

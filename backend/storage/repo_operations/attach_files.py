@@ -25,13 +25,30 @@ from pydantic import BaseModel, Field
 
 from backend.models.operations import PlanChange, PlanIssue
 from backend.models.sources import SourceManifestRow, SourcePhaseMetadata
+from backend.pipeline.source_downloader import (
+    NOTE_BLOCKED_REQUEST,
+    blocked_skipped_phases,
+    clear_blocked_fetch_skips,
+)
 
 from .base import OperationDefinition
 from .context import OperationContext, file_sha256
 
 INBOX_DIR_NAME = "inbox"
 
+# The pipeline's own prefix, `000109_report.pdf`. A file named this way came out
+# of this repository, so a missing source is a real error rather than a request.
 _ID_PREFIX_RE = re.compile(r"^(\d{6})_")
+
+# What a person types when they save a document for a row they have numbered:
+# `ID#109.html`, `ID-109-ocr.pdf`, `id 109 copy.pdf`. This is the user saying
+# where the file belongs, so when no such source exists yet, one is created with
+# that id rather than with the next free number.
+#
+# The `id` is required. Without it `2024-report.pdf` would be read as a request
+# for source 2024, and a filename that happens to start with a year is far more
+# common than one that means it.
+_ID_LABEL_RE = re.compile(r"^id[\s#_-]*(\d{1,6})(?=[\s._-]|$)", re.IGNORECASE)
 
 # Which artifact slot a file fills, keyed by the filename convention the
 # pipeline itself writes. Matching these keeps the resolver's legacy fallbacks
@@ -94,6 +111,11 @@ _SLOT_PHASE: dict[str, str] = {
 
 WRITABLE_SLOTS = frozenset(_SLOT_PHASE)
 
+# Fetch statuses meaning "the document was never obtained", which a hand-attached
+# fetch artifact resolves. `blocked` is here because a bot wall or sign-in page
+# is exactly the case this operation exists to rescue.
+_UNFETCHED_STATUSES = frozenset({"failed", "blocked"})
+
 ACTION_ATTACH = "attach"
 ACTION_CREATE = "create"
 ACTION_SKIP = "skip"
@@ -139,8 +161,14 @@ class _Candidate:
         self.replaced_path: Path | None = None
         self.new_rel = ""
         self.title = ""
+        # An id the filename asked for that no source holds yet, so the new
+        # source is created with it instead of with the next free number.
+        self.requested_id = ""
         # The file is already stored; only the row's bookkeeping needs fixing.
         self.metadata_only = False
+        # The file is itself a block page, so attaching it must not clear the
+        # source's blocked status.
+        self.keeps_blocked = False
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +206,14 @@ def _classify(
     }
     next_id = _next_id(ctx)
     claimed: set[tuple[str, str]] = set()
+    # Ids the filenames asked for, reserved before any auto-allocation so a file
+    # with no number in its name cannot take one another file is waiting for.
+    requested_ids = {
+        source_id
+        for candidate in candidates
+        if (source_id := _requested_filename_id(ctx, candidate))
+    }
+    assigned_ids: set[str] = set()
 
     for candidate in candidates:
         subject = candidate.subject
@@ -219,16 +255,31 @@ def _classify(
                     subject,
                 )
                 continue
+            if candidate.requested_id:
+                if candidate.requested_id in assigned_ids:
+                    block(
+                        "id_claimed_twice",
+                        f"Two files in this request both name source "
+                        f"{candidate.requested_id}. Rename one, or give it --source-id.",
+                        subject,
+                    )
+                    continue
+                candidate.target_id = candidate.requested_id
+            else:
+                while f"{next_id:06d}" in requested_ids or f"{next_id:06d}" in assigned_ids:
+                    next_id += 1
+                candidate.target_id = f"{next_id:06d}"
+                next_id += 1
+
             candidate.action = ACTION_CREATE
             candidate.slot = "raw_file"
-            candidate.target_id = f"{next_id:06d}"
             candidate.new_rel = _repository_source_file_path(
                 source_id=candidate.target_id,
                 field="raw_file",
                 source_name=safe_source_name(candidate.path.name),
             ).as_posix()
             candidate.title = str(candidate.hint.title or "").strip()
-            next_id += 1
+            assigned_ids.add(candidate.target_id)
             upload_sha[candidate.sha256] = SourceManifestRow(id=candidate.target_id)
             continue
 
@@ -293,7 +344,50 @@ def _classify(
             source_name=safe_source_name(candidate.path.name),
         ).as_posix()
 
+        if _looks_like_saved_block_page(candidate, row):
+            # The user saved the wall rather than the page behind it. Attach the
+            # file anyway -- it is evidence, and refusing would just strand it --
+            # but do not let it clear the block, which is what the interactive
+            # Resolve Fetches path does with the same content.
+            candidate.keeps_blocked = True
+            warn(
+                "attached_file_is_a_block_page",
+                f"{candidate.path.name} still looks like a bot wall or sign-in page, so "
+                f"source {row.id} stays blocked. Open the page in a browser you control, "
+                "save the article itself, and attach that.",
+                subject,
+            )
+
     return candidates, blockers, warnings
+
+
+def _looks_like_saved_block_page(candidate: _Candidate, row: SourceManifestRow) -> bool:
+    """Would attaching this file paper over the block rather than fix it?
+
+    Only asked of HTML attached to a fetch slot on a row that is actually
+    blocked -- that is the one case where a saved file plausibly *is* the wall.
+    A PDF is essentially never an interstitial, and paying to extract its text
+    on every plan would not earn its keep.
+    """
+    if str(row.fetch_status or "").strip() != "blocked":
+        return False
+    if _SLOT_PHASE.get(candidate.slot) != "fetch":
+        return False
+    if candidate.path.suffix.lower() not in {".html", ".htm", ".xhtml"}:
+        return False
+
+    from backend.pipeline.fetch_verification import looks_blocked
+    from backend.pipeline.source_downloader import decode_bytes_to_text, extract_title
+
+    try:
+        html = decode_bytes_to_text(candidate.path.read_bytes())
+    except OSError:
+        return False
+    return looks_blocked(
+        raw_html=html,
+        title=extract_title(html),
+        final_url=str(row.final_url or row.original_url or ""),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +466,13 @@ def plan(
                     after="completed",
                 )
             )
-        if row is not None and _resolves_fetch(candidate.slot, row.fetch_status):
+        resolves = (
+            row is not None
+            and not candidate.keeps_blocked
+            and _resolves_fetch(candidate.slot, row.fetch_status)
+        )
+        if resolves:
+            was_blocked = str(row.fetch_status or "").strip() == "blocked"
             changes.append(
                 PlanChange(
                     kind="row_field",
@@ -380,9 +480,26 @@ def plan(
                     field="fetch_status",
                     before=str(row.fetch_status or ""),
                     after="success",
-                    detail="Resolves the fetch, so it is not retried or left flagged as failed.",
+                    detail="Resolves the fetch, so it is not retried or left flagged as unfetched.",
                 )
             )
+            if was_blocked:
+                # Naming them is the point: these are the phases the block held
+                # back, and the user has to know they are now due to run.
+                released = ", ".join(blocked_skipped_phases(row)) or "none"
+                changes.append(
+                    PlanChange(
+                        kind="row_field",
+                        subject=subject,
+                        field="phase_metadata.skipped_blocked_fetch",
+                        before=released,
+                        after="cleared",
+                        detail=(
+                            "The block held these phases back; they are released so a "
+                            "source-phase run picks them up."
+                        ),
+                    )
+                )
 
     attach_count = sum(1 for item in candidates if item.action == ACTION_ATTACH)
     create_count = sum(1 for item in candidates if item.action == ACTION_CREATE)
@@ -529,14 +646,22 @@ def apply(ctx: OperationContext, params: AttachFilesParams, plan_obj: Any) -> in
                 content_digest=candidate.sha256,
             )
 
-        if _resolves_fetch(candidate.slot, row.fetch_status):
+        if not candidate.keeps_blocked and _resolves_fetch(candidate.slot, row.fetch_status):
             # Either the fetch had not run yet, or it failed and this file is
             # the very thing it could not get. A status that already succeeded
             # is left alone: the user is topping up an otherwise good source.
+            was_blocked = str(row.fetch_status or "").strip() == "blocked"
             row.fetch_status = "success"
             row.error_message = ""
             row.fetch_method = "manual_attach"
             row.fetched_at = row.fetched_at or now
+            row.fetch_verification = ""
+            if was_blocked:
+                # The LLM phases were held back rather than run against the
+                # wall. They produced nothing, so there is no stale output to
+                # invalidate -- they simply have to be allowed to start.
+                clear_blocked_fetch_skips(row)
+                row.notes = _drop_note(row.notes, NOTE_BLOCKED_REQUEST)
         row.notes = _add_note(row.notes, "manual_attach")
 
         journal.protect(destination.parent / f"{row.id}_metadata.json")
@@ -684,6 +809,17 @@ def _resolve_target(
             return None, True
         return row, False
 
+    match = _ID_LABEL_RE.match(candidate.path.name)
+    if match:
+        source_id = f"{int(match.group(1)):06d}"
+        row = ctx.row_by_id(source_id)
+        if row is not None:
+            return row, False
+        # Not an error: naming a file `ID#109` for a row that has no source yet
+        # is how a planning sheet's document rows arrive, so honour the number.
+        candidate.requested_id = source_id
+        return None, False
+
     return None, False
 
 
@@ -728,6 +864,25 @@ def _select_slot(candidate: _Candidate) -> tuple[str, PlanIssue | None]:
 # ---------------------------------------------------------------------------
 
 
+def _requested_filename_id(ctx: OperationContext, candidate: _Candidate) -> str:
+    """The id a filename asks for, when nothing else decides and no source holds it.
+
+    Read twice -- once here to reserve the number, once in `_resolve_target` to
+    use it -- rather than threading state between the two, because the reserving
+    pass has to see every file before the using pass handles the first one.
+    """
+    hint = candidate.hint
+    if str(hint.source_id or "").strip() or str(hint.url or "").strip():
+        return ""
+    if _ID_PREFIX_RE.match(candidate.path.name):
+        return ""
+    match = _ID_LABEL_RE.match(candidate.path.name)
+    if not match:
+        return ""
+    source_id = f"{int(match.group(1)):06d}"
+    return "" if ctx.row_by_id(source_id) is not None else source_id
+
+
 def _next_id(ctx: OperationContext) -> int:
     from backend.storage.attached_repository import _next_source_id_from_rows
 
@@ -745,14 +900,19 @@ def _resolves_fetch(slot: str, fetch_status: str) -> bool:
 
     * A source that has not been fetched yet (blank or `queued`) is satisfied by
       any artifact -- the user has the content, so re-downloading is waste.
-    * A source whose fetch *failed* is only resolved by a fetch-phase artifact.
-      A summary or a rating says nothing about whether the page was ever
-      retrieved, so the failure should stay visible.
+    * A source whose fetch did not produce the document is only resolved by a
+      fetch-phase artifact. A summary or a rating says nothing about whether the
+      page was ever retrieved, so the failure should stay visible.
+
+    `blocked` counts as not having produced the document. It is the status a
+    fetch that hit a bot wall or sign-in page now carries, and hand-attaching
+    the real file is precisely how those are meant to be resolved -- leaving it
+    blocked would keep every LLM phase skipped for a source that is fine.
     """
     status = str(fetch_status or "").strip()
     if status in {"", "queued"}:
         return True
-    return status == "failed" and _SLOT_PHASE.get(slot) == "fetch"
+    return status in _UNFETCHED_STATUSES and _SLOT_PHASE.get(slot) == "fetch"
 
 
 def _phase_status(row: SourceManifestRow, phase: str) -> str:
@@ -764,6 +924,20 @@ def _add_note(value: str, note: str) -> str:
     parts = [part.strip() for part in str(value or "").split(";") if part.strip()]
     if note not in parts:
         parts.append(note)
+    return "; ".join(parts)
+
+
+def _drop_note(value: str, note: str) -> str:
+    """Remove a note that no longer describes the row.
+
+    A source rescued by hand is no longer a blocked request, and leaving the
+    marker behind makes the manifest read as though it still is.
+    """
+    parts = [
+        part.strip()
+        for part in str(value or "").split(";")
+        if part.strip() and part.strip() != note
+    ]
     return "; ".join(parts)
 
 
@@ -870,8 +1044,10 @@ DEFINITION = OperationDefinition(
         "Register files staged in .ra_repo/inbox/ against repository sources. Each file is "
         "either matched to an existing source (by explicit id, by fetch URL, or by a "
         "000123_ filename prefix) and stored in the right artifact slot, or turned into a "
-        "new uploaded-document source. Attaching marks the source fetched so it is not "
-        "queued for another download attempt."
+        "new uploaded-document source. A filename that names an id the repository does not "
+        "hold yet, such as ID#109.pdf, creates the source with that id, so documents saved "
+        "by hand land on the numbers a planning spreadsheet gave them. Attaching marks the "
+        "source fetched so it is not queued for another download attempt."
     ),
     params_model=AttachFilesParams,
     planner=plan,

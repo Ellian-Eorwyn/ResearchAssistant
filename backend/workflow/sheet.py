@@ -32,7 +32,9 @@ from .models import (
     RowLayout,
     SheetAnomaly,
     SheetColumn,
+    SheetDocument,
     SheetPlan,
+    SheetProvidedColumn,
     SheetSource,
 )
 
@@ -308,6 +310,7 @@ def parse_planning_sheet(
     prompts_row: int | None = None,
     no_prompts_row: bool = False,
     repair_encoding: str = "auto",
+    merge_duplicate_urls: bool = False,
 ) -> SheetPlan:
     """Read a planning spreadsheet into a reviewable plan."""
     path = Path(path)
@@ -361,7 +364,10 @@ def parse_planning_sheet(
 
     _extract_columns(plan, header, prompts, layout)
     _extract_sources(plan, grid, layout)
+    if merge_duplicate_urls:
+        _merge_duplicate_urls(plan)
     _check_sources(plan)
+    _extract_provided_columns(plan, grid, header, prompts, layout)
 
     plan.summary = _summarize(plan)
     return plan
@@ -429,17 +435,6 @@ def _extract_sources(plan: SheetPlan, grid: list[list[str]], layout: RowLayout) 
                 )
             )
             continue
-        if not _looks_like_url_cell(url):
-            plan.anomalies.append(
-                SheetAnomaly(
-                    code="cell_not_a_url",
-                    message=f"Row {row_index}: {url[:60]!r} does not look like a web address.",
-                    subject=url,
-                    row=row_index,
-                )
-            )
-            # Still emitted: `create_sources` will block on it with a clear code,
-            # which is a better place for the user to see it than here.
 
         source_id = raw_id
         if raw_id and not _INTEGER.match(raw_id):
@@ -464,7 +459,191 @@ def _extract_sources(plan: SheetPlan, grid: list[list[str]], layout: RowLayout) 
                 )
             )
 
+        if not _looks_like_url_cell(url):
+            # There is no address to fetch, so this cannot become a URL source:
+            # handing it to `create_sources` could only ever produce
+            # `url_invalid`, and one such row blocks the whole import. It keeps
+            # its id and is reported, because the row is real -- the document
+            # just arrives by hand instead of over the network.
+            plan.documents.append(SheetDocument(row=row_index, id=source_id, label=url))
+            plan.anomalies.append(
+                SheetAnomaly(
+                    code="document_row",
+                    message=(
+                        f"Row {row_index}: {url[:60]!r} is not a web address, so nothing will be "
+                        f"fetched for id {source_id or '(unnumbered)'}. Attach the document by "
+                        "hand, or correct the URL cell."
+                    ),
+                    subject=url,
+                    row=row_index,
+                )
+            )
+            continue
+
         plan.sources.append(SheetSource(row=row_index, id=source_id, url=url))
+
+
+def _dedupe_key(url: str) -> str:
+    """The repository's own idea of "the same URL", so a merge here matches it.
+
+    Imported lazily: `attached_repository` is the app's largest module and
+    importing it at module scope would drag the whole storage layer into a
+    parser that otherwise only needs the standard library.
+    """
+    from backend.storage.attached_repository import repository_dedupe_key
+
+    return repository_dedupe_key(url) or url.strip().lower().rstrip("/")
+
+
+def _merge_duplicate_urls(plan: SheetPlan) -> None:
+    """Collapse rows sharing a URL into the one with the lowest id.
+
+    The rows are not discarded: the survivor records which ids it now stands
+    for, so a value imported from a merged row can still be traced to the sheet
+    row it came from, and `_extract_provided_columns` can gather what those rows
+    said rather than only what the survivor said.
+    """
+    groups: dict[str, list[SheetSource]] = {}
+    for source in plan.sources:
+        groups.setdefault(_dedupe_key(source.url), []).append(source)
+
+    survivors: list[SheetSource] = []
+    merged_total = 0
+    for members in groups.values():
+        # Lowest numeric id wins; an unnumbered row sorts last so it never
+        # displaces a row the user numbered deliberately.
+        members.sort(key=lambda s: (int(s.id) if s.id.isdigit() else 10**9, s.row))
+        keeper, rest = members[0], members[1:]
+        if rest:
+            keeper.merged_ids = [item.id for item in rest if item.id]
+            keeper.merged_rows = [item.row for item in rest]
+            merged_total += len(rest)
+        survivors.append(keeper)
+
+    if not merged_total:
+        return
+
+    survivors.sort(key=lambda s: s.row)
+    plan.sources = survivors
+    plan.anomalies.append(
+        SheetAnomaly(
+            code="duplicate_urls_merged",
+            message=(
+                f"{merged_total} row(s) shared a URL with an earlier row and were merged into "
+                f"it, leaving {len(survivors)} source(s). Each survivor records the ids it "
+                "stands for."
+            ),
+        )
+    )
+
+
+def _extract_provided_columns(
+    plan: SheetPlan,
+    grid: list[list[str]],
+    header: list[str],
+    prompts: list[str],
+    layout: RowLayout,
+) -> None:
+    """Collect columns the user filled in themselves.
+
+    A column with a heading, no prompt and no data is simply not a column. One
+    with a heading, no prompt and *data* is the user's own work -- a collection
+    date, the channel a link came from -- and until now the only thing said
+    about it was that it would not be created, after which its contents were
+    dropped on the floor.
+    """
+    if layout.url_column < 0:
+        return
+
+    row_ids: dict[int, str] = {}
+    for source in plan.sources:
+        row_ids[source.row] = source.id
+        for row in source.merged_rows:
+            row_ids[row] = source.id
+    for document in plan.documents:
+        row_ids[document.row] = document.id
+
+    seen_labels: dict[str, int] = {}
+    for index, raw_label in enumerate(header):
+        label = (raw_label or "").strip()
+        if index in {layout.id_column, layout.url_column} or not label:
+            continue
+        if (prompts[index] if index < len(prompts) else "").strip():
+            continue
+
+        # Values are gathered per source rather than per row, so a merged group
+        # contributes everything its rows said, in the order the sheet says it.
+        gathered: dict[str, list[str]] = {}
+        for row_index in range(layout.first_data_row, len(grid)):
+            source_id = row_ids.get(row_index)
+            if not source_id:
+                continue
+            row = grid[row_index]
+            value = row[index].strip() if index < len(row) else ""
+            if not value:
+                continue
+            bucket = gathered.setdefault(source_id, [])
+            if value not in bucket:
+                bucket.append(value)
+
+        if not gathered:
+            continue
+
+        key = label.casefold()
+        if key in seen_labels:
+            plan.anomalies.append(
+                SheetAnomaly(
+                    code="duplicate_provided_column",
+                    message=(
+                        f"Column {label!r} appears at positions {seen_labels[key]} and {index}, "
+                        "both with data and no prompt. Only the first will be imported."
+                    ),
+                    subject=label,
+                )
+            )
+            continue
+        seen_labels[key] = index
+
+        plan.provided_columns.append(
+            SheetProvidedColumn(
+                index=index,
+                label=label,
+                values={sid: "; ".join(values) for sid, values in gathered.items()},
+            )
+        )
+
+    # A column that is about to be imported is not a column that "will not be
+    # created", and printing both leaves the user to work out which is true.
+    imported = {column.label for column in plan.provided_columns}
+    plan.skipped_columns = [
+        column for column in plan.skipped_columns if column.label not in imported
+    ]
+    plan.anomalies = [
+        anomaly
+        for anomaly in plan.anomalies
+        if not (anomaly.code == "column_without_prompt" and anomaly.subject in imported)
+    ]
+
+    _add_merged_ids_column(plan)
+
+
+def _add_merged_ids_column(plan: SheetPlan) -> None:
+    """Record which sheet rows each merged source stands for, as a column.
+
+    Without it a merged source's provided values name several channels with no
+    way back to the rows they came from, and the sheet can no longer be joined
+    to the repository on id alone.
+    """
+    values = {
+        source.id: ", ".join(source.merged_ids)
+        for source in plan.sources
+        if source.id and source.merged_ids
+    }
+    if not values:
+        return
+    plan.provided_columns.append(
+        SheetProvidedColumn(index=-1, label="Merged ID#s", values=values)
+    )
 
 
 def _check_sources(plan: SheetPlan) -> None:
@@ -529,7 +708,15 @@ def _check_sources(plan: SheetPlan) -> None:
 def _summarize(plan: SheetPlan) -> str:
     numeric = sorted(int(s.id) for s in plan.sources if s.id)
     id_range = f" (ids {numeric[0]}-{numeric[-1]})" if numeric else ""
-    parts = [f"{len(plan.sources)} source(s){id_range}", f"{len(plan.columns)} column(s) with prompts"]
+    parts = [f"{len(plan.sources)} source(s){id_range}"]
+    merged = sum(len(source.merged_ids) for source in plan.sources)
+    if merged:
+        parts.append(f"{merged} duplicate row(s) merged in")
+    if plan.documents:
+        parts.append(f"{len(plan.documents)} document(s) to attach by hand")
+    parts.append(f"{len(plan.columns)} column(s) with prompts")
+    if plan.provided_columns:
+        parts.append(f"{len(plan.provided_columns)} column(s) of provided data")
     if plan.skipped_columns:
         parts.append(f"{len(plan.skipped_columns)} column(s) skipped (no prompt)")
     blocking = plan.blocking_anomalies
@@ -548,14 +735,39 @@ def sheet_plan_to_create_sources_params(plan: SheetPlan) -> dict[str, Any]:
 
 
 def sheet_plan_to_create_columns_params(plan: SheetPlan) -> dict[str, Any]:
-    return {
-        "columns": [
-            {
-                "label": column.label,
-                "instruction_prompt": column.prompt,
-                "include_source_text": True,
-            }
-            for column in plan.columns
-        ],
-        "skip_existing": True,
-    }
+    columns: list[dict[str, Any]] = [
+        {
+            "label": column.label,
+            "instruction_prompt": column.prompt,
+            "include_source_text": True,
+        }
+        for column in plan.columns
+    ]
+    # A provided column holds the user's own data and is never run, so it needs
+    # no prompt, no source text and no constraint -- only somewhere to live.
+    columns.extend(
+        {
+            "label": column.label,
+            "instruction_prompt": "",
+            "include_source_text": False,
+            "provided": True,
+        }
+        for column in plan.provided_columns
+    )
+    return {"columns": columns, "skip_existing": True}
+
+
+def sheet_plan_to_set_values_params(plan: SheetPlan) -> list[dict[str, Any]]:
+    """One `set_column_values` request per provided column, keyed by label.
+
+    Labels rather than column ids because the columns do not exist yet when the
+    plan is written; the operation resolves the label against the repository.
+    """
+    return [
+        {
+            "column_label": column.label,
+            "values": {f"{int(sid):06d}": value for sid, value in column.values.items() if sid},
+            "overwrite": False,
+        }
+        for column in plan.provided_columns
+    ]

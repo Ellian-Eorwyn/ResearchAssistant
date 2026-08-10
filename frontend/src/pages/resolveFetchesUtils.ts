@@ -1,4 +1,9 @@
-import type { CaptureInputEvent, ResolveSourceRow } from "../api/types";
+import type {
+  CaptureInputEvent,
+  RepositorySourceTaskRequest,
+  ResolveSourceRow,
+  WatchFolderFile,
+} from "../api/types";
 
 export type ResolveFilter = "blocked" | "failed" | "partial" | "all";
 
@@ -158,4 +163,172 @@ export function cdpMouseButton(button: number): string {
   if (button === 3) return "back";
   if (button === 4) return "forward";
   return "left";
+}
+
+/**
+ * The next source to work on after resolving one.
+ *
+ * Must be given the row list as it was *before* the resolved row disappeared
+ * from it — once the list refetches, "the one after this" has no anchor.
+ */
+export function nextUnresolvedId(
+  rows: ResolveSourceRow[],
+  currentId: string,
+  resolvedIds: string[],
+): string {
+  const done = new Set(resolvedIds);
+  const index = rows.findIndex((row) => row.id === currentId);
+  const after = index < 0 ? rows : rows.slice(index + 1);
+  const forward = after.find((row) => !done.has(row.id));
+  if (forward) return forward.id;
+  // Nothing left below; wrap so a pass that started mid-list still finishes.
+  const wrapped = rows.find((row) => !done.has(row.id) && row.id !== currentId);
+  return wrapped?.id ?? "";
+}
+
+/** "12s ago", "4m ago" — how fresh a watched file is. */
+export function formatFileAge(modifiedMs: number, nowMs: number): string {
+  const seconds = Math.max(0, Math.round((nowMs - modifiedMs) / 1000));
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
+}
+
+/** Compact byte size for the watch list. */
+export function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/** One line describing a watched file, for the attach list. */
+export function describeWatchFile(file: WatchFolderFile, nowMs: number): string {
+  return `${formatFileSize(file.size_bytes)} · ${formatFileAge(file.modified_ms, nowMs)}`;
+}
+
+export const RESOLVE_PROCESSING_PHASES = [
+  "cleanup",
+  "title",
+  "catalog",
+  "citation_verify",
+  "summary",
+  "rating",
+] as const;
+
+export type ResolveProcessingPhase = (typeof RESOLVE_PROCESSING_PHASES)[number];
+
+export const RESOLVE_PHASE_LABELS: Record<ResolveProcessingPhase, string> = {
+  cleanup: "LLM Markdown Cleanup",
+  title: "Title Resolution",
+  catalog: "Catalog Metadata",
+  citation_verify: "Citation Verification",
+  summary: "Summary",
+  rating: "Rating",
+};
+
+export interface ResolveProcessingQueueInput {
+  sourceIds: string[];
+  draft: RepositorySourceTaskRequest;
+  defaultProjectProfileName: string;
+  phases?: readonly ResolveProcessingPhase[];
+  overwriteExisting?: boolean;
+}
+
+export interface ResolveQueuedTask {
+  id: ResolveProcessingPhase;
+  label: string;
+  payload: RepositorySourceTaskRequest;
+}
+
+/**
+ * The background work that finishes a hand-attached source.
+ *
+ * One job per phase, because only one repository operation may run at a time —
+ * the caller feeds these to `startSourceTaskQueue`, which drains them in order.
+ */
+export function buildResolveProcessingQueue({
+  sourceIds,
+  draft,
+  defaultProjectProfileName,
+  phases = RESOLVE_PROCESSING_PHASES,
+  overwriteExisting = false,
+}: ResolveProcessingQueueInput): ResolveQueuedTask[] {
+  const ids = sourceIds.map((value) => value.trim()).filter(Boolean);
+  if (ids.length === 0 || phases.length === 0) return [];
+
+  const basePayload: RepositorySourceTaskRequest = {
+    ...draft,
+    // `scope: "selected"` is not a scope the backend knows; selection is
+    // expressed by `source_ids`, exactly as the browser page does it.
+    scope: "all",
+    import_id: "",
+    source_ids: ids,
+    selected_phases: [],
+    rerun_failed_only: false,
+    // Never re-download. The whole point of these rows is that fetching them
+    // reproduces the block — and it would overwrite the file just attached.
+    run_download: false,
+    force_redownload: false,
+    // The capture already wrote the markdown. Re-converting a Markdown or PDF
+    // attach that has no raw HTML risks blanking it.
+    run_convert: false,
+    force_convert: false,
+    run_catalog: false,
+    run_citation_verify: false,
+    run_llm_cleanup: false,
+    run_llm_title: false,
+    run_llm_summary: false,
+    run_llm_rating: false,
+    force_catalog: false,
+    force_citation_verify: false,
+    force_llm_cleanup: false,
+    force_title: false,
+    force_summary: false,
+    force_rating: false,
+    include_raw_file: true,
+    include_rendered_html: true,
+    include_rendered_pdf: true,
+    include_markdown: true,
+    include_ocr_pdf: true,
+    extract_media_links: true,
+    download_media_transcript: true,
+    download_media_video: false,
+    download_media_audio: true,
+    download_media_thumbnail: true,
+    project_profile_name: draft.project_profile_name || defaultProjectProfileName,
+  };
+
+  const ordered = RESOLVE_PROCESSING_PHASES.filter((phase) => phases.includes(phase));
+  return ordered.map((phase) => {
+    const payload: RepositorySourceTaskRequest = {
+      ...basePayload,
+      selected_phases: [phase],
+    };
+    if (phase === "cleanup") {
+      payload.run_llm_cleanup = true;
+      // Cleanup skips on the mere presence of its output file, with no digest
+      // check — without force it would keep the block page's cleaned text.
+      payload.force_llm_cleanup = true;
+    } else if (phase === "title") {
+      payload.run_llm_title = true;
+      // Same shape: `if row.title and not force`. The wall's title would survive.
+      payload.force_title = true;
+    } else if (phase === "catalog") {
+      payload.run_catalog = true;
+      payload.force_catalog = overwriteExisting;
+    } else if (phase === "citation_verify") {
+      payload.run_citation_verify = true;
+      payload.force_citation_verify = overwriteExisting;
+    } else if (phase === "summary") {
+      payload.run_llm_summary = true;
+      payload.force_summary = overwriteExisting;
+    } else {
+      payload.run_llm_rating = true;
+      payload.force_rating = overwriteExisting;
+    }
+    return { id: phase, label: RESOLVE_PHASE_LABELS[phase], payload };
+  });
 }

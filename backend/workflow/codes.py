@@ -25,6 +25,14 @@ from .models import Classification
 
 _HTTP_DETAIL = re.compile(r"http_status_(\d{3})")
 
+# httpx's connection-level failures, which arrive with no HTTP status at all.
+# `nodename nor servname` is what macOS returns for a name that did not resolve.
+_CONNECTION_ERROR = re.compile(
+    r"ConnectError|ConnectTimeout|nodename nor servname|Name or service not known"
+    r"|Temporary failure in name resolution|Connection refused",
+    re.IGNORECASE,
+)
+
 # HTTP statuses worth another attempt: server-side faults and rate limits.
 RETRYABLE_HTTP = frozenset({408, 425, 429, 500, 502, 503, 504, 507, 509})
 # Statuses that mean the URL itself is wrong.
@@ -47,11 +55,43 @@ CODE_TABLE: dict[str, CodeMeaning] = {
         "An HTTP error. Whether it is worth retrying depends on the status code "
         "in the detail, so this is split further.",
     ),
+    "internal_error": CodeMeaning(
+        "retryable",
+        "The pipeline hit an error it did not expect and failed this one source "
+        "rather than ending the whole run. The exception is in the detail. A "
+        "retry is worth trying, since some causes are transient -- but if it "
+        "repeats, this is a bug worth reporting rather than a source to fix.",
+    ),
     "blocked_request": CodeMeaning(
         "needs_manual_document",
         "The site refused the request. The pipeline already retried it in a headless "
         "browser and was refused again, so another attempt will not help. Download the "
         "document by hand and attach it.",
+    ),
+    # The four verdicts `fetch_verification` records when the bytes that came
+    # back are a wall rather than the document. They arrive after the pipeline
+    # has already retried in a headless browser, so none of them is retryable --
+    # what is needed is the document itself.
+    "blocked_challenge": CodeMeaning(
+        "needs_manual_document",
+        "What came back is a bot-check or interstitial page, not the document -- a "
+        "CDN 'access denied', a Cloudflare challenge, or similar. The browser retry "
+        "was refused too. Save the page by hand and attach it.",
+    ),
+    "blocked_http": CodeMeaning(
+        "needs_manual_document",
+        "The site answered with a status that means refusal (401, 402, 403, 407, 429 "
+        "or 451) and the page body confirmed it. Save the page by hand and attach it.",
+    ),
+    "login_required": CodeMeaning(
+        "needs_manual_document",
+        "The page is behind a sign-in. The pipeline does not hold credentials and "
+        "will not enter any. Sign in yourself, save the page, and attach it.",
+    ),
+    "paywall": CodeMeaning(
+        "needs_manual_document",
+        "What came back is a subscription prompt rather than the article. If you have "
+        "access, open it yourself, save the page, and attach it.",
     ),
     "blocked_fetch": CodeMeaning(
         "needs_manual_document",
@@ -160,9 +200,21 @@ def classify(error_code: str, detail: str = "") -> tuple[Classification, str, st
     if code == "network_failure":
         status = http_status_from_detail(detail)
         if status is None:
+            # No status means the request never got far enough to receive one:
+            # DNS did not resolve, or the connection was refused or timed out.
+            # Calling that "an HTTP error" sends the user looking at the site
+            # when the thing to look at is usually their own network.
+            if _CONNECTION_ERROR.search(detail or ""):
+                return (
+                    "retryable",
+                    "The connection never got as far as an HTTP response -- the name did "
+                    "not resolve, or the host refused or timed out. Usually the local "
+                    "network or DNS rather than the site. Worth a retry.",
+                    "no_connection",
+                )
             return (
                 "retryable",
-                "An HTTP error with no status recorded. Worth one retry.",
+                "A network error with no status recorded. Worth one retry.",
                 "",
             )
         pattern = f"http_status_{status}"

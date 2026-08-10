@@ -3,13 +3,17 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { api } from "../api/client";
 import type { CaptureSessionInfo, RepositoryCaptureResponse, ResolveSourceRow } from "../api/types";
+import { AttachPanel } from "../components/AttachPanel";
 import { Button, EmptyState, StatusBadge, SurfaceCard } from "../components/primitives";
 import { RemoteBrowserCanvas } from "../components/RemoteBrowserCanvas";
+import { useAppState } from "../state/AppState";
 import { labelFetchVerification, statusTone } from "./repositoryBrowserUtils";
 import {
   RESOLVE_FILTER_INCLUDE,
+  buildResolveProcessingQueue,
   filterResolveRows,
   hostFromUrl,
+  nextUnresolvedId,
   type ResolveFilter,
 } from "./resolveFetchesUtils";
 
@@ -20,8 +24,24 @@ const FILTERS: Array<{ id: ResolveFilter; label: string }> = [
   { id: "all", label: "All" },
 ];
 
+// How long after the last attach the pending sources are processed on their own.
+const AUTO_PROCESS_IDLE_MS = 25000;
+
 export function ResolveFetchesPage() {
   const queryClient = useQueryClient();
+  const {
+    repositoryStatus,
+    settingsDraft,
+    sourceTaskDraft,
+    sourceRunning,
+    sourceStatus,
+    sourceTaskQueueActiveLabel,
+    sourceTaskQueueCompletedCount,
+    sourceTaskQueueTotalCount,
+    startSourceTaskQueue,
+    cancelSourceTasks,
+  } = useAppState();
+
   const [filter, setFilter] = useState<ResolveFilter>("blocked");
   const [query, setQuery] = useState("");
   const [activeId, setActiveId] = useState("");
@@ -30,10 +50,15 @@ export function ResolveFetchesPage() {
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [captureResult, setCaptureResult] = useState<RepositoryCaptureResponse | null>(null);
-  const uploadInputRef = useRef<HTMLInputElement>(null);
+  const [sinceMs, setSinceMs] = useState(0);
+  const [autoAdvance, setAutoAdvance] = useState(true);
+  const [overwriteExisting, setOverwriteExisting] = useState(false);
+  const [pendingIds, setPendingIds] = useState<string[]>([]);
+  const [pendingTitles, setPendingTitles] = useState<Record<string, string>>({});
+  const autoProcessTimer = useRef<number | null>(null);
 
   const listQuery = useQuery({
-    queryKey: ["resolve-fetches", filter],
+    queryKey: ["resolve-fetches"],
     queryFn: () => api.listBlockedSources(RESOLVE_FILTER_INCLUDE.all),
   });
   const availabilityQuery = useQuery({
@@ -60,9 +85,97 @@ export function ResolveFetchesPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session?.session_id]);
 
+  // Survive a refresh: the tray is session intent, but losing it mid-pass and
+  // silently skipping the processing would be worse than a little persistence.
+  const trayKey = `ra:resolve-pending:${repositoryStatus?.path ?? ""}`;
+  useEffect(() => {
+    try {
+      const stored = window.sessionStorage.getItem(trayKey);
+      if (stored) {
+        const parsed = JSON.parse(stored) as { ids: string[]; titles: Record<string, string> };
+        setPendingIds(parsed.ids ?? []);
+        setPendingTitles(parsed.titles ?? {});
+      }
+    } catch {
+      // A malformed entry is not worth surfacing; start with an empty tray.
+    }
+  }, [trayKey]);
+  useEffect(() => {
+    try {
+      window.sessionStorage.setItem(
+        trayKey,
+        JSON.stringify({ ids: pendingIds, titles: pendingTitles }),
+      );
+    } catch {
+      // Private-mode storage failures must not break attaching.
+    }
+  }, [trayKey, pendingIds, pendingTitles]);
+
   const refreshList = () => {
     void queryClient.invalidateQueries({ queryKey: ["resolve-fetches"] });
     void queryClient.invalidateQueries({ queryKey: ["repository-manifest"] });
+  };
+
+  const startProcessing = () => {
+    if (sourceRunning || pendingIds.length === 0) return;
+    const tasks = buildResolveProcessingQueue({
+      sourceIds: pendingIds,
+      draft: sourceTaskDraft,
+      defaultProjectProfileName: settingsDraft?.default_project_profile_name ?? "",
+      overwriteExisting,
+    });
+    if (tasks.length === 0) return;
+    void startSourceTaskQueue(
+      tasks.map((task) => ({ label: task.label, payload: task.payload })),
+      `Processing ${pendingIds.length} resolved source(s).`,
+    );
+    setPendingIds([]);
+    setPendingTitles({});
+  };
+
+  // Restart the idle countdown on every attach, so a run of attaches is
+  // processed once at the end rather than fighting for the single job slot.
+  const armAutoProcess = () => {
+    if (autoProcessTimer.current) window.clearTimeout(autoProcessTimer.current);
+    autoProcessTimer.current = window.setTimeout(() => {
+      autoProcessTimer.current = null;
+      startProcessing();
+    }, AUTO_PROCESS_IDLE_MS);
+  };
+  useEffect(() => {
+    return () => {
+      if (autoProcessTimer.current) window.clearTimeout(autoProcessTimer.current);
+    };
+  }, []);
+
+  const handleResolved = (result: RepositoryCaptureResponse) => {
+    setCaptureResult(result);
+    setError("");
+    if (result.status !== "captured") {
+      // Still a wall. Stay on this source — advancing would hide the warning.
+      refreshList();
+      return;
+    }
+
+    const resolvedId = result.source_id || activeId;
+    setPendingIds((prev) => (prev.includes(resolvedId) ? prev : [...prev, resolvedId]));
+    setPendingTitles((prev) => ({
+      ...prev,
+      [resolvedId]: result.title || activeRow?.title || resolvedId,
+    }));
+    armAutoProcess();
+
+    // Work out the next source from the list as it is *now*, before the
+    // refetch drops the row we just resolved and leaves no anchor to count from.
+    const nextId = autoAdvance
+      ? nextUnresolvedId(rows, resolvedId, [...pendingIds, resolvedId])
+      : "";
+    refreshList();
+    if (nextId) {
+      setActiveId(nextId);
+      setCaptureResult(null);
+      setSinceMs(0);
+    }
   };
 
   const reverifyMutation = useMutation({
@@ -88,7 +201,7 @@ export function ResolveFetchesPage() {
       setError("");
       setNotice(
         info.headless
-          ? "Running headless — some sites detect this. If the page refuses, use Upload a saved page."
+          ? "Running headless — some sites detect this. Open the page in your own browser instead and attach the file."
           : "",
       );
     },
@@ -115,11 +228,7 @@ export function ResolveFetchesPage() {
         include_rendered_pdf: true,
         include_markdown: true,
       }),
-    onSuccess: (result) => {
-      setCaptureResult(result);
-      setError("");
-      refreshList();
-    },
+    onSuccess: handleResolved,
     onError: (mutationError) => setError(String(mutationError)),
   });
 
@@ -130,11 +239,18 @@ export function ResolveFetchesPage() {
         file,
         activeRow?.final_url || activeRow?.original_url || "",
       ),
-    onSuccess: (result) => {
-      setCaptureResult(result);
-      setError("");
-      refreshList();
-    },
+    onSuccess: handleResolved,
+    onError: (mutationError) => setError(String(mutationError)),
+  });
+
+  const attachPathMutation = useMutation({
+    mutationFn: (path: string) =>
+      api.attachWatchedFile(
+        activeId,
+        path,
+        activeRow?.final_url || activeRow?.original_url || "",
+      ),
+    onSuccess: handleResolved,
     onError: (mutationError) => setError(String(mutationError)),
   });
 
@@ -143,10 +259,20 @@ export function ResolveFetchesPage() {
     setCaptureResult(null);
     setNotice("");
     setError("");
+    setSinceMs(0);
+  };
+
+  const openInOwnBrowser = (row: ResolveSourceRow) => {
+    // Arm the watch folder first: everything that lands from here on is almost
+    // certainly what the user just saved, and gets flagged as such.
+    setSinceMs(Date.now());
+    window.open(row.original_url, "_blank", "noopener,noreferrer");
   };
 
   const availability = availabilityQuery.data;
   const counts = listQuery.data;
+  const attaching =
+    uploadMutation.isPending || attachPathMutation.isPending || captureMutation.isPending;
 
   return (
     <div className="flex h-full min-h-0 gap-4">
@@ -221,6 +347,17 @@ export function ResolveFetchesPage() {
                     }
                     type="button"
                     onClick={() => selectRow(row)}
+                    onDragOver={(event) => event.preventDefault()}
+                    onDrop={(event) => {
+                      event.preventDefault();
+                      if (sourceRunning) return;
+                      const file = event.dataTransfer.files?.[0];
+                      if (!file) return;
+                      // Dropping onto a row means "this one", even if another
+                      // is currently selected.
+                      setActiveId(row.id);
+                      uploadMutation.mutate(file);
+                    }}
                   >
                     <div className="flex items-center justify-between gap-2">
                       <span className="font-mono text-body-sm text-on-surface-variant">
@@ -256,7 +393,7 @@ export function ResolveFetchesPage() {
         {!activeRow ? (
           <EmptyState
             title="Select a source"
-            detail="Pick a blocked source on the left to open it in a browser you can drive."
+            detail="Pick a blocked source on the left, then open it in your own browser or the in-app one."
           />
         ) : (
           <>
@@ -278,19 +415,26 @@ export function ResolveFetchesPage() {
                 <div className="flex items-center gap-2">
                   {session && (
                     <StatusBadge
-                      text={session.headless ? "headless" : "headful"}
+                      text={
+                        session.headless
+                          ? "headless"
+                          : `headful${session.channel ? ` · ${session.channel}` : ""}`
+                      }
                       tone={session.headless ? "warning" : "success"}
                     />
                   )}
+                  <Button variant="primary" onClick={() => openInOwnBrowser(activeRow)}>
+                    Open in my browser
+                  </Button>
                   {!session ? (
                     <Button
                       disabled={
                         startSessionMutation.isPending || availability?.available === false
                       }
-                      variant="primary"
+                      variant="secondary"
                       onClick={() => startSessionMutation.mutate(activeRow)}
                     >
-                      {startSessionMutation.isPending ? "Starting…" : "Open in browser"}
+                      {startSessionMutation.isPending ? "Starting…" : "Open in-app browser"}
                     </Button>
                   ) : (
                     <Button
@@ -300,7 +444,7 @@ export function ResolveFetchesPage() {
                         setSession(null);
                       }}
                     >
-                      Close browser
+                      Close in-app browser
                     </Button>
                   )}
                 </div>
@@ -313,7 +457,7 @@ export function ResolveFetchesPage() {
                     <div className="mt-1 font-mono text-body-sm">{availability.guidance}</div>
                   )}
                   <div className="mt-1 text-on-surface-variant">
-                    You can still upload a saved copy of the page below.
+                    Open the page in your own browser and attach the saved file instead.
                   </div>
                 </div>
               )}
@@ -349,7 +493,7 @@ export function ResolveFetchesPage() {
                     }}
                   />
                   <Button
-                    disabled={captureMutation.isPending}
+                    disabled={captureMutation.isPending || sourceRunning}
                     variant="primary"
                     onClick={() => captureMutation.mutate()}
                   >
@@ -357,6 +501,15 @@ export function ResolveFetchesPage() {
                   </Button>
                 </div>
               )}
+
+              <label className="flex items-center gap-2 text-body-sm text-on-surface-variant">
+                <input
+                  checked={autoAdvance}
+                  type="checkbox"
+                  onChange={(event) => setAutoAdvance(event.target.checked)}
+                />
+                Advance to the next source after a successful attach
+              </label>
 
               {error && (
                 <div className="rounded-md bg-error/10 p-3 text-body-md text-error">{error}</div>
@@ -386,61 +539,102 @@ export function ResolveFetchesPage() {
               )}
             </SurfaceCard>
 
-            {session ? (
-              <div className="min-h-0 flex-1 overflow-hidden rounded-lg ghost-border">
-                <RemoteBrowserCanvas
-                  sessionId={session.session_id}
-                  viewportHeight={session.viewport_height}
-                  viewportWidth={session.viewport_width}
-                  onError={setError}
-                  onUrlChange={setAddressBar}
-                />
-              </div>
-            ) : (
-              <SurfaceCard className="min-h-0 flex-1 overflow-y-auto">
-                <div className="text-title-sm font-semibold text-on-surface">
-                  What we currently have
-                </div>
-                <p className="mt-1 text-body-md text-on-surface-variant">
-                  {activeRow.error_message || "No error was recorded for this source."}
-                </p>
-                <pre className="mt-3 whitespace-pre-wrap rounded-md bg-surface-container-low p-3 font-mono text-body-sm text-on-surface-variant">
-                  {activeRow.current_content_preview || "(nothing was stored)"}
-                </pre>
-
-                <div className="mt-4 border-t border-outline-variant/30 pt-4">
-                  <div className="text-title-sm font-semibold text-on-surface">
-                    Upload a saved page
+            <div className="grid min-h-0 flex-1 gap-3 lg:grid-cols-[minmax(0,1fr)_24rem]">
+              <div className="min-h-0 overflow-hidden">
+                {session ? (
+                  <div className="h-full overflow-hidden rounded-lg ghost-border">
+                    <RemoteBrowserCanvas
+                      sessionId={session.session_id}
+                      viewportHeight={session.viewport_height}
+                      viewportWidth={session.viewport_width}
+                      onError={setError}
+                      onUrlChange={setAddressBar}
+                    />
                   </div>
-                  <p className="mt-1 text-body-md text-on-surface-variant">
-                    If the site cannot be worked past in the browser, save it yourself
-                    (File → Save Page As, or print to PDF) and upload it here. It is written
-                    into source {activeRow.id} in place. Complete-page saves leave a{" "}
-                    <code>_files/</code> folder that is ignored, and <code>.mhtml</code>{" "}
-                    archives are not supported.
-                  </p>
-                  <input
-                    ref={uploadInputRef}
-                    accept=".html,.htm,.xhtml,.pdf,.md,.markdown,.txt"
-                    className="hidden"
-                    type="file"
-                    onChange={(event) => {
-                      const file = event.target.files?.[0];
-                      if (file) uploadMutation.mutate(file);
-                      event.target.value = "";
-                    }}
-                  />
-                  <Button
-                    className="mt-3"
-                    disabled={uploadMutation.isPending}
-                    variant="secondary"
-                    onClick={() => uploadInputRef.current?.click()}
-                  >
-                    {uploadMutation.isPending ? "Uploading…" : "Choose a file"}
-                  </Button>
-                </div>
-              </SurfaceCard>
-            )}
+                ) : (
+                  <SurfaceCard className="h-full overflow-y-auto">
+                    <div className="text-title-sm font-semibold text-on-surface">
+                      What we currently have
+                    </div>
+                    <p className="mt-1 text-body-md text-on-surface-variant">
+                      {activeRow.error_message || "No error was recorded for this source."}
+                    </p>
+                    <pre className="mt-3 whitespace-pre-wrap rounded-md bg-surface-container-low p-3 font-mono text-body-sm text-on-surface-variant">
+                      {activeRow.current_content_preview || "(nothing was stored)"}
+                    </pre>
+                  </SurfaceCard>
+                )}
+              </div>
+
+              <div className="flex min-h-0 flex-col gap-3 overflow-y-auto">
+                <AttachPanel
+                  busy={attaching}
+                  disabled={sourceRunning}
+                  finalUrl={activeRow.final_url || activeRow.original_url}
+                  sinceMs={sinceMs}
+                  sourceId={activeRow.id}
+                  onAttachFile={(file) => uploadMutation.mutate(file)}
+                  onAttachPath={(path) => attachPathMutation.mutate(path)}
+                />
+
+                <SurfaceCard className="flex flex-col gap-2">
+                  <div className="text-title-sm font-semibold text-on-surface">
+                    Resolved, waiting to process
+                    {pendingIds.length > 0 ? ` (${pendingIds.length})` : ""}
+                  </div>
+                  {pendingIds.length === 0 ? (
+                    <p className="text-body-md text-on-surface-variant">
+                      Attached sources collect here. Only one repository job can run at a
+                      time, so they are processed together rather than one at a time.
+                    </p>
+                  ) : (
+                    <ul className="max-h-40 overflow-y-auto text-body-sm text-on-surface-variant">
+                      {pendingIds.map((id) => (
+                        <li key={id} className="truncate">
+                          <span className="font-mono">{id}</span> · {pendingTitles[id] || ""}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+
+                  <label className="flex items-center gap-2 text-body-sm text-on-surface-variant">
+                    <input
+                      checked={overwriteExisting}
+                      type="checkbox"
+                      onChange={(event) => setOverwriteExisting(event.target.checked)}
+                    />
+                    Overwrite existing catalog, summary and rating
+                  </label>
+
+                  {sourceRunning ? (
+                    <div className="flex flex-col gap-2">
+                      <div className="text-body-sm text-on-surface-variant">
+                        {sourceTaskQueueTotalCount > 0
+                          ? `${sourceTaskQueueCompletedCount}/${sourceTaskQueueTotalCount} · `
+                          : ""}
+                        {sourceTaskQueueActiveLabel || "Running"}
+                        {sourceStatus
+                          ? ` · ${sourceStatus.processed_urls}/${sourceStatus.total_urls}`
+                          : ""}
+                      </div>
+                      <Button variant="secondary" onClick={() => void cancelSourceTasks()}>
+                        Stop
+                      </Button>
+                    </div>
+                  ) : (
+                    <Button
+                      disabled={pendingIds.length === 0}
+                      variant="primary"
+                      onClick={startProcessing}
+                    >
+                      {pendingIds.length === 0
+                        ? "Nothing to process"
+                        : `Process ${pendingIds.length} resolved source(s)`}
+                    </Button>
+                  )}
+                </SurfaceCard>
+              </div>
+            </div>
           </>
         )}
       </section>

@@ -36,22 +36,41 @@ def _text_fingerprint(base: Path, row: Any) -> str:
     return "|".join(parts)
 
 
+def computed_column_ids(column_configs: Any) -> set[str]:
+    """Columns whose values a model derived from the source text.
+
+    A column with no instruction prompt holds data the user supplied -- a
+    collection date, the channel a link came from -- imported by
+    `set_column_values` rather than computed from anything. Rebuilding a
+    source's text cannot invalidate it, and the remedy for staleness is to
+    re-run the column, which for one of these would replace the user's own data
+    with whatever the model says. So they are never stale.
+    """
+    return {
+        str(config.id)
+        for config in column_configs or []
+        if str(getattr(config, "instruction_prompt", "") or "").strip()
+    }
+
+
 def snapshot(service: Any) -> dict[str, tuple[str, tuple[str, ...]]]:
-    """Per source: its text fingerprint and the columns that already hold a value."""
-    from backend.storage.attached_repository import _load_source_rows
+    """Per source: its text fingerprint and the computed columns already filled."""
+    from backend.storage.attached_repository import _load_column_configs, _load_source_rows
 
     if not getattr(service, "is_attached", False):
         return {}
     base = Path(service.path)
     with service._writer_lock():
-        rows = _load_source_rows(service._load_state_locked().get("sources", []))
+        state = service._load_state_locked()
+        rows = _load_source_rows(state.get("sources", []))
+        computed = computed_column_ids(_load_column_configs(state.get("column_configs", [])))
     return {
         str(row.id): (
             _text_fingerprint(base, row),
             tuple(
                 key
                 for key, value in (row.custom_fields or {}).items()
-                if str(value or "").strip()
+                if str(value or "").strip() and key in computed
             ),
         )
         for row in rows
@@ -77,19 +96,35 @@ def mark_stale(service: Any, before: dict[str, tuple[str, tuple[str, ...]]]) -> 
     with service._writer_lock():
         state = service._load_state_locked()
         rows = _load_source_rows(state.get("sources", []))
+        configs = _load_column_configs(state.get("column_configs", []))
+        # Re-checked here as well as in `snapshot`: a column can lose its prompt
+        # between the two, and marking on the stale side would be the harmful
+        # direction -- the remedy overwrites imported data.
+        computed = computed_column_ids(configs)
         changed = False
 
         for row in rows:
+            existing = {c for c in (row.stale_column_ids or "").split(",") if c}
+            # Purge marks that should never have been written -- against a
+            # provided column, or against a column since deleted. A repository
+            # carrying one from an earlier version heals on the next convert
+            # rather than nagging forever about data no run can fix.
+            valid = existing & computed
+            if valid != existing:
+                row.stale_column_ids = ",".join(sorted(valid))
+                existing = valid
+                changed = True
+
             previous = before.get(str(row.id))
             if not previous:
                 continue  # created during this run, so nothing predates it
             old_fingerprint, had_values = previous
+            had_values = tuple(key for key in had_values if key in computed)
             if not had_values:
                 continue
             if _text_fingerprint(base, row) == old_fingerprint:
                 continue  # the text is byte-identical; no value went stale
 
-            existing = {c for c in (row.stale_column_ids or "").split(",") if c}
             merged = existing | set(had_values)
             if merged != existing:
                 marked += len(merged - existing)
@@ -101,7 +136,7 @@ def mark_stale(service: Any, before: dict[str, tuple[str, tuple[str, ...]]]) -> 
                 sources=rows,
                 citations=_load_citation_rows(state.get("citations", [])),
                 imports=state.get("imports", []),
-                column_configs=_load_column_configs(state.get("column_configs", [])),
+                column_configs=configs,
             )
     return marked
 

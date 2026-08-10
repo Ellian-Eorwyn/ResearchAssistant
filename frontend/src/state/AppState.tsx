@@ -50,6 +50,7 @@ const DEFAULT_APP_SETTINGS: AppSettings = {
   use_llm: false,
   fetch_delay: 2,
   searxng_base_url: "",
+  manual_capture_watch_dir: "",
 };
 
 const DEFAULT_REPO_SETTINGS: RepoSettings = {

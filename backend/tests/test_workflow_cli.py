@@ -71,8 +71,8 @@ class CliContractTests(unittest.TestCase):
         names = set(actions[0].choices) if actions else set()
         expected = {
             "version", "doctor", "where", "plan-sheet", "create-sources",
-            "create-columns", "set-constraints", "columns", "fetch", "convert",
-            "triage", "retry", "attach", "run-column", "remap", "watch",
+            "create-columns", "set-constraints", "set-values", "columns", "fetch",
+            "convert", "triage", "retry", "attach", "run-column", "remap", "watch",
         }
         self.assertEqual(names, expected)
 

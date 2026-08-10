@@ -12,7 +12,7 @@ from unittest import mock
 
 from backend.models.export import ExportRow
 from backend.models.operations import VerifyIssue
-from backend.models.sources import SourceManifestRow
+from backend.models.sources import SourceManifestRow, SourcePhaseMetadata
 from backend.storage.attached_repository import AttachedRepositoryService
 from backend.storage.file_store import FileStore
 from backend.storage.repo_operations import (
@@ -658,6 +658,58 @@ class AttachFilesTests(_OperationsTestCase):
         manual = [i for i in state["imports"] if i.get("import_type") == "manual_attach"]
         self.assertEqual(manual[0]["source_ids"], ["000002"])
 
+    def test_an_id_filename_creates_the_source_it_names(self) -> None:
+        # How a planning sheet's document rows arrive: the user saves the file
+        # under the id their sheet gave it, for a source that does not exist yet.
+        (self.inbox() / "ID#109-ocr.pdf").write_bytes(b"%PDF-1.4 claude")
+
+        result = self.apply("attach_files", {})
+
+        self.assertEqual(result.status, "applied", result.message)
+        rows = self.rows_by_id()
+        self.assertIn("000109", rows)
+        self.assertEqual(rows["000109"]["raw_file"], "sources/000109/000109_ID#109-ocr.pdf")
+        # An uploaded document was never going to be fetched, so it is not a
+        # fetch that succeeded -- it is a fetch that does not apply.
+        self.assertEqual(rows["000109"]["fetch_status"], "not_applicable")
+        self.assertEqual(rows["000109"]["source_kind"], "uploaded_document")
+
+    def test_id_filename_variants_all_name_the_same_source(self) -> None:
+        for name in ("ID-109.pdf", "id 109 copy.pdf", "ID#109.pdf", "ID109.pdf"):
+            with self.subTest(name=name):
+                candidate = self._candidate_for(name)
+                self.assertEqual(candidate, "000109")
+
+    def test_a_filename_starting_with_a_year_is_not_read_as_an_id(self) -> None:
+        # `2024-report.pdf` is a normal name; reading it as source 2024 would put
+        # the file somewhere the user never asked for.
+        self.assertEqual(self._candidate_for("2024-report.pdf"), "")
+
+    def _candidate_for(self, name: str) -> str:
+        from backend.storage.repo_operations.attach_files import _ID_LABEL_RE
+
+        match = _ID_LABEL_RE.match(name)
+        return f"{int(match.group(1)):06d}" if match else ""
+
+    def test_two_files_naming_one_id_is_a_blocker(self) -> None:
+        (self.inbox() / "ID#109-a.pdf").write_bytes(b"%PDF-1.4 first")
+        (self.inbox() / "ID#109-b.pdf").write_bytes(b"%PDF-1.4 second")
+
+        plan = self.plan("attach_files", {})
+        self.assertEqual([i.code for i in plan.blockers], ["id_claimed_twice"])
+
+    def test_an_id_filename_for_an_existing_source_attaches_to_it(self) -> None:
+        (self.inbox() / "ID#1-saved.pdf").write_bytes(b"%PDF-1.4 saved")
+
+        result = self.apply(
+            "attach_files", {"hints": [{"path": "ID#1-saved.pdf", "role": "raw_file"}]}
+        )
+
+        self.assertEqual(result.status, "applied", result.message)
+        rows = self.rows_by_id()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows["000001"]["raw_file"], "sources/000001/000001_ID#1-saved.pdf")
+
     def test_can_refuse_to_create_new_sources(self) -> None:
         (self.inbox() / "orphan.pdf").write_bytes(b"%PDF-1.4 orphan")
         plan = self.plan("attach_files", {"allow_new_sources": False})
@@ -710,6 +762,145 @@ class AttachFilesTests(_OperationsTestCase):
         self.assertEqual(updated["fetch_status"], "success")
         self.assertEqual(updated["error_message"], "")
         self.assertEqual(updated["fetch_method"], "manual_attach")
+
+    def _block_source(self, source_id: str = "000001") -> None:
+        """Leave the row exactly as a blocked run does: held phases and all."""
+        with self.service._writer_lock():
+            rows = _load_rows(self.service)
+            row = next(item for item in rows if item.id == source_id)
+            row.fetch_status = "blocked"
+            row.fetch_verification = "blocked_challenge"
+            row.error_message = "blocked_challenge: bot wall"
+            row.notes = "blocked_request"
+            row.title = "Attention Required! | Cloudflare"
+            for phase, field in (
+                ("cleanup", "llm_cleanup_status"),
+                ("title", "title_status"),
+                ("catalog", "catalog_status"),
+                ("summary", "summary_status"),
+                ("rating", "rating_status"),
+            ):
+                setattr(row, field, "skipped_blocked_fetch")
+                row.phase_metadata[phase] = SourcePhaseMetadata(
+                    phase=phase, status="skipped", error_code="blocked_fetch"
+                )
+            self.service._save_state_locked(sources=rows, citations=[], imports=[])
+            self.service._rebuild_outputs_locked(rows, [])
+
+    def test_attaching_a_document_clears_a_blocked_fetch(self) -> None:
+        """A bot wall is the case this operation exists to rescue."""
+        self._block_source()
+        (self.inbox() / "saved-page.html").write_text(
+            "<html><head><title>Real Article</title></head><body><article><p>"
+            + ("Real content about distributed energy resources. " * 60)
+            + "</p></article></body></html>",
+            encoding="utf-8",
+        )
+        result = self.apply(
+            "attach_files",
+            {"hints": [{"path": "saved-page.html", "source_id": "000001", "role": "raw_file"}]},
+        )
+
+        self.assertEqual(result.status, "applied", result.message)
+        updated = self.rows_by_id()["000001"]
+        self.assertEqual(updated["fetch_status"], "success")
+        self.assertEqual(updated["error_message"], "")
+        self.assertEqual(updated["fetch_verification"], "")
+        self.assertEqual(updated["fetch_method"], "manual_attach")
+        self.assertNotIn("blocked_request", updated["notes"])
+
+    def test_resolving_a_block_releases_the_phases_it_held_back(self) -> None:
+        """Skipped phases produced nothing, so staling cannot reach them."""
+        self._block_source()
+        (self.inbox() / "saved-page.html").write_text(
+            "<html><head><title>Real Article</title></head><body><article><p>"
+            + ("Real content about distributed energy resources. " * 60)
+            + "</p></article></body></html>",
+            encoding="utf-8",
+        )
+        self.apply(
+            "attach_files",
+            {"hints": [{"path": "saved-page.html", "source_id": "000001", "role": "raw_file"}]},
+        )
+
+        updated = self.rows_by_id()["000001"]
+        for field in (
+            "llm_cleanup_status",
+            "catalog_status",
+            "summary_status",
+            "rating_status",
+        ):
+            self.assertEqual(updated[field], "", f"{field} still holds the block's skip")
+        for phase in ("cleanup", "catalog", "summary", "rating"):
+            self.assertNotIn(phase, updated.get("phase_metadata") or {})
+
+    def test_the_plan_names_the_phases_a_block_was_holding(self) -> None:
+        self._block_source()
+        (self.inbox() / "saved-page.html").write_text(
+            "<html><head><title>Real Article</title></head><body><article><p>"
+            + ("Real content about distributed energy resources. " * 60)
+            + "</p></article></body></html>",
+            encoding="utf-8",
+        )
+        plan = self.plan(
+            "attach_files",
+            {"hints": [{"path": "saved-page.html", "source_id": "000001", "role": "raw_file"}]},
+        )
+
+        status_change = next(
+            change for change in plan.changes if change.field == "fetch_status"
+        )
+        self.assertEqual(status_change.before, "blocked")
+        self.assertEqual(status_change.after, "success")
+
+        released = next(
+            change
+            for change in plan.changes
+            if change.field == "phase_metadata.skipped_blocked_fetch"
+        )
+        self.assertIn("summary", released.before)
+        self.assertEqual(released.after, "cleared")
+
+    def test_attaching_the_saved_bot_wall_does_not_count_as_a_fix(self) -> None:
+        """Saving the challenge screen must not silently mark the source good."""
+        self._block_source()
+        (self.inbox() / "saved-page.html").write_text(
+            "<html><head><title>Just a moment...</title></head><body>"
+            "<p>Verifying you are human. This may take a few seconds.</p>"
+            "<p>Enable JavaScript and cookies to continue.</p></body></html>",
+            encoding="utf-8",
+        )
+        plan = self.plan(
+            "attach_files",
+            {"hints": [{"path": "saved-page.html", "source_id": "000001", "role": "raw_file"}]},
+        )
+        self.assertIn(
+            "attached_file_is_a_block_page",
+            [issue.code for issue in plan.warnings],
+        )
+        self.assertEqual(
+            [change for change in plan.changes if change.field == "fetch_status"], []
+        )
+
+        self.apply(
+            "attach_files",
+            {"hints": [{"path": "saved-page.html", "source_id": "000001", "role": "raw_file"}]},
+        )
+        updated = self.rows_by_id()["000001"]
+        self.assertEqual(updated["fetch_status"], "blocked")
+        self.assertEqual(updated["summary_status"], "skipped_blocked_fetch")
+        # Stored anyway: it is evidence, and stranding it helps nobody.
+        self.assertTrue(updated["raw_file"])
+
+    def test_a_non_fetch_artifact_does_not_clear_a_blocked_fetch(self) -> None:
+        """A summary says nothing about whether the page was ever retrieved."""
+        self._block_source()
+        (self.inbox() / "000001_summary.md").write_text("# Summary\n", encoding="utf-8")
+        self.apply("attach_files", {})
+
+        updated = self.rows_by_id()["000001"]
+        self.assertEqual(updated["fetch_status"], "blocked")
+        self.assertTrue(updated["summary_file"])
 
     def test_a_non_fetch_artifact_does_not_clear_a_failed_fetch(self) -> None:
         """A summary says nothing about whether the page was ever retrieved."""

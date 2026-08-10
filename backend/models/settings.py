@@ -31,6 +31,10 @@ class AppSettings(BaseModel):
     use_llm: bool = False
     searxng_base_url: str = ""
     fetch_delay: float = Field(default=2.0, ge=1.0, le=10.0)
+    # Where a browser drops files the user collected by hand. Left blank rather
+    # than defaulting to a literal path so the fallback stays in one place and
+    # someone who never opens Settings still gets a working watch folder.
+    manual_capture_watch_dir: str = ""
 
     @field_validator("searxng_base_url")
     @classmethod

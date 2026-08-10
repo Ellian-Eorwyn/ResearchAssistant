@@ -283,6 +283,8 @@ export interface AppSettings {
   use_llm: boolean;
   searxng_base_url: string;
   fetch_delay: number;
+  /** Folder the browser saves into. Blank means `~/Downloads`. */
+  manual_capture_watch_dir: string;
 }
 
 export interface DirectoryEntry {
@@ -1205,6 +1207,25 @@ export interface ResolveSourceListResponse {
   partial_count: number;
   /** True when this request triggered the one-shot retroactive re-verification. */
   reverified: boolean;
+}
+
+export interface WatchFolderFile {
+  path: string;
+  name: string;
+  size_bytes: number;
+  modified_at: string;
+  modified_ms: number;
+  extension: string;
+  /** Landed after the user opened this source in their own browser. */
+  is_new: boolean;
+}
+
+export interface WatchFolderListResponse {
+  root: string;
+  /** False when the folder is missing — point the user at Settings, not an empty list. */
+  configured: boolean;
+  files: WatchFolderFile[];
+  error: string;
 }
 
 export interface CaptureAvailabilityResponse {

@@ -8,9 +8,12 @@ the capture that writes the real page back into the same source id.
 from __future__ import annotations
 
 import logging
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, Response, UploadFile
+from fastapi.concurrency import run_in_threadpool
 
 from backend.models.capture import (
     CaptureInputRequest,
@@ -20,25 +23,31 @@ from backend.models.capture import (
     CaptureSessionListResponse,
     CaptureSessionRequest,
     CaptureAvailabilityResponse,
+    ManualAttachPathRequest,
     ResolveSourceListResponse,
     ResolveSourceRow,
+    WatchFolderFile,
+    WatchFolderListResponse,
 )
 from backend.models.repository import RepositoryCaptureResponse
-from backend.pipeline.fetch_verification import verify_fetch
 from backend.pipeline.interactive_browser import (
     InteractiveBrowserError,
     InteractiveBrowserSession,
 )
-from backend.pipeline.source_capture import CAPTURE_FETCH_METHOD, UPLOAD_FETCH_METHOD, CapturedArtifacts
+from backend.pipeline.source_capture import (
+    CAPTURE_FETCH_METHOD,
+    MAX_UPLOAD_BYTES,
+    REJECTED_ARCHIVE_EXTENSIONS,
+    SUPPORTED_UPLOAD_EXTENSIONS,
+    CapturedArtifacts,
+    UnsupportedManualUploadError,
+    artifacts_from_uploaded_bytes,
+)
 from backend.pipeline.source_downloader import (
-    build_searchable_pdf,
-    decode_bytes_to_text,
     detect_runtime_capabilities,
     effective_markdown_rel_path,
     extract_canonical_url,
     extract_markdown_with_fallback,
-    extract_pdf_pages,
-    extract_title,
     png_images_to_pdf_bytes,
 )
 
@@ -49,6 +58,11 @@ router = APIRouter()
 RESOLVABLE_STATUSES = {"blocked", "failed", "partial"}
 PREVIEW_CHARS = 4000
 MAX_VECTOR_PDF_PAGE_POINTS = 14000
+
+# Watch folder: where a browser drops the pages the user saved by hand.
+DEFAULT_WATCH_DIR = "~/Downloads"
+# A stop so a pathological folder cannot turn one request into a long scan.
+MAX_WATCH_SCAN_ENTRIES = 5000
 
 
 def _service(request: Request):
@@ -67,6 +81,243 @@ def _manager(request: Request):
 
 def _session_info(session: InteractiveBrowserSession) -> CaptureSessionInfo:
     return CaptureSessionInfo(**session.info())
+
+
+def _capture_or_http_error(
+    service,
+    source_id: str,
+    artifacts: CapturedArtifacts,
+) -> RepositoryCaptureResponse:
+    """Write artifacts into a source, translating the service's refusals.
+
+    Every manual route ends here, so a running job or an unknown id reads the
+    same whether the file came from the live browser, an upload or the watch
+    folder.
+    """
+    try:
+        return service.capture_source_artifacts(source_id=source_id, artifacts=artifacts)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 404 if "unknown source_id" in detail.lower() else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+
+
+def _watch_root(request: Request) -> Path:
+    """The folder the user's browser saves into, as configured or defaulted."""
+    configured = ""
+    try:
+        configured = str(
+            request.app.state.file_store.load_app_settings().manual_capture_watch_dir or ""
+        ).strip()
+    except Exception:
+        logger.exception("capture: could not read the watch folder setting")
+    return Path(configured or DEFAULT_WATCH_DIR).expanduser()
+
+
+def _is_within(candidate: Path, root: Path) -> bool:
+    return candidate == root or root in candidate.parents
+
+
+def _watch_path_refusal(candidate: Path, root: Path) -> tuple[str, str] | None:
+    """Why this path may not be read, or None if it may.
+
+    The client hands us a server-side filesystem path, so this is the security
+    boundary, not a convenience check. The app binds loopback, which means the
+    realistic attacker is a web page reaching localhost — and without
+    containment this endpoint is an arbitrary-file-read that would copy
+    something like `~/.ssh/id_rsa` into the repository, where the LLM phases
+    would then read it back out.
+
+    The ordering matches `repo_operations.attach_files._collect_candidates`:
+    refuse a symlink before resolving, check containment before existence so a
+    traversal reports as a traversal, and resolve *both* sides — on macOS
+    `/tmp` is `/private/tmp` and `$HOME` sits under `/System/Volumes/Data`, so
+    comparing unresolved strings produces false negatives.
+    """
+    if candidate.is_symlink():
+        return ("symlink_not_allowed", "That path is a symlink. Attach the file itself.")
+
+    resolved = candidate.resolve()
+    # resolve() also collapses a symlinked *parent*, so a link partway up the
+    # path is caught here even though the check above only sees the leaf.
+    if not _is_within(resolved, root.resolve()):
+        return (
+            "path_outside_watch_folder",
+            "That file is outside the watch folder. Change the folder in Settings, "
+            "or upload the file directly.",
+        )
+    if not resolved.is_file():
+        return ("file_not_found", "That file is no longer there.")
+
+    suffix = resolved.suffix.lower()
+    if suffix in REJECTED_ARCHIVE_EXTENSIONS:
+        return (
+            "unsupported_file_type",
+            "MHTML archives are not supported. Save the page as HTML "
+            "(or print it to PDF) and attach that instead.",
+        )
+    if suffix not in SUPPORTED_UPLOAD_EXTENSIONS:
+        return (
+            "unsupported_file_type",
+            f"Unsupported file type `{suffix or resolved.name}`. Attach HTML, PDF, or Markdown.",
+        )
+
+    size = resolved.stat().st_size
+    if size == 0:
+        return ("empty_file", "That file is empty.")
+    if size > MAX_UPLOAD_BYTES:
+        return (
+            "file_too_large",
+            f"That file is {size // (1024 * 1024)} MB, over the "
+            f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit.",
+        )
+    return None
+
+
+def _scan_watch_folder(
+    root: Path,
+    *,
+    since_ms: int,
+    max_age_minutes: int,
+    limit: int,
+) -> WatchFolderListResponse:
+    """List recent attachable files, newest first. Blocking; run in a threadpool."""
+    response = WatchFolderListResponse(root=str(root))
+    try:
+        if not root.is_dir():
+            response.error = (
+                f"`{root}` is not a folder. Set a watch folder in Settings."
+            )
+            return response
+        response.configured = True
+
+        cutoff = time.time() - max_age_minutes * 60
+        found: list[WatchFolderFile] = []
+        # Depth 1 only: saving a page "complete" writes a sibling `<name>_files/`
+        # folder, and recursing into it would bury the page under its own assets.
+        for index, entry in enumerate(root.iterdir()):
+            if index >= MAX_WATCH_SCAN_ENTRIES:
+                break
+            if entry.name.startswith("."):
+                continue
+            suffix = entry.suffix.lower()
+            if suffix not in SUPPORTED_UPLOAD_EXTENSIONS:
+                continue
+            try:
+                # Everything the attach guard would refuse is filtered here too,
+                # so the list never offers a file that cannot then be attached.
+                if entry.is_symlink() or not entry.is_file():
+                    continue
+                stat = entry.stat()
+            except OSError:
+                continue
+            if stat.st_mtime < cutoff:
+                continue
+            # A zero-byte file is a download still in flight.
+            if stat.st_size == 0 or stat.st_size > MAX_UPLOAD_BYTES:
+                continue
+            modified_ms = int(stat.st_mtime * 1000)
+            found.append(
+                WatchFolderFile(
+                    path=str(entry),
+                    name=entry.name,
+                    size_bytes=stat.st_size,
+                    modified_at=datetime.fromtimestamp(
+                        stat.st_mtime, tz=timezone.utc
+                    ).isoformat(),
+                    modified_ms=modified_ms,
+                    extension=suffix,
+                    is_new=bool(since_ms) and modified_ms >= since_ms,
+                )
+            )
+
+        found.sort(key=lambda item: item.modified_ms, reverse=True)
+        response.files = found[:limit]
+        return response
+    except PermissionError:
+        # macOS gates ~/Downloads behind Files-and-Folders access, so this is a
+        # routine first-run state rather than an error worth a 500.
+        response.error = (
+            f"No permission to read `{root}`. On macOS, grant the app "
+            "Files and Folders access under System Settings → Privacy & Security."
+        )
+        return response
+    except OSError as exc:
+        response.error = f"Could not read `{root}`: {exc}"
+        return response
+
+
+@router.get("/capture/watch-folder", response_model=WatchFolderListResponse)
+async def list_watch_folder(
+    request: Request,
+    since_ms: int = Query(default=0, ge=0),
+    max_age_minutes: int = Query(default=1440, ge=1, le=20160),
+    limit: int = Query(default=40, ge=1, le=200),
+) -> WatchFolderListResponse:
+    """Recent files in the user's download folder, newest first.
+
+    Deliberately does not require an attached repository, so the panel can
+    render its guidance before one is picked. The scan is pushed to a thread:
+    a blocking `iterdir()` over a large folder on the event loop would also
+    stall the frame long-poll and visibly hitch the live browser stream.
+    """
+    root = _watch_root(request)
+    return await run_in_threadpool(
+        _scan_watch_folder,
+        root,
+        since_ms=since_ms,
+        max_age_minutes=max_age_minutes,
+        limit=limit,
+    )
+
+
+@router.post(
+    "/capture/sources/{source_id}/attach-path",
+    response_model=RepositoryCaptureResponse,
+)
+async def attach_watched_file_into_source(
+    source_id: str,
+    request: Request,
+    payload: ManualAttachPathRequest,
+) -> RepositoryCaptureResponse:
+    """Attach a file the user already downloaded, by path, without re-uploading it.
+
+    The file is only ever read — never moved, renamed or deleted. It is the
+    user's own download folder, and they may well want the file afterwards.
+    """
+    service = _service(request)
+    root = _watch_root(request)
+
+    raw = str(payload.path or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="A file path is required.")
+
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+
+    refusal = await run_in_threadpool(_watch_path_refusal, candidate, root)
+    if refusal is not None:
+        code, message = refusal
+        raise HTTPException(
+            status_code=404 if code == "file_not_found" else 400,
+            detail=message,
+        )
+
+    resolved = candidate.resolve()
+    content = await run_in_threadpool(resolved.read_bytes)
+    try:
+        artifacts = artifacts_from_uploaded_bytes(
+            content=content,
+            filename=resolved.name,
+            final_url=payload.final_url,
+        )
+    except UnsupportedManualUploadError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return _capture_or_http_error(service, source_id, artifacts)
 
 
 @router.get("/capture/availability", response_model=CaptureAvailabilityResponse)
@@ -361,14 +612,7 @@ async def capture_session_into_source(
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Could not read the page: {exc}") from exc
 
-    try:
-        result = service.capture_source_artifacts(source_id=source_id, artifacts=artifacts)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ValueError as exc:
-        detail = str(exc)
-        status_code = 404 if "unknown source_id" in detail.lower() else 400
-        raise HTTPException(status_code=status_code, detail=detail) from exc
+    result = _capture_or_http_error(service, source_id, artifacts)
 
     if result.status == "captured":
         # Keep the cookies that got us through, so automated fetches of this
@@ -395,79 +639,14 @@ async def manual_upload_into_source(
     """
     service = _service(request)
     content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
-
-    suffix = Path(file.filename or "").suffix.lower()
-    artifacts = CapturedArtifacts(
-        final_url=final_url,
-        fetch_method=UPLOAD_FETCH_METHOD,
-        http_status=200,
-    )
-
-    if suffix in {".html", ".htm", ".xhtml"}:
-        html = decode_bytes_to_text(content)
-        capabilities = detect_runtime_capabilities(use_llm=False, llm_backend=None)
-        markdown, used_fallback, _ = extract_markdown_with_fallback(html, capabilities)
-        artifacts.raw_html = html
-        artifacts.markdown = markdown
-        artifacts.title = extract_title(html)
-        artifacts.canonical_url = extract_canonical_url(html)
-        artifacts.content_type = "text/html"
-        artifacts.detected_type = "html"
-        artifacts.extraction_method = (
-            "raw_html_manual_fallback" if used_fallback else "raw_html_manual"
-        )
-    elif suffix == ".pdf":
-        artifacts.raw_pdf = content
-        artifacts.content_type = "application/pdf"
-        artifacts.detected_type = "pdf"
-        pages = extract_pdf_pages(content)
-        artifacts.markdown = "\n\n".join(
-            str(page.get("text") or "").strip() for page in pages if page.get("text")
-        ).strip()
-        artifacts.extraction_method = "pdf_text_manual"
-        ocr_pdf, ocr_status, _ = build_searchable_pdf(content)
-        if ocr_pdf:
-            artifacts.ocr_pdf = ocr_pdf
-            artifacts.ocr_status = ocr_status
-    elif suffix in {".md", ".markdown", ".txt"}:
-        artifacts.markdown = decode_bytes_to_text(content)
-        artifacts.content_type = "text/plain"
-        artifacts.detected_type = "document"
-        artifacts.extraction_method = "manual_markdown"
-    elif suffix in {".mhtml", ".mht"}:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "MHTML archives are not supported. Save the page as HTML "
-                "(or print it to PDF) and upload that instead."
-            ),
-        )
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file type `{suffix or file.filename}`. Upload HTML, PDF, or Markdown.",
-        )
-
-    # An uploaded file has no HTTP evidence, so the verifier only sees the text;
-    # judging it the same way keeps a saved block page from counting as a fix.
-    verification = verify_fetch(
-        http_status=None,
-        final_url=final_url,
-        title=artifacts.title,
-        raw_html=artifacts.raw_html,
-        extracted_text=artifacts.markdown,
-        content_type=artifacts.content_type,
-        detected_type=artifacts.detected_type,
-    )
-    artifacts.notes.append(f"verify_{verification.reason}")
 
     try:
-        return service.capture_source_artifacts(source_id=source_id, artifacts=artifacts)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ValueError as exc:
-        detail = str(exc)
-        status_code = 404 if "unknown source_id" in detail.lower() else 400
-        raise HTTPException(status_code=status_code, detail=detail) from exc
+        artifacts = artifacts_from_uploaded_bytes(
+            content=content,
+            filename=file.filename or "",
+            final_url=final_url,
+        )
+    except UnsupportedManualUploadError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return _capture_or_http_error(service, source_id, artifacts)

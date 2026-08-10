@@ -20,6 +20,11 @@ from .models import EncodingRepair
 # attempted at all. Ordered by how often the damage is seen in the wild.
 CANDIDATE_CODECS: tuple[str, ...] = ("cp1252", "mac_roman")
 
+# How many times one mis-decode may be undone. Text mangled twice is common
+# enough to be worth handling; a chain longer than this is more likely to be a
+# bug in the reasoning above than a file that survived five bad round trips.
+MAX_REPAIR_PASSES = 5
+
 # Sequences that only appear when UTF-8 has been misread. Each is the start of a
 # mangled multi-byte character rather than a whole one, so counting them
 # approximates "how much damage is in this text".
@@ -52,35 +57,58 @@ def looks_mangled(text: str) -> bool:
     return count_suspicious(text) > 0
 
 
+def _one_pass(text: str, codec: str) -> str:
+    """Reverse one mis-decode, or return "" when this codec cannot explain it."""
+    try:
+        repaired = text.encode(codec).decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError, LookupError):
+        return ""
+    if repaired == text:
+        return ""
+    try:
+        # Reversing the repair must reproduce the original exactly, or we
+        # are corrupting something rather than fixing it.
+        if repaired.encode("utf-8").decode(codec) != text:
+            return ""
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return ""
+    return repaired
+
+
 def repair_text(text: str, *, codecs: tuple[str, ...] = CANDIDATE_CODECS) -> tuple[str, str]:
     """Return `(repaired_text, codec_used)`, or `(text, "")` when not repairable.
 
-    A candidate is accepted only if the round trip is exact and the damage
-    strictly decreases. Both conditions matter: the round trip proves we are
-    reversing a real mis-decode rather than inventing characters, and the
-    decrease proves the result is actually better.
+    A candidate is accepted only if every round trip is exact and the damage
+    strictly decreases across the whole chain. Both conditions matter: the round
+    trip proves we are reversing a real mis-decode rather than inventing
+    characters, and the decrease proves the result is actually better.
+
+    The chain is what makes repeated damage repairable. A file that was mangled,
+    saved, and mangled again holds `‚Äö√Ñ√Æ` where an em dash belongs, and one
+    pass only gets it back to `‚Äî` -- still broken, and scoring exactly as many
+    markers as it started with. Judging a single pass by that count rejects the
+    repair and gives up on the file; judging the chain accepts it and runs the
+    round trip again, which lands on `—`.
+
+    Each pass must round-trip on its own, so a longer chain is no less safe than
+    a single step: it is the same proof, applied twice. Repairing stops as soon
+    as the text is clean, so undamaged text is never put through a second pass.
     """
     if not text or not looks_mangled(text):
         return text, ""
 
     before = count_suspicious(text)
     for codec in codecs:
-        try:
-            repaired = text.encode(codec).decode("utf-8")
-        except (UnicodeEncodeError, UnicodeDecodeError, LookupError):
-            continue
-        if repaired == text:
-            continue
-        try:
-            # Reversing the repair must reproduce the original exactly, or we
-            # are corrupting something rather than fixing it.
-            if repaired.encode("utf-8").decode(codec) != text:
-                continue
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            continue
-        if count_suspicious(repaired) >= before:
-            continue
-        return repaired, codec
+        current = text
+        for _ in range(MAX_REPAIR_PASSES):
+            repaired = _one_pass(current, codec)
+            if not repaired:
+                break
+            current = repaired
+            if count_suspicious(current) == 0:
+                break
+        if current != text and count_suspicious(current) < before:
+            return current, codec
 
     return text, ""
 

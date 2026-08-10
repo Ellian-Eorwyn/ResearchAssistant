@@ -694,6 +694,56 @@ def mark_downstream_stale_for_blocked(row: SourceManifestRow) -> list[str]:
     return staled
 
 
+# What `_skip_phase_for_blocked_fetch` writes, so the two stay in step.
+BLOCKED_SKIP_ERROR_CODE = "blocked_fetch"
+BLOCKED_SKIP_STATUS = "skipped_blocked_fetch"
+
+
+def blocked_skipped_phases(row: SourceManifestRow) -> list[str]:
+    """Phases held back because the fetch was blocked. Read-only.
+
+    Shared by the plan preview and the apply step so a dry run names exactly the
+    phases the real run will release.
+    """
+    found: list[str] = []
+    for phase, status_field in DOWNSTREAM_PHASE_STATUS_FIELDS:
+        metadata = _get_phase_metadata(row, phase)
+        field_status = (
+            str(getattr(row, status_field, "") or "").strip().lower() if status_field else ""
+        )
+        if (
+            metadata is not None
+            and str(metadata.error_code or "").strip() == BLOCKED_SKIP_ERROR_CODE
+        ) or field_status == BLOCKED_SKIP_STATUS:
+            found.append(phase)
+    return found
+
+
+def clear_blocked_fetch_skips(row: SourceManifestRow) -> list[str]:
+    """Undo the phase skips a blocked fetch caused, once real content arrives.
+
+    While a source is blocked its LLM phases are held back deliberately, since
+    cataloguing a Cloudflare interstitial writes plausible metadata about the
+    wall. When the page is finally obtained by hand, that hold has to be
+    released — and staling is the wrong tool: `mark_downstream_stale` only
+    touches phases carrying a content digest, and a phase that was skipped never
+    ran, so it has none. Left alone, the row reads `success` while every phase
+    below it still says `skipped_blocked_fetch` and nothing reports as
+    outstanding.
+
+    So these are reset to never-run rather than to stale: there is no previous
+    output to invalidate, only work that was never allowed to start.
+    """
+    cleared = blocked_skipped_phases(row)
+    status_fields = dict(DOWNSTREAM_PHASE_STATUS_FIELDS)
+    for phase in cleared:
+        row.phase_metadata.pop(_normalize_phase_name(phase), None)
+        status_field = status_fields.get(phase, "")
+        if status_field:
+            setattr(row, status_field, "")
+    return cleared
+
+
 # Artifact paths. These live at module level so anything writing into a source
 # — the downloader, an interactive capture, a manual upload — produces the exact
 # same filenames rather than inventing a parallel convention.
@@ -914,9 +964,16 @@ class PlaywrightRenderer:
         self._context = None
         self._startup_error: str = startup_error
 
-    def _new_page(self, **kwargs):
-        """Pages come from the shared context so captured cookies apply."""
-        return self._context.new_page(**kwargs)
+    def _new_page(self):
+        """Pages come from the shared context so captured cookies apply.
+
+        Deliberately takes no arguments. Per-page options such as `viewport`
+        belong to `Browser.new_page`, which makes its own context; passing one
+        here raises `TypeError` and takes the whole run down with it. The
+        context set in `_ensure_started` already carries the viewport, the user
+        agent and the locale, and every page inherits them.
+        """
+        return self._context.new_page()
 
     def render(self, url: str) -> tuple[str, str]:
         if self._startup_error:
@@ -945,12 +1002,7 @@ class PlaywrightRenderer:
             self._startup_error = _normalize_playwright_error(exc)
             return b"", self._startup_error, []
 
-        page = self._new_page(
-            viewport={
-                "width": PLAYWRIGHT_VIEWPORT_WIDTH,
-                "height": PLAYWRIGHT_VIEWPORT_HEIGHT,
-            }
-        )
+        page = self._new_page()
         notes: list[str] = []
         try:
             page.goto(url, wait_until="networkidle", timeout=self.timeout_ms)
@@ -1496,12 +1548,22 @@ class SourceDownloadOrchestrator:
                                 continue
 
                             self._mark_item_running(target)
-                            row = self._process_target(
-                                target=target,
-                                client=client,
-                                renderer=renderer,
-                                existing_row=existing_row,
-                            )
+                            try:
+                                row = self._process_target(
+                                    target=target,
+                                    client=client,
+                                    renderer=renderer,
+                                    existing_row=existing_row,
+                                )
+                            except Exception as exc:
+                                # `_process_target` handles the failures it
+                                # expects; this catches the ones it does not --
+                                # a browser API misuse, a hostile page crashing
+                                # Chromium. Without it a single source ends the
+                                # whole run, so a hundred good URLs are lost to
+                                # one bad one and the counts report neither an
+                                # success nor a failure for any of them.
+                                row = self._failed_row_for(target, existing_row, exc)
                             rows_by_id[row.id] = row
                             self._persist_sink_row(row)
                             self._mark_item_finished(row)
@@ -2397,6 +2459,44 @@ class SourceDownloadOrchestrator:
         if added and self.status is not None:
             self._save_status()
         return added
+
+    def _failed_row_for(
+        self,
+        target: SourceTarget,
+        existing_row: SourceManifestRow | None,
+        exc: BaseException,
+    ) -> SourceManifestRow:
+        """Record one source as failed after an error nothing else expected.
+
+        Deliberately verbose in `error_message`: an `internal_error` is a bug in
+        this pipeline rather than anything the user can fix, so the exception
+        type and message have to survive into the manifest for it to be
+        diagnosable after the run.
+        """
+        if existing_row is not None:
+            row = existing_row.model_copy(deep=True)
+            row.id = target.id
+        else:
+            row = SourceManifestRow(
+                id=target.id,
+                source_kind=target.source_kind,
+                source_document_name=target.source_document_name,
+                citation_number=target.citation_number,
+                original_url=target.original_url,
+            )
+        message = f"internal_error: {type(exc).__name__}: {exc}"
+        logger.exception("source %s failed with an unexpected error", target.id)
+        row.fetch_status = "failed"
+        row.error_message = message
+        row.fetched_at = _utc_now_iso()
+        self._complete_row_phase(
+            row,
+            PHASE_FETCH,
+            status="failed",
+            error=message,
+            error_code="internal_error",
+        )
+        return row
 
     def _process_target(
         self,

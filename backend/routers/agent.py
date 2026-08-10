@@ -187,16 +187,35 @@ def _authorize(request: Request, *, access: str, request_id: str) -> JSONRespons
     return None
 
 
+PHASE_NAMES = ("fetch", "convert", "cleanup", "tag", "summarize")
+
+
 def _normalize_requested_phases(values: list[str]) -> list[str]:
-    allowed = {"fetch", "convert", "tag", "summarize"}
+    """Lower-case, de-duplicate and validate the requested phase names.
+
+    An unrecognised name used to be dropped in silence, so asking for a phase
+    this API did not have ran the rest and reported success -- the request was
+    half-honoured and nothing said so. Refusing is the only answer that cannot
+    be mistaken for the phase having run.
+    """
     phases: list[str] = []
     seen: set[str] = set()
+    unknown: list[str] = []
     for item in values:
         phase = str(item or "").strip().lower()
-        if phase not in allowed or phase in seen:
+        if not phase or phase in seen:
+            continue
+        if phase not in PHASE_NAMES:
+            unknown.append(phase)
             continue
         seen.add(phase)
         phases.append(phase)
+    if unknown:
+        raise ValueError(
+            f"Unknown phase(s): {', '.join(sorted(unknown))}. Choose from: "
+            + ", ".join(PHASE_NAMES)
+            + "."
+        )
     return phases
 
 
@@ -217,6 +236,7 @@ def _to_repository_task_request(payload: AgentRunSourcePhasesRequest) -> Reposit
         raise ValueError("At least one phase is required.")
     run_download = "fetch" in phases
     run_convert = "convert" in phases
+    run_cleanup = "cleanup" in phases
     run_tag = "tag" in phases
     run_summarize = "summarize" in phases
     force = bool(payload.force)
@@ -229,13 +249,13 @@ def _to_repository_task_request(payload: AgentRunSourcePhasesRequest) -> Reposit
         rerun_failed_only=False,
         run_download=run_download,
         run_convert=run_convert,
-        run_llm_cleanup=False,
+        run_llm_cleanup=run_cleanup,
         run_llm_title=False,
         run_llm_summary=run_summarize,
         run_llm_rating=run_tag,
         force_redownload=force and run_download,
         force_convert=force and run_convert,
-        force_llm_cleanup=False,
+        force_llm_cleanup=force and run_cleanup,
         force_title=False,
         force_summary=force and run_summarize,
         force_rating=force and run_tag,

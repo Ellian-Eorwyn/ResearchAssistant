@@ -34,6 +34,34 @@ class ResolveSourceListResponse(BaseModel):
     reverified: bool = False
 
 
+class WatchFolderFile(BaseModel):
+    """One file in the watch folder that could be attached to a source."""
+
+    path: str
+    name: str = ""
+    size_bytes: int = 0
+    modified_at: str = ""
+    modified_ms: int = 0
+    extension: str = ""
+    # Landed after the user last said "open this source in my browser", so it is
+    # almost certainly the thing they just saved.
+    is_new: bool = False
+
+
+class WatchFolderListResponse(BaseModel):
+    root: str = ""
+    # False when the folder is missing entirely, so the UI can point at Settings
+    # instead of showing an empty list that looks like a bug.
+    configured: bool = False
+    files: list[WatchFolderFile] = Field(default_factory=list)
+    error: str = ""
+
+
+class ManualAttachPathRequest(BaseModel):
+    path: str
+    final_url: str = ""
+
+
 class CaptureAvailabilityResponse(BaseModel):
     available: bool = False
     headless: bool = True

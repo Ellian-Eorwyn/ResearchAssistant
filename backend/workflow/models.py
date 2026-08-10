@@ -105,6 +105,35 @@ class SheetSource(BaseModel):
     row: int
     id: str = ""
     url: str = ""
+    # Ids of other sheet rows holding the same URL, which this source now stands
+    # for. Empty unless the caller asked for duplicates to be merged.
+    merged_ids: list[str] = Field(default_factory=list)
+    merged_rows: list[int] = Field(default_factory=list)
+
+
+class SheetDocument(BaseModel):
+    """A row that names a document to be supplied by hand rather than a URL.
+
+    Kept apart from `SheetSource` because there is nothing to fetch: the row is
+    real and keeps its id, but handing it to `create_sources` could only ever
+    produce `url_invalid`.
+    """
+
+    row: int
+    id: str = ""
+    label: str = ""
+
+
+class SheetProvidedColumn(BaseModel):
+    """A column the user filled in themselves, rather than one the model writes.
+
+    It has a heading and data but no prompt, so it is not a column to run --
+    it is a column to import, keyed by the source id each value belongs to.
+    """
+
+    index: int
+    label: str = ""
+    values: dict[str, str] = Field(default_factory=dict)
 
 
 class SheetColumn(BaseModel):
@@ -126,7 +155,9 @@ class SheetPlan(BaseModel):
     layout: RowLayout = Field(default_factory=RowLayout)
     encoding_repair: EncodingRepair = Field(default_factory=EncodingRepair)
     sources: list[SheetSource] = Field(default_factory=list)
+    documents: list[SheetDocument] = Field(default_factory=list)
     columns: list[SheetColumn] = Field(default_factory=list)
+    provided_columns: list[SheetProvidedColumn] = Field(default_factory=list)
     skipped_columns: list[SheetColumn] = Field(default_factory=list)
     anomalies: list[SheetAnomaly] = Field(default_factory=list)
     summary: str = ""

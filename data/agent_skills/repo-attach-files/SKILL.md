@@ -51,13 +51,31 @@ Report the `problems` and their remedies. The ones you will actually meet:
 | `slot_occupied` | That source already has this kind of file and the content differs. Show both, ask, then add `--overwrite`. |
 | `path_outside_repository` | Ask the user to move the file inside the repository. |
 | `unknown_source_id` | The id given does not exist. Run `.agents/bin/ra where` and show them what does. |
-| `filename_id_not_found` | The `000123_` prefix names a source that is not there. |
+| `filename_id_not_found` | The `000123_` prefix names a source that is not there. That prefix is written by the app itself, so the file came from this repository and the source really should exist — unlike an `ID#123` name, which creates the source. |
+| `id_claimed_twice` | Two files name the same id. Rename one, or give each an explicit `--source-id`. |
+
+## Let the filename do the work
+
+The quickest loop, and the one to teach the user: **name each file for the id it
+belongs to** — `ID#109.pdf`, `ID-109.html`, `id 109 report.pdf` — drop them all
+in one folder inside the repository, and attach the folder in a single command.
+
+```bash
+.agents/bin/ra attach user-files/import --apply
+```
+
+Each file goes to the source that id names. If no such source exists yet, one is
+**created with that id**, which is how a planning sheet's `document_row` entries
+get their documents without any renumbering afterwards.
+
+The `id` is required in the name. `2024-report.pdf` is treated as an ordinary
+filename, not as a request for source 2024.
 
 ## Naming a target explicitly
 
-The file usually finds its own source: identical content is skipped, a
-`000042_` filename prefix names a source, and anything unmatched becomes a new
-source. To be explicit:
+The file usually finds its own source: identical content is skipped, an
+`ID#42` or `000042_` filename names a source, and anything unmatched becomes a
+new source. To be explicit:
 
 ```bash
 .agents/bin/ra attach report.pdf --source-id 000042 --role raw_file --apply
@@ -74,6 +92,14 @@ for a print-to-PDF of a page you also saved as HTML.
 
 The source should now read `success`. If it does not, say so rather than
 attaching again.
+
+A source that was `blocked` is resolved the same way: attaching a fetch-phase
+artifact clears the block *and* releases the LLM phases that were held back
+while it stood, so a following `ra run` picks them up. One exception, and the
+plan warns about it as `attached_file_is_a_block_page`: if the HTML you attached
+is itself the bot wall, the file is stored but the source stays `blocked`. That
+means the saved page was the challenge screen rather than the article — get the
+real page and attach that.
 
 **If any column already ran against that source, its values are now wrong.**
 They were computed from whatever text the failed fetch left behind — usually an

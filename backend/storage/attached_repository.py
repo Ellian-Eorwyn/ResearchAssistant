@@ -128,6 +128,7 @@ from backend.pipeline.standardized_markdown import (
 from backend.pipeline.source_downloader import (
     MANIFEST_DERIVED_COLUMNS,
     NOTE_BLOCKED_REQUEST,
+    clear_blocked_fetch_skips,
     PHASE_CATALOG,
     PHASE_CITATION_VERIFY,
     PHASE_CLEANUP,
@@ -1684,16 +1685,20 @@ class AttachedRepositoryService:
         if not artifacts.has_content():
             raise ValueError("Nothing was captured for this source.")
 
-        # A running job holds its own in-memory copy of these rows and would
-        # overwrite the capture when it finishes. The writer lock alone does not
-        # protect against that, so refuse loudly rather than lose the capture.
-        if self._download_thread and self._download_thread.is_alive():
-            raise RuntimeError(
-                "A repository operation is already running. Wait for it to finish "
-                "before capturing into a source."
-            )
-
         with self._writer_lock():
+            # A running job holds its own in-memory copy of these rows and would
+            # overwrite the capture when it finishes. The writer lock alone does
+            # not protect against that, so refuse loudly rather than lose the
+            # capture — but check inside the lock, because `start_source_tasks`
+            # assigns the thread while holding it. Checking outside let a capture
+            # pass the test, block on the lock while a job started, and then
+            # write into rows that job had already snapshotted.
+            if self._download_thread and self._download_thread.is_alive():
+                raise RuntimeError(
+                    "A repository operation is already running. Wait for it to finish "
+                    "before capturing into a source."
+                )
+
             state = self._load_state_locked()
             rows = _load_source_rows(state.get("sources", []))
             citations = _load_citation_rows(state.get("citations", []))
@@ -1776,6 +1781,13 @@ class AttachedRepositoryService:
                 source_kind=row.source_kind,
             )
 
+            # A row that was blocked had its LLM phases held back rather than
+            # run against the wall. Now that real content is here, release them
+            # — they never produced anything, so staling would not reach them.
+            # Done before the title is settled, so `title_status` is judged
+            # against a cleared field rather than the stale skip marker.
+            unblocked = [] if verification.is_blocked else clear_blocked_fetch_skips(row)
+
             # Do not let a wall's title overwrite a good one we already had.
             captured_title = str(artifacts.title or "").strip()
             if captured_title and not verification.is_blocked:
@@ -1823,6 +1835,9 @@ class AttachedRepositoryService:
                 else ""
             )
             staled = mark_downstream_stale(row, markdown_digest)
+            # Both categories mean the same thing to the caller: this phase has
+            # to run before the row is finished.
+            staled.extend(phase for phase in unblocked if phase not in staled)
 
             self._write_repository_source_metadata(row)
             rows[row_index] = row

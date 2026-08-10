@@ -62,10 +62,42 @@ Tell the user the summary and **every anomaly**. Common ones:
 - `column_without_prompt` — that column will not be created. Normal.
 - `mojibake_repaired` — damaged characters were fixed. Mention that the original
   file still contains them.
-- `duplicate_source_id`, `cell_not_a_url` — the sheet needs a human. Stop and ask.
+- `document_row` — that row's URL cell names a document rather than an address,
+  so nothing will be fetched for it. It keeps its id and is left out of
+  `create-sources`; the user supplies the file and you attach it (see below).
+- `duplicate_url` — several rows share a URL. Read the next section before
+  running `create-sources`, because it will refuse the whole request otherwise.
+- `duplicate_source_id` — the sheet needs a human. Stop and ask.
 
 If the header or prompts row is wrong, re-run with `--header-row N` or
 `--prompts-row N` (0-based).
+
+### When rows share a URL
+
+`create-sources` refuses a request containing the same URL twice, and one such
+pair blocks every other row with it. Ask the user which they want:
+
+- **One source per unique URL** — re-run with `--merge-duplicate-urls`. Rows
+  sharing a URL collapse into the one with the lowest id, which records the ids
+  it now stands for in a `Merged ID#s` column.
+- **One source per row** — they fix the sheet. Repeats of a URL are usually
+  deliberate (the same page found through different channels), so do not assume
+  merging is what they want; the merged source keeps only one row's own data
+  unless that data is in a provided column, where it is combined.
+
+### Columns of provided data
+
+A column with a heading and data but **no prompt** holds the user's own work —
+a collection date, the channel a link came from. `plan-sheet` lists these
+separately and they are imported rather than run. Step 3a fills them.
+
+### Documents to attach
+
+Rows reported as `document_row` have an id but nothing to fetch. Ask the user
+for the files, have them save each one named for its id (`ID#109.pdf`), and use
+the `repo-attach-files` skill. Attaching creates the source **with that id**, so
+do this at any point — before or after `create-sources` — and the numbering
+still matches the sheet.
 
 ## Step 2 — Create the sources
 
@@ -102,6 +134,20 @@ For columns that already exist from an earlier run:
 .agents/bin/ra set-constraints --apply
 ```
 
+## Step 3a — Import the columns of provided data
+
+Only if `plan-sheet` reported any. These cost no model calls, so they are worth
+doing before the fetch.
+
+```bash
+.agents/bin/ra set-values
+.agents/bin/ra set-values --apply
+```
+
+Same pattern: dry run, show the user, then `--apply`. It writes one column at a
+time and reports each separately. Cells that already hold a different value are
+left alone; add `--overwrite` only if the user says to replace them.
+
 ## Step 4 — Ask, then fetch
 
 Tell the user how many sources will be downloaded and that it takes a while.
@@ -113,6 +159,14 @@ Tell the user how many sources will be downloaded and that it takes a while.
 
 If it comes back with `terminal: false`, it is still running. Say so and use the
 command in `next` to check again.
+
+To have the local model tidy each page's text as it arrives, add the `cleanup`
+phase. It is one model call per source on top of the download, so say what that
+costs before offering it:
+
+```bash
+.agents/bin/ra fetch --phases fetch,convert,cleanup --wait
+```
 
 ## Step 5 — Deal with what failed
 

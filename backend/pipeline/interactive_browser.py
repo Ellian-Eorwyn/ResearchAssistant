@@ -25,6 +25,7 @@ import base64
 import logging
 import os
 import shutil
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -85,6 +86,18 @@ def normalize_target_url(raw_url: str) -> str:
 
 
 def _display_available() -> str:
+    """Name the window server we can put a real browser window on.
+
+    `DISPLAY`/`WAYLAND_DISPLAY` only answer this on X11 and Wayland. macOS and
+    Windows set neither, so probing them there reported "no display" for every
+    session and forced headless — the one configuration bot walls reject on
+    sight. A logged-in desktop session on those platforms always has a
+    compositor, so say so.
+    """
+    if sys.platform == "darwin":
+        return "aqua"
+    if sys.platform == "win32":
+        return "windows"
     return os.environ.get("DISPLAY", "") or os.environ.get("WAYLAND_DISPLAY", "")
 
 
@@ -93,10 +106,38 @@ def _chrome_channel() -> str:
 
     Bot walls fingerprint the browser build, and a stock Chrome with a persistent
     profile gets through checks that headless Chromium does not.
+
+    Playwright locates the binary itself once it is handed a channel name, so
+    this only has to answer "is it installed". A `PATH` probe cannot: on macOS
+    Chrome lives in an app bundle and on Windows under Program Files, so neither
+    ever appeared on `PATH` and both silently fell back to bundled Chromium.
     """
+    if sys.platform == "darwin":
+        if Path("/Applications/Google Chrome.app").exists():
+            return "chrome"
+        if Path("/Applications/Microsoft Edge.app").exists():
+            return "msedge"
+        return ""
+
+    if sys.platform == "win32":
+        roots = [
+            os.environ.get("PROGRAMFILES", ""),
+            os.environ.get("PROGRAMFILES(X86)", ""),
+            os.environ.get("LOCALAPPDATA", ""),
+        ]
+        for root in roots:
+            if root and (Path(root) / "Google/Chrome/Application/chrome.exe").exists():
+                return "chrome"
+        for root in roots:
+            if root and (Path(root) / "Microsoft/Edge/Application/msedge.exe").exists():
+                return "msedge"
+        return ""
+
     for candidate in ("google-chrome", "google-chrome-stable", "chromium"):
         if shutil.which(candidate):
             return "chrome" if candidate.startswith("google-chrome") else "chromium"
+    if Path("/opt/google/chrome/chrome").exists():
+        return "chrome"
     return ""
 
 

@@ -18,6 +18,10 @@ from .models import ActiveJob, ColumnSummary, NextAction, Orientation, na
 
 MAX_FAILURE_EXAMPLES = 5
 
+# Fetch statuses meaning the document was never obtained. Both need the user to
+# act; `blocked` simply names *why* the fetch came back without the page.
+UNFETCHED_STATUSES = frozenset({"failed", "blocked"})
+
 
 def orientation(service: Any, *, include_column_stats: bool = True) -> Orientation:
     from backend.storage.attached_repository import (
@@ -54,7 +58,11 @@ def orientation(service: Any, *, include_column_stats: bool = True) -> Orientati
     failures = collections.Counter()
     examples: dict[str, list[str]] = {}
     for row in rows:
-        if str(row.fetch_status or "") != "failed":
+        # `blocked` is a failure the user has to act on, not a lesser state: the
+        # row holds a bot wall instead of the document. Leaving it out here made
+        # a repository whose only problem was blocked fetches look clean, and
+        # kept `ra triage` out of the suggested next actions.
+        if str(row.fetch_status or "") not in UNFETCHED_STATUSES:
             continue
         code = _error_code(row)
         failures[code] += 1
@@ -69,18 +77,22 @@ def orientation(service: Any, *, include_column_stats: bool = True) -> Orientati
     stale = stale_pairs(rows)
     for config in configs:
         constraint = getattr(config, "output_constraint", None)
+        # A column with no prompt is not run, so it cannot hold a value computed
+        # from text and cannot go stale. Reporting one anyway offers a remedy
+        # that would overwrite the user's imported data with model output.
+        has_prompt = bool((config.instruction_prompt or "").strip())
         summary = ColumnSummary(
             id=config.id,
             label=config.label,
             kind=config.kind,
-            has_prompt=bool((config.instruction_prompt or "").strip()),
-            requires_llm=bool((config.instruction_prompt or "").strip()),
+            has_prompt=has_prompt,
+            requires_llm=has_prompt,
             # Maintained by the storage layer on every run. Without it a column
             # that ran and produced nothing is indistinguishable from one never
             # attempted, so `_next_actions` would recommend it forever.
             last_run_status=str(getattr(config, "last_run_status", "") or ""),
             allowed_values=list(getattr(constraint, "allowed_values", None) or []),
-            stale_source_ids=sorted(stale.get(config.id, [])),
+            stale_source_ids=sorted(stale.get(config.id, [])) if has_prompt else [],
         )
         if records:
             filled = sum(1 for record in records if str(record.get(config.id, "") or "").strip())
@@ -143,7 +155,7 @@ def _summarize(report: Orientation) -> str:
 
     by_status = report.sources_by_fetch_status
     parts = [f"{report.total_sources} source(s)"]
-    for key in ("success", "partial", "failed", "queued"):
+    for key in ("success", "partial", "failed", "blocked", "queued"):
         if by_status.get(key):
             parts.append(f"{by_status[key]} {key}")
     prompted = sum(1 for c in report.columns if c.has_prompt)

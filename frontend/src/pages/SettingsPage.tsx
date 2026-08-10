@@ -268,6 +268,34 @@ export function SettingsPage() {
       </SurfaceCard>
 
       <SurfaceCard>
+        <div className="mb-3 text-title-sm font-semibold">Manual Capture</div>
+        <div className="grid gap-3 md:grid-cols-[minmax(0,260px)_minmax(0,1fr)]">
+          <InputField
+            label="Watch folder"
+            value={appSettingsDraft.manual_capture_watch_dir || ""}
+            onChange={(event) =>
+              setAppSettingsDraft((prev) => ({
+                ...prev,
+                manual_capture_watch_dir: event.target.value,
+              }))
+            }
+            placeholder="~/Downloads"
+          />
+          <div className="rounded-md bg-surface-container-low p-3 text-body-md text-on-surface-variant">
+            Where your browser saves pages you collect by hand. Resolve Fetches watches this folder
+            and offers recent files for one-click attaching. Leave empty to use{" "}
+            <code>~/Downloads</code>. Files here are only ever read, never moved or deleted.
+          </div>
+        </div>
+
+        <div className="mt-4 flex flex-wrap gap-2">
+          <Button variant="primary" disabled={savingSettings} onClick={() => void saveAppSettings()}>
+            {savingSettings ? "Saving..." : "Save Watch Folder"}
+          </Button>
+        </div>
+      </SurfaceCard>
+
+      <SurfaceCard>
         <div className="mb-3 text-title-sm font-semibold">Search Settings</div>
         <div className="grid gap-3 md:grid-cols-[minmax(0,260px)_minmax(0,1fr)]">
           <InputField

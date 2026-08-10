@@ -35,6 +35,7 @@ from .sheet import (
     parse_planning_sheet,
     sheet_plan_to_create_columns_params,
     sheet_plan_to_create_sources_params,
+    sheet_plan_to_set_values_params,
 )
 from .triage import triage_failures as _triage_failures
 
@@ -77,6 +78,7 @@ class WorkflowService:
         prompts_row: int | None = None,
         no_prompts_row: bool = False,
         repair_encoding: str = "auto",
+        merge_duplicate_urls: bool = False,
     ) -> SheetPlan:
         return parse_planning_sheet(
             Path(path),
@@ -84,13 +86,17 @@ class WorkflowService:
             prompts_row=prompts_row,
             no_prompts_row=no_prompts_row,
             repair_encoding=repair_encoding,
+            merge_duplicate_urls=merge_duplicate_urls,
         )
 
-    def sheet_to_params(self, plan: SheetPlan, kind: str) -> dict[str, Any]:
+    def sheet_to_params(self, plan: SheetPlan, kind: str) -> Any:
         if kind == "create_sources":
             return sheet_plan_to_create_sources_params(plan)
         if kind == "create_columns":
             return sheet_plan_to_create_columns_params(plan)
+        # A list, not a dict: one request per provided column.
+        if kind == "set_values":
+            return sheet_plan_to_set_values_params(plan)
         raise ValueError(f"Unknown params kind: {kind}")
 
     # -- operations -------------------------------------------------------
@@ -121,7 +127,14 @@ class WorkflowService:
             return [action.model_dump(mode="json") for action in actions]
 
         if plan.blockers:
-            payload["summary"] = plan.summary or "Blocked."
+            # The planner's own summary describes what it *would* do, which on a
+            # blocked plan reads exactly like a successful one -- "Will create
+            # 101 source(s)" above a list of reasons nothing will be created.
+            # Say the outcome first, because that is the part being skimmed.
+            payload["summary"] = (
+                f"Blocked by {len(plan.blockers)} problem(s); nothing will change."
+                + (f" Otherwise: {plan.summary}" if plan.summary else "")
+            )
             payload["next"] = out(nas("Fix the blockers listed above, then run this again."))
             return payload
         if not apply:

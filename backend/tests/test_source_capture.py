@@ -8,7 +8,12 @@ from pathlib import Path
 
 from backend.models.sources import SourceManifestRow, SourcePhaseMetadata
 from backend.pipeline.fetch_verification import FETCH_VERIFICATION_VERSION
-from backend.pipeline.source_capture import CapturedArtifacts
+from backend.pipeline.source_capture import (
+    MAX_UPLOAD_BYTES,
+    CapturedArtifacts,
+    UnsupportedManualUploadError,
+    artifacts_from_uploaded_bytes,
+)
 from backend.storage.attached_repository import AttachedRepositoryService, _load_source_rows
 from backend.storage.file_store import FileStore
 
@@ -192,6 +197,191 @@ class CaptureSourceArtifactsTest(unittest.TestCase):
         manifest = self.repository.manifest_csv_path().read_text(encoding="utf-8-sig")
         self.assertIn("fetch_verification", manifest.splitlines()[0])
         self.assertIn("manual_capture", manifest)
+
+
+class ReleasesBlockedPhaseSkipsTest(unittest.TestCase):
+    """A capture that resolves a block must let the held-back phases run."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory(prefix="capture-unblock-")
+        root = Path(self.temp_dir.name)
+        self.store = FileStore(base_dir=root / "data", sync_project_profiles=False)
+        self.repository = AttachedRepositoryService(store=self.store)
+        self.repository.create(str(root / "repo"))
+
+        row = SourceManifestRow(
+            id="000045",
+            original_url="https://example.com/walled",
+            title="Attention Required! | Cloudflare",
+            fetch_status="blocked",
+            fetch_verification="blocked_challenge",
+            error_message="blocked_challenge: bot wall",
+            notes="blocked_request",
+        )
+        # Exactly what `_skip_phase_for_blocked_fetch` leaves behind.
+        for phase, field in (
+            ("cleanup", "llm_cleanup_status"),
+            ("title", "title_status"),
+            ("catalog", "catalog_status"),
+            ("summary", "summary_status"),
+            ("rating", "rating_status"),
+        ):
+            setattr(row, field, "skipped_blocked_fetch")
+            row.phase_metadata[phase] = SourcePhaseMetadata(
+                phase=phase, status="skipped", error_code="blocked_fetch"
+            )
+        with self.repository._writer_lock():
+            self.repository._save_state_locked(sources=[row], citations=[], imports=[])
+            self.repository._rebuild_outputs_locked([row], [])
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _real_page(self) -> CapturedArtifacts:
+        html = (
+            "<html><head><title>Real Article</title></head><body><article><p>"
+            + ("Real content about distributed energy resources. " * 60)
+            + "</p></article></body></html>"
+        )
+        return artifacts_from_uploaded_bytes(
+            content=html.encode("utf-8"),
+            filename="saved.html",
+            final_url="https://example.com/walled",
+        )
+
+    def _row(self) -> SourceManifestRow:
+        return _load_source_rows(
+            json.loads(
+                (self.repository.path / ".ra_repo" / "repository_state.json").read_text(
+                    encoding="utf-8"
+                )
+            )["sources"]
+        )[0]
+
+    def test_the_held_phases_are_reset_to_never_run(self) -> None:
+        self.repository.capture_source_artifacts(source_id="000045", artifacts=self._real_page())
+        row = self._row()
+        self.assertEqual(row.fetch_status, "success")
+        for field in ("llm_cleanup_status", "catalog_status", "summary_status", "rating_status"):
+            self.assertEqual(getattr(row, field), "", f"{field} still holds the block's skip")
+        for phase in ("cleanup", "catalog", "summary", "rating"):
+            self.assertNotIn(phase, row.phase_metadata)
+
+    def test_the_released_phases_are_reported_to_the_caller(self) -> None:
+        """Silence here would tell the user nothing needs running."""
+        result = self.repository.capture_source_artifacts(
+            source_id="000045", artifacts=self._real_page()
+        )
+        self.assertEqual(
+            sorted(result.staled_phases),
+            ["catalog", "cleanup", "rating", "summary", "title"],
+        )
+
+    def test_the_extracted_title_replaces_the_walls_title(self) -> None:
+        self.repository.capture_source_artifacts(source_id="000045", artifacts=self._real_page())
+        row = self._row()
+        self.assertEqual(row.title, "Real Article")
+        self.assertEqual(row.title_status, "extracted")
+
+    def test_a_capture_that_is_still_blocked_keeps_the_phases_held(self) -> None:
+        html = (
+            "<html><head><title>Just a moment...</title></head><body>"
+            "<p>Verifying you are human. This may take a few seconds.</p>"
+            "<p>Enable JavaScript and cookies to continue.</p></body></html>"
+        )
+        artifacts = artifacts_from_uploaded_bytes(
+            content=html.encode("utf-8"), filename="wall.html"
+        )
+        result = self.repository.capture_source_artifacts(
+            source_id="000045", artifacts=artifacts
+        )
+        self.assertEqual(result.status, "still_blocked")
+        row = self._row()
+        self.assertEqual(row.fetch_status, "blocked")
+        self.assertEqual(row.summary_status, "skipped_blocked_fetch")
+
+
+class ArtifactsFromUploadedBytesTest(unittest.TestCase):
+    """The bytes -> artifacts step every manual route shares."""
+
+    def test_html_is_extracted_with_its_title_and_canonical_url(self):
+        html = (
+            "<html><head><title>What Is A Virtual Power Plant</title>"
+            '<link rel="canonical" href="https://example.com/vpp"></head>'
+            "<body><article><p>"
+            + ("A virtual power plant aggregates distributed resources. " * 60)
+            + "</p></article></body></html>"
+        )
+        artifacts = artifacts_from_uploaded_bytes(
+            content=html.encode("utf-8"), filename="saved.html", final_url="https://example.com/vpp"
+        )
+        self.assertEqual(artifacts.detected_type, "html")
+        self.assertEqual(artifacts.content_type, "text/html")
+        self.assertEqual(artifacts.title, "What Is A Virtual Power Plant")
+        self.assertEqual(artifacts.canonical_url, "https://example.com/vpp")
+        self.assertEqual(artifacts.fetch_method, "manual_upload")
+        self.assertIn("virtual power plant", artifacts.markdown.lower())
+
+    def test_markdown_is_taken_as_the_text_itself(self):
+        artifacts = artifacts_from_uploaded_bytes(
+            content=REAL_PAGE_MD.encode("utf-8"), filename="notes.md"
+        )
+        self.assertEqual(artifacts.detected_type, "document")
+        self.assertEqual(artifacts.extraction_method, "manual_markdown")
+        self.assertEqual(artifacts.markdown, REAL_PAGE_MD)
+
+    def test_a_txt_file_is_treated_as_markdown(self):
+        artifacts = artifacts_from_uploaded_bytes(
+            content=REAL_PAGE_MD.encode("utf-8"), filename="notes.txt"
+        )
+        self.assertEqual(artifacts.detected_type, "document")
+        self.assertTrue(artifacts.has_content())
+
+    def test_a_saved_block_page_is_still_scored_as_blocked(self):
+        """The regression that matters: saving the wall must not count as a fix."""
+        html = (
+            "<html><head><title>Just a moment...</title></head><body>"
+            "<p>Verifying you are human. This may take a few seconds.</p>"
+            "<p>Enable JavaScript and cookies to continue.</p>"
+            "</body></html>"
+        )
+        artifacts = artifacts_from_uploaded_bytes(
+            content=html.encode("utf-8"), filename="wall.html"
+        )
+        self.assertTrue(
+            any(note.startswith("verify_") and note != "verify_ok" for note in artifacts.notes),
+            artifacts.notes,
+        )
+
+    def test_a_real_page_is_noted_as_verified(self):
+        html = "<html><head><title>Real</title></head><body><article><p>" + (
+            "Substantial article text that reads like a document. " * 80
+        ) + "</p></article></body></html>"
+        artifacts = artifacts_from_uploaded_bytes(
+            content=html.encode("utf-8"), filename="real.html"
+        )
+        self.assertIn("verify_ok", artifacts.notes)
+
+    def test_mhtml_is_refused_with_its_own_guidance(self):
+        with self.assertRaises(UnsupportedManualUploadError) as caught:
+            artifacts_from_uploaded_bytes(content=b"From: <saved>", filename="page.mhtml")
+        self.assertIn("MHTML", str(caught.exception))
+
+    def test_an_unknown_extension_is_refused(self):
+        with self.assertRaises(UnsupportedManualUploadError) as caught:
+            artifacts_from_uploaded_bytes(content=b"MZ", filename="installer.exe")
+        self.assertIn("Unsupported file type", str(caught.exception))
+
+    def test_an_empty_file_is_refused(self):
+        with self.assertRaises(UnsupportedManualUploadError):
+            artifacts_from_uploaded_bytes(content=b"", filename="page.html")
+
+    def test_an_oversized_file_is_refused(self):
+        with self.assertRaises(UnsupportedManualUploadError) as caught:
+            artifacts_from_uploaded_bytes(
+                content=b"x" * (MAX_UPLOAD_BYTES + 1), filename="page.html"
+            )
+        self.assertIn("limit", str(caught.exception))
 
 
 if __name__ == "__main__":

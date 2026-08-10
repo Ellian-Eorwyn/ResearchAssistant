@@ -25,6 +25,11 @@ from backend.workflow.sheet import (
 # UTF-8 em dash read back as MacRoman, exactly as seen in the real sheet.
 MOJIBAKE_EM_DASH = "‚Äî"
 
+# The same em dash mangled a second time, which is what a sheet exported from an
+# already-damaged file actually contains. One repair pass only gets this back to
+# MOJIBAKE_EM_DASH, which scores the same damage as it started with.
+DOUBLE_MOJIBAKE_EM_DASH = "‚Äö√Ñ√Æ"
+
 BANNER = ["", "", "", "", "Source attributes to scrape", "", "", ""]
 HEADER = ["ID#", "URL", "Data Collection Year", "Source Origin", "Citation",
           "Year Published", "Org Type", "Location"]
@@ -139,14 +144,65 @@ class AnomalyTests(_SheetTestCase):
         self.assertIn("duplicate_source_id", codes)
         self.assertIn("duplicate_url", codes)
 
-    def test_a_non_url_cell_is_reported_but_the_row_is_kept(self) -> None:
-        path = self.standard_sheet(extra_rows=[data_row("24", "not a web address")])
+    def test_a_non_url_cell_becomes_a_document_to_attach_by_hand(self) -> None:
+        path = self.standard_sheet(extra_rows=[data_row("24", "n/a - PDF of Claude response")])
         plan = parse_planning_sheet(path)
 
-        self.assertIn("cell_not_a_url", {a.code for a in plan.anomalies})
-        # Kept deliberately: create_sources blocks on it with a precise code,
-        # which is a better place for the user to see the problem.
-        self.assertIn("not a web address", [s.url for s in plan.sources])
+        self.assertIn("document_row", {a.code for a in plan.anomalies})
+        # Out of `sources` on purpose. It cannot be fetched, and leaving it there
+        # means one such row blocks the import of every row beside it.
+        self.assertNotIn("n/a - PDF of Claude response", [s.url for s in plan.sources])
+        self.assertEqual([(d.id, d.label) for d in plan.documents],
+                         [("24", "n/a - PDF of Claude response")])
+
+    def test_merging_keeps_the_lowest_id_and_records_the_rest(self) -> None:
+        path = self.standard_sheet(extra_rows=[
+            data_row("31", "https://example.com/beta"),
+            data_row("12", "https://example.com/beta"),
+        ])
+        plan = parse_planning_sheet(path, merge_duplicate_urls=True)
+
+        beta = [s for s in plan.sources if s.url == "https://example.com/beta"]
+        self.assertEqual(len(beta), 1)
+        self.assertEqual(beta[0].id, "12")
+        # The fixture's own row 21 shares the URL too, so all three collapse.
+        self.assertEqual(sorted(beta[0].merged_ids), ["21", "31"])
+        self.assertIn("duplicate_urls_merged", {a.code for a in plan.anomalies})
+
+    def test_a_column_with_data_but_no_prompt_is_imported_not_dropped(self) -> None:
+        rows = [BANNER, HEADER, PROMPTS,
+                ["20", "https://example.com/alpha", "2026", "Google", "", "", "", ""],
+                ["21", "https://example.com/beta", "2026", "Perplexity", "", "", "", ""]]
+        plan = parse_planning_sheet(self.write_csv(rows))
+
+        by_label = {c.label: c for c in plan.provided_columns}
+        self.assertEqual(by_label["Data Collection Year"].values, {"20": "2026", "21": "2026"})
+        self.assertEqual(by_label["Source Origin"].values, {"20": "Google", "21": "Perplexity"})
+        # It is being imported, so it is not also a column that "will not be created".
+        self.assertNotIn(
+            "Source Origin",
+            {a.subject for a in plan.anomalies if a.code == "column_without_prompt"},
+        )
+
+    def test_a_merged_row_contributes_its_own_provided_values(self) -> None:
+        rows = [BANNER, HEADER, PROMPTS,
+                ["20", "https://example.com/alpha", "2026", "Google", "", "", "", ""],
+                ["31", "https://example.com/alpha", "2026", "Perplexity", "", "", "", ""],
+                ["44", "https://example.com/alpha", "2026", "Google", "", "", "", ""]]
+        plan = parse_planning_sheet(self.write_csv(rows), merge_duplicate_urls=True)
+
+        by_label = {c.label: c for c in plan.provided_columns}
+        # Both channels, in sheet order, and the repeated one only once.
+        self.assertEqual(by_label["Source Origin"].values, {"20": "Google; Perplexity"})
+        self.assertEqual(by_label["Data Collection Year"].values, {"20": "2026"})
+        self.assertEqual(by_label["Merged ID#s"].values, {"20": "31, 44"})
+
+    def test_merging_is_off_unless_asked_for(self) -> None:
+        path = self.standard_sheet(extra_rows=[data_row("31", "https://example.com/beta")])
+        plan = parse_planning_sheet(path)
+
+        self.assertEqual(len([s for s in plan.sources if s.url.endswith("/beta")]), 2)
+        self.assertIn("duplicate_url", {a.code for a in plan.anomalies})
 
     def test_a_non_numeric_id_is_blanked_so_one_is_allocated(self) -> None:
         path = self.standard_sheet(extra_rows=[data_row("TBD", "https://example.com/delta")])
@@ -175,6 +231,24 @@ class EncodingTests(_SheetTestCase):
 
         self.assertEqual(repaired, "a byline such as Staff — use the organization")
         self.assertEqual(codec, "mac_roman")
+
+    def test_repairs_text_that_was_mangled_twice(self) -> None:
+        mangled = f"a byline such as Staff {DOUBLE_MOJIBAKE_EM_DASH} use the organization"
+        repaired, codec = repair_text(mangled)
+
+        self.assertEqual(repaired, "a byline such as Staff — use the organization")
+        self.assertEqual(codec, "mac_roman")
+
+    def test_one_stubborn_cell_does_not_disqualify_the_whole_sheet(self) -> None:
+        # The real sheet's damage is doubled, so a single pass leaves the marker
+        # count unchanged and the codec used to look unusable for every cell.
+        grid = [[f"first {DOUBLE_MOJIBAKE_EM_DASH} cell"], [f"second {MOJIBAKE_EM_DASH} cell"]]
+        repaired, report = repair_grid(grid)
+
+        self.assertTrue(report.applied)
+        self.assertEqual(report.codec, "mac_roman")
+        self.assertEqual(report.suspicious_after, 0)
+        self.assertEqual(repaired, [["first — cell"], ["second — cell"]])
 
     def test_leaves_clean_text_alone(self) -> None:
         clean = "an em dash — and a curly quote “here”"

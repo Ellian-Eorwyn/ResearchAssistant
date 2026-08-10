@@ -65,6 +65,7 @@ def _build_registry() -> dict[str, OperationDefinition]:
     from .create_sources import DEFINITION as CREATE_SOURCES
     from .remap_source_ids import DEFINITION as REMAP_SOURCE_IDS
     from .set_column_constraints import DEFINITION as SET_COLUMN_CONSTRAINTS
+    from .set_column_values import DEFINITION as SET_COLUMN_VALUES
 
     return {
         item.name: item
@@ -72,6 +73,7 @@ def _build_registry() -> dict[str, OperationDefinition]:
             CREATE_SOURCES,
             CREATE_COLUMNS,
             SET_COLUMN_CONSTRAINTS,
+            SET_COLUMN_VALUES,
             REMAP_SOURCE_IDS,
             ATTACH_FILES,
         )

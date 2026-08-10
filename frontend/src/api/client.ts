@@ -24,6 +24,7 @@ import type {
   RepositoryCaptureResponse,
   RepositoryReverifyFetchesResponse,
   ResolveSourceListResponse,
+  WatchFolderListResponse,
   RepositoryColumnConfig,
   RepositoryColumnPromptFixResponse,
   RepositoryColumnRunStartResponse,
@@ -541,6 +542,15 @@ export const api = {
     );
     return parseApiResponse<RepositoryCaptureResponse>(resp);
   },
+  listWatchFolder: (sinceMs = 0, maxAgeMinutes = 1440, limit = 40) =>
+    apiGet<WatchFolderListResponse>(
+      `capture/watch-folder?since_ms=${sinceMs}&max_age_minutes=${maxAgeMinutes}&limit=${limit}`,
+    ),
+  attachWatchedFile: (sourceId: string, path: string, finalUrl: string) =>
+    apiPost<RepositoryCaptureResponse>(
+      `capture/sources/${encodeURIComponent(sourceId)}/attach-path`,
+      { path, final_url: finalUrl },
+    ),
 };
 
 /** URL the canvas long-polls for the next painted frame. */

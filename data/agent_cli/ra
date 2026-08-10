@@ -228,6 +228,18 @@ def follow(run_id: str, token: str, *, budget_seconds: float = FOLLOW_BUDGET_SEC
     return data
 
 
+# What to actually do about an error the server returns before any command's own
+# checks run. Restarting the app clears its attachment, so this one is met every
+# time the server comes back up and is worth answering precisely.
+REMEDIES = {
+    "repository_not_attached": (
+        "Open the repository in the app, or: curl -X POST "
+        "http://127.0.0.1:7995/api/repository/attach "
+        "-H 'Content-Type: application/json' -d '{\"path\":\"<repo>\"}'"
+    ),
+}
+
+
 def data_of(body: dict, *, allow_error: bool = False) -> dict:
     if body.get("status") == "error" and not allow_error:
         error = body.get("error") or {}
@@ -311,6 +323,20 @@ def cmd_doctor(args, token):
         params={"refresh_capabilities": "true" if args.refresh_capabilities else None},
     )
     data = data_of(body, allow_error=True)
+
+    # `allow_error` is here so a preflight that found blockers still prints its
+    # checks. An error envelope is a different thing -- the preflight did not
+    # run at all -- and swallowing it printed "BLOCKED, BLOCKED" with no reason
+    # given, which is the least useful thing this command could say.
+    if body.get("status") == "error" and not data.get("checks"):
+        error = body.get("error") or {}
+        code = str(error.get("code") or "error")
+        message = str(error.get("message") or "The preflight could not run.")
+        remedy = REMEDIES.get(code, "")
+        return False, f"Could not check: {message}", [], data, [
+            {"code": code, "message": message, "remedy": remedy}
+        ]
+
     problems = [
         {"code": c["id"], "message": c["detail"], "remedy": c.get("remedy", "")}
         for c in data.get("checks", [])
@@ -348,6 +374,7 @@ def cmd_plan_sheet(args, token):
             "prompts_row": args.prompts_row,
             "no_prompts_row": args.no_prompts_row,
             "repair_encoding": args.repair_encoding,
+            "merge_duplicate_urls": args.merge_duplicate_urls,
         },
     )
     data = data_of(body)
@@ -366,8 +393,32 @@ def cmd_plan_sheet(args, token):
         "no_header_row_found", "no_url_column_found", "no_sources_found", "mojibake_unrepairable",
     }
     ok = not any(a["code"] in blocking for a in data.get("anomalies", []))
-    nxt = ["ra create-sources", "ra create-columns"] if ok else ["Fix the sheet, then run ra plan-sheet again"]
-    return ok, data.get("summary", ""), nxt, data, problems
+
+    # The summary counts these; the user still has to see which ones, because a
+    # document row and a provided column are both decisions about their data.
+    lines = [data.get("summary", "")]
+    documents = data.get("documents") or []
+    if documents:
+        lines.append(f"\n{len(documents)} row(s) name a document rather than a URL:")
+        for item in documents[:10]:
+            lines.append(f"  id {item.get('id') or '(none)'}  {str(item.get('label', ''))[:60]}")
+        lines.append("  -> supply these files yourself; `ra attach` puts them on these ids.")
+    provided = data.get("provided_columns") or []
+    if provided:
+        lines.append(f"\n{len(provided)} column(s) hold your own data and are imported, not run:")
+        for column in provided:
+            values = column.get("values") or {}
+            distinct = len(set(values.values()))
+            lines.append(
+                f"  {column.get('label', '')[:44]:46} {len(values)} value(s), {distinct} distinct"
+            )
+
+    nxt = (
+        ["ra create-sources", "ra create-columns"] + (["ra set-values"] if provided else [])
+        if ok
+        else ["Fix the sheet, then run ra plan-sheet again"]
+    )
+    return ok, "\n".join(line for line in lines if line), nxt, data, problems
 
 
 def _stored_plan():
@@ -435,6 +486,52 @@ def cmd_create_columns(args, token):
     check_contract(token)
     params = _stored_plan()["create_columns_params"]
     return _operation("create-columns", "create_columns", params, args.apply, token)
+
+
+def cmd_set_values(args, token):
+    """Import every provided column from the parsed sheet, one operation each.
+
+    One request per column rather than one for all of them, because a column is
+    the unit the user reviews: a wrong value in `Source Origin` should not have
+    to be discussed alongside a correct one in `Data Collection Year`.
+    """
+    check_contract(token)
+    requests = _stored_plan().get("set_values_params") or []
+    if args.label:
+        wanted = " ".join(args.label.split()).casefold()
+        requests = [r for r in requests if " ".join(r["column_label"].split()).casefold() == wanted]
+        if not requests:
+            raise Problem(
+                f"The parsed sheet has no provided column called {args.label!r}.",
+                code="unknown_column_label",
+                remedy="ra plan-sheet <spreadsheet>",
+                exit_code=EXIT_USAGE,
+            )
+    if not requests:
+        return True, "The sheet has no columns of provided data.", ["ra where"], {}, []
+
+    lines, problems, changed = [], [], 0
+    for params in requests:
+        params = {**params, "overwrite": bool(args.overwrite)}
+        ok, summary, _, data, issues = _operation(
+            "set-values", "set_column_values", params, args.apply, token
+        )
+        lines.append(summary)
+        problems.extend(issues)
+        changed += len((data.get("plan") or {}).get("changes") or [])
+
+    if problems:
+        nxt = [{"command": "ra plan-sheet <spreadsheet>", "gate": "go", "why": ""}]
+    elif args.apply:
+        nxt = [{"command": "ra where", "gate": "go", "why": ""}]
+    else:
+        nxt = [{
+            "command": "ra set-values --apply",
+            "gate": "ask_user",
+            "why": f"Show the user these {changed} change(s) across "
+                   f"{len(requests)} column(s) and get their agreement first.",
+        }]
+    return not problems, "\n".join(lines), nxt, {"columns": len(requests)}, problems
 
 
 def cmd_set_constraints(args, token):
@@ -726,6 +823,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prompts-row", type=int, default=None)
     p.add_argument("--no-prompts-row", action="store_true")
     p.add_argument("--repair-encoding", choices=["auto", "never", "force"], default="auto")
+    p.add_argument(
+        "--merge-duplicate-urls",
+        action="store_true",
+        help="Rows sharing a URL become one source, keeping the lowest id.",
+    )
     p.set_defaults(func=cmd_plan_sheet)
 
     p = sub.add_parser("create-sources", help="Create sources from the parsed sheet.")
@@ -735,6 +837,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("create-columns", help="Create columns from the parsed sheet.")
     p.add_argument("--apply", action="store_true")
     p.set_defaults(func=cmd_create_columns)
+
+    p = sub.add_parser(
+        "set-values",
+        help="Import the sheet's own data columns (no prompt, no model calls).",
+    )
+    p.add_argument("--label", default="", help="One provided column; default is all of them.")
+    p.add_argument("--overwrite", action="store_true", help="Replace values already there.")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_set_values)
 
     p = sub.add_parser("columns", help="List columns and how full they are.")
     p.set_defaults(func=cmd_columns)
