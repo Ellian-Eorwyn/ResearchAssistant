@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { api } from "../api/client";
 import type { CaptureSessionInfo, RepositoryCaptureResponse, ResolveSourceRow } from "../api/types";
@@ -23,9 +23,6 @@ const FILTERS: Array<{ id: ResolveFilter; label: string }> = [
   { id: "partial", label: "Partial" },
   { id: "all", label: "All" },
 ];
-
-// How long after the last attach the pending sources are processed on their own.
-const AUTO_PROCESS_IDLE_MS = 25000;
 
 export function ResolveFetchesPage() {
   const queryClient = useQueryClient();
@@ -55,7 +52,6 @@ export function ResolveFetchesPage() {
   const [overwriteExisting, setOverwriteExisting] = useState(false);
   const [pendingIds, setPendingIds] = useState<string[]>([]);
   const [pendingTitles, setPendingTitles] = useState<Record<string, string>>({});
-  const autoProcessTimer = useRef<number | null>(null);
 
   const listQuery = useQuery({
     queryKey: ["resolve-fetches"],
@@ -133,21 +129,6 @@ export function ResolveFetchesPage() {
     setPendingTitles({});
   };
 
-  // Restart the idle countdown on every attach, so a run of attaches is
-  // processed once at the end rather than fighting for the single job slot.
-  const armAutoProcess = () => {
-    if (autoProcessTimer.current) window.clearTimeout(autoProcessTimer.current);
-    autoProcessTimer.current = window.setTimeout(() => {
-      autoProcessTimer.current = null;
-      startProcessing();
-    }, AUTO_PROCESS_IDLE_MS);
-  };
-  useEffect(() => {
-    return () => {
-      if (autoProcessTimer.current) window.clearTimeout(autoProcessTimer.current);
-    };
-  }, []);
-
   // The in-app browser is keyed on the capture session, not the source, so
   // changing sources never moves it on its own. When a session is open, point it
   // at the given source's page so its live view — and the next Capture — are the
@@ -174,7 +155,6 @@ export function ResolveFetchesPage() {
       ...prev,
       [resolvedId]: result.title || activeRow?.title || resolvedId,
     }));
-    armAutoProcess();
 
     // Work out the next source from the list as it is *now*, before the
     // refetch drops the row we just resolved and leaves no anchor to count from.
