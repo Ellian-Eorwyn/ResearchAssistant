@@ -148,6 +148,17 @@ export function ResolveFetchesPage() {
     };
   }, []);
 
+  // The in-app browser is keyed on the capture session, not the source, so
+  // changing sources never moves it on its own. When a session is open, point it
+  // at the given source's page so its live view — and the next Capture — are the
+  // right page, sparing a close/re-open just to load the URL.
+  const loadSessionToRow = (row?: ResolveSourceRow) => {
+    const url = row?.final_url || row?.original_url || "";
+    if (session && url) {
+      navigateMutation.mutate({ url, action: "goto" });
+    }
+  };
+
   const handleResolved = (result: RepositoryCaptureResponse) => {
     setCaptureResult(result);
     setError("");
@@ -176,14 +187,8 @@ export function ResolveFetchesPage() {
       setActiveId(nextId);
       setCaptureResult(null);
       setSinceMs(0);
-      // The in-app browser is keyed on the session, not the source, so advancing
-      // the source alone leaves Chromium on the page we just captured. Point the
-      // open session at the new source so its live view — and the next Capture —
-      // are the right page, sparing a close/re-open just to load the next URL.
-      const nextUrl = nextRow?.final_url || nextRow?.original_url || "";
-      if (session && nextUrl) {
-        navigateMutation.mutate({ url: nextUrl, action: "goto" });
-      }
+      // Move the open browser onto the new source so the next Capture targets it.
+      loadSessionToRow(nextRow);
     }
   };
 
@@ -264,6 +269,7 @@ export function ResolveFetchesPage() {
   });
 
   const selectRow = (row: ResolveSourceRow) => {
+    if (row.id !== activeId) loadSessionToRow(row);
     setActiveId(row.id);
     setCaptureResult(null);
     setNotice("");
@@ -490,6 +496,9 @@ export function ResolveFetchesPage() {
                     onClick={() => navigateMutation.mutate({ action: "reload" })}
                   >
                     ⟳
+                  </Button>
+                  <Button variant="secondary" onClick={() => loadSessionToRow(activeRow)}>
+                    Load source page
                   </Button>
                   <input
                     className="min-w-[16rem] flex-1 rounded-md bg-surface-variant px-3 py-2 font-mono text-body-sm text-on-surface outline-none"
