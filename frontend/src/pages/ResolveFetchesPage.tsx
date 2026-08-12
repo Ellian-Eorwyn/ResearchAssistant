@@ -170,11 +170,20 @@ export function ResolveFetchesPage() {
     const nextId = autoAdvance
       ? nextUnresolvedId(rows, resolvedId, [...pendingIds, resolvedId])
       : "";
+    const nextRow = nextId ? rows.find((row) => row.id === nextId) : undefined;
     refreshList();
     if (nextId) {
       setActiveId(nextId);
       setCaptureResult(null);
       setSinceMs(0);
+      // The in-app browser is keyed on the session, not the source, so advancing
+      // the source alone leaves Chromium on the page we just captured. Point the
+      // open session at the new source so its live view — and the next Capture —
+      // are the right page, sparing a close/re-open just to load the next URL.
+      const nextUrl = nextRow?.final_url || nextRow?.original_url || "";
+      if (session && nextUrl) {
+        navigateMutation.mutate({ url: nextUrl, action: "goto" });
+      }
     }
   };
 
