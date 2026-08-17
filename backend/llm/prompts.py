@@ -465,3 +465,54 @@ Score each of the following search results for relevance.
 
 Return JSON in exactly this shape:
 {{"scores": [{{"index": 0, "relevance_score": 0.0}}, {{"index": 1, "relevance_score": 0.0}}, ...]}}"""
+
+
+IMAGE_ANALYZE_SYSTEM = """You are analyzing a single image extracted from a web page that was collected for a research study.
+Use the imported project profile below as the governing rubric for what counts as research-relevant subject matter.
+
+Classify the image as exactly one of:
+- "relevant": the image carries subject matter that informs the research question -- for example figures, charts, diagrams, infographics, data visualizations, maps, photographs of the subject, screenshots of relevant tools or data, or illustrations that explain a concept.
+- "incidental": the image is page furniture rather than content -- for example logos, wordmarks, favicons, navigation or banner icons, flags, social-media buttons, decorative separators or backgrounds, advertisements, or headshots and portraits unrelated to the study's subject.
+
+When unsure, weigh whether a researcher pursuing the stated purpose would cite or analyze this image. Judge the image itself; the alt text and page context are hints, not the decision.
+
+Return output only as a single JSON object with these keys:
+{{"classification": "relevant" | "incidental",
+  "category": "chart|diagram|infographic|photo|map|screenshot|illustration|logo|icon|banner|ad|decorative|portrait|other",
+  "confidence": 0.0-1.0,
+  "reason": "one sentence justifying the classification",
+  "description": "if relevant: 1-2 sentences describing what the image shows; otherwise an empty string",
+  "relevance": "if relevant: one sentence on why it matters to the study; otherwise an empty string"}}
+
+--- PROJECT PROFILE ---
+{project_profile_yaml}
+--- END PROJECT PROFILE ---"""
+
+IMAGE_CLASSIFY_SYSTEM = """You are classifying a single image extracted from a web page that was collected for a research study.
+Use the imported project profile below as the governing rubric for what counts as research-relevant subject matter.
+
+Classify the image as exactly one of:
+- "relevant": the image carries subject matter that informs the research question -- for example figures, charts, diagrams, infographics, data visualizations, maps, photographs of the subject, screenshots of relevant tools or data, or illustrations that explain a concept.
+- "incidental": the image is page furniture rather than content -- for example logos, wordmarks, favicons, navigation or banner icons, flags, social-media buttons, decorative separators or backgrounds, advertisements, or headshots and portraits unrelated to the study's subject.
+
+When unsure, weigh whether a researcher pursuing the stated purpose would cite or analyze this image. Judge the image itself; the alt text and page context are hints, not the decision.
+
+Return output only as a single JSON object with these keys:
+{{"classification": "relevant" | "incidental",
+  "category": "chart|diagram|infographic|photo|map|screenshot|illustration|logo|icon|banner|ad|decorative|portrait|other",
+  "confidence": 0.0-1.0,
+  "reason": "one sentence justifying the classification"}}
+
+--- PROJECT PROFILE ---
+{project_profile_yaml}
+--- END PROJECT PROFILE ---"""
+
+IMAGE_ANALYZE_USER = """Research purpose:
+{research_purpose}
+
+Page title: {page_title}
+Page URL: {page_url}
+Image alt text: {alt_text}
+Nearby text: {nearby_text}
+
+Analyze the attached image against the project profile. Return JSON only."""

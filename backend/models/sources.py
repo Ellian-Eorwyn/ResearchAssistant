@@ -80,6 +80,18 @@ class SourceManifestRow(BaseModel):
     discovered_media_urls: str = ""
     discovered_media_count: int = 0
     discovery_depth: int = 0
+    # Inline page images extracted (automatically, during fetch) into
+    # sources/{id}/images/, then classified relevant|incidental and described by
+    # the opt-in `images` phase. images_dir/image_index_file point at the folder
+    # and its index JSON; image_descriptions_file is the canonical per-source
+    # descriptions markdown (mirrored to the top-level image_descriptions/ area).
+    images_dir: str = ""
+    image_index_file: str = ""
+    image_status: str = ""  # not_requested | extracted | analyzed | partial | failed | skipped_*
+    image_count: int = 0
+    relevant_image_count: int = 0
+    image_descriptions_file: str = ""
+    image_descriptions_status: str = ""  # not_requested | generated | skipped_* | failed
     custom_fields: dict[str, str] = Field(default_factory=dict)
     phase_metadata: dict[str, SourcePhaseMetadata] = Field(default_factory=dict)
     # Column ids whose stored value was computed from this source's *previous*
@@ -149,6 +161,11 @@ SOURCE_MANIFEST_COLUMNS = [
     "discovered_source_ids",
     "discovered_media_urls",
     "discovered_media_count",
+    "image_status",
+    "image_count",
+    "relevant_image_count",
+    "image_index_file",
+    "image_descriptions_status",
 ]
 
 
@@ -196,6 +213,15 @@ class SourceOutputOptions(BaseModel):
     download_media_video: bool = False
     download_media_audio: bool = True
     download_media_thumbnail: bool = True
+    # Inline page images. Extraction is cheap (download + index, no LLM) and runs
+    # automatically during fetch; classify/describe use the vision model and only
+    # run in the opt-in `images` phase.
+    extract_images: bool = True
+    classify_images: bool = True
+    describe_images: bool = True
+    image_min_edge_px: int = 64
+    image_max_bytes: int = 8_000_000
+    image_max_count: int = 40
 
 
 class SourceDownloadRequest(BaseModel):
@@ -208,6 +234,7 @@ class SourceDownloadRequest(BaseModel):
     run_llm_title: bool = False
     run_llm_summary: bool = True
     run_llm_rating: bool = False
+    run_images: bool = False
     force_redownload: bool = False
     force_convert: bool = False
     force_catalog: bool = False
@@ -216,6 +243,7 @@ class SourceDownloadRequest(BaseModel):
     force_title: bool = False
     force_summary: bool = False
     force_rating: bool = False
+    force_images: bool = False
     project_profile_name: str = ""
     include_raw_file: bool = True
     include_rendered_html: bool = True
@@ -227,6 +255,12 @@ class SourceDownloadRequest(BaseModel):
     download_media_video: bool = False
     download_media_audio: bool = True
     download_media_thumbnail: bool = True
+    extract_images: bool = True
+    classify_images: bool = True
+    describe_images: bool = True
+    image_min_edge_px: int = 64
+    image_max_bytes: int = 8_000_000
+    image_max_count: int = 40
 
 
 class SourceOutputSummary(BaseModel):
@@ -252,6 +286,9 @@ class SourceOutputSummary(BaseModel):
     audio_file_count: int = 0
     thumbnail_file_count: int = 0
     discovered_media_count: int = 0
+    image_count: int = 0
+    relevant_image_count: int = 0
+    image_failed_count: int = 0
 
 
 class SourceDownloadStatus(BaseModel):
@@ -284,6 +321,7 @@ class SourceDownloadStatus(BaseModel):
     run_llm_title: bool = False
     run_llm_summary: bool = True
     run_llm_rating: bool = False
+    run_images: bool = False
     force_redownload: bool = False
     force_convert: bool = False
     force_catalog: bool = False
@@ -292,6 +330,7 @@ class SourceDownloadStatus(BaseModel):
     force_title: bool = False
     force_summary: bool = False
     force_rating: bool = False
+    force_images: bool = False
     project_profile_name: str = ""
     output_options: SourceOutputOptions = Field(default_factory=SourceOutputOptions)
     output_summary: SourceOutputSummary = Field(default_factory=SourceOutputSummary)

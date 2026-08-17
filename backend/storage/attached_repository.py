@@ -134,6 +134,7 @@ from backend.pipeline.source_downloader import (
     PHASE_CLEANUP,
     PHASE_CONVERT,
     PHASE_FETCH,
+    PHASE_IMAGES,
     PHASE_RATING,
     PHASE_SUMMARY,
     PHASE_TITLE,
@@ -291,6 +292,8 @@ FILE_FIELDS = [
     "video_file",
     "audio_file",
     "thumbnail_file",
+    "image_index_file",
+    "image_descriptions_file",
 ]
 
 REPOSITORY_BUNDLE_FILE_KINDS = ("pdf", "rendered", "html", "md")
@@ -3768,6 +3771,132 @@ class AttachedRepositoryService:
         headers = _repository_source_file_headers(source_path)
         return source_path, media_type, headers
 
+    def _image_index_data(self, row: SourceManifestRow) -> dict:
+        path = self.path / SOURCES_DIR_NAME / row.id / "images" / f"{row.id}_images.json"
+        if not path.is_file():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def list_source_images(self, source_id: str) -> dict:
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+        with self._writer_lock():
+            state = self._load_state_locked()
+            rows = _load_source_rows(state.get("sources", []))
+        row = next((item for item in rows if item.id == source_id), None)
+        if row is None:
+            raise ValueError(f"Source `{source_id}` not found")
+        data = self._image_index_data(row)
+        images = data.get("images", []) if isinstance(data, dict) else []
+        return {
+            "source_id": source_id,
+            "image_status": row.image_status,
+            "image_count": row.image_count,
+            "relevant_image_count": row.relevant_image_count,
+            "image_descriptions_status": row.image_descriptions_status,
+            "images": images,
+        }
+
+    def resolve_source_image(
+        self, *, source_id: str, image_id: str
+    ) -> tuple[Path, str, dict[str, str]]:
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+        # The id is a path segment; pin it to the known shape to block traversal.
+        if not re.fullmatch(rf"{re.escape(source_id)}_img_\d{{4}}", image_id or ""):
+            raise ValueError("Invalid image id")
+        with self._writer_lock():
+            state = self._load_state_locked()
+            rows = _load_source_rows(state.get("sources", []))
+        row = next((item for item in rows if item.id == source_id), None)
+        if row is None:
+            raise ValueError(f"Source `{source_id}` not found")
+        data = self._image_index_data(row)
+        record = next(
+            (im for im in (data.get("images") or []) if im.get("image_id") == image_id),
+            None,
+        )
+        if record is None:
+            raise ValueError(f"Image `{image_id}` not found on source `{source_id}`")
+        filename = str(record.get("file") or "")
+        if not filename or "/" in filename or "\\" in filename or ".." in filename:
+            raise ValueError("Invalid image file reference")
+        source_path = self.path / SOURCES_DIR_NAME / source_id / "images" / filename
+        if not self._is_path_within_repo(source_path) or not source_path.is_file():
+            raise ValueError(f"No file available for image `{image_id}`")
+        media_type = _image_media_type(source_path, str(record.get("mime") or ""))
+        headers = _repository_source_file_headers(source_path)
+        return source_path, media_type, headers
+
+    def resolve_source_image_descriptions(
+        self, source_id: str
+    ) -> tuple[Path, str, dict[str, str]]:
+        if not self.is_attached:
+            raise ValueError("No repository attached")
+        with self._writer_lock():
+            state = self._load_state_locked()
+            rows = _load_source_rows(state.get("sources", []))
+        row = next((item for item in rows if item.id == source_id), None)
+        if row is None:
+            raise ValueError(f"Source `{source_id}` not found")
+        rel = str(row.image_descriptions_file or "").strip()
+        if not rel:
+            raise ValueError(f"No image descriptions for source `{source_id}`")
+        path = self.path / rel
+        if not self._is_path_within_repo(path) or not path.is_file():
+            raise ValueError(f"No image descriptions file for source `{source_id}`")
+        return path, "text/markdown; charset=utf-8", _repository_source_file_headers(path)
+
+    def _remove_source_image_artifacts(self, row: SourceManifestRow) -> None:
+        images_dir = self.path / SOURCES_DIR_NAME / row.id / "images"
+        if images_dir.is_dir() and self._is_path_within_repo(images_dir):
+            shutil.rmtree(images_dir, ignore_errors=True)
+        mirror = self.path / "image_descriptions" / f"{row.id}.md"
+        if mirror.is_file() and self._is_path_within_repo(mirror):
+            try:
+                mirror.unlink()
+            except OSError:
+                pass
+        self._prune_image_descriptions_index(row.id)
+
+    def _prune_image_descriptions_index(self, source_id: str) -> None:
+        index_json = self.path / "image_descriptions" / "index.json"
+        if not index_json.is_file():
+            return
+        try:
+            data = json.loads(index_json.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(data, dict) or source_id not in data:
+            return
+        data.pop(source_id, None)
+        try:
+            index_json.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            )
+            lines = [
+                "# Image descriptions index",
+                "",
+                "Sources with research-relevant images.",
+                "",
+            ]
+            for sid in sorted(data.keys()):
+                entry = data[sid]
+                title = entry.get("title") or entry.get("url") or sid
+                lines.append(
+                    f"- [{sid}]({entry.get('file', sid + '.md')}) — {title} "
+                    f"({entry.get('relevant_image_count', 0)} relevant / "
+                    f"{entry.get('image_count', 0)} images)"
+                )
+            (self.path / "image_descriptions" / "index.md").write_text(
+                "\n".join(lines).rstrip() + "\n", encoding="utf-8"
+            )
+        except OSError:
+            pass
+
     def find_duplicate_source_candidates(self) -> RepositoryDuplicateCandidateResponse:
         if not self.is_attached:
             raise ValueError("Attach a repository before scanning for duplicate sources")
@@ -3944,6 +4073,7 @@ class AttachedRepositoryService:
                         continue
                     deleted_files += 1
                     self._cleanup_empty_repository_dirs(source_path.parent)
+                self._remove_source_image_artifacts(row)
 
             remaining_citations = [
                 citation
@@ -6438,6 +6568,7 @@ class AttachedRepositoryService:
         run_llm_title = bool(payload.run_llm_title or payload.force_title)
         run_llm_summary = bool(payload.run_llm_summary or payload.force_summary)
         run_llm_rating = bool(payload.run_llm_rating or payload.force_rating)
+        run_images = bool(payload.run_images or payload.force_images)
         if not (
             run_download
             or run_convert
@@ -6447,6 +6578,7 @@ class AttachedRepositoryService:
             or run_llm_title
             or run_llm_summary
             or run_llm_rating
+            or run_images
         ):
             raise ValueError("Select at least one source phase to run.")
         if run_download and not any(
@@ -6473,6 +6605,7 @@ class AttachedRepositoryService:
             run_citation_verify=run_citation_verify,
             run_rating=run_llm_rating,
             run_summary=run_llm_summary,
+            run_images=run_images,
         )
 
         with self._writer_lock():
@@ -6497,6 +6630,7 @@ class AttachedRepositoryService:
                 run_llm_title=run_llm_title,
                 run_llm_summary=run_llm_summary,
                 run_llm_rating=run_llm_rating,
+                run_images=run_images,
                 output_options=SourceOutputOptions(
                     include_raw_file=payload.include_raw_file,
                     include_rendered_html=payload.include_rendered_html,
@@ -6508,6 +6642,12 @@ class AttachedRepositoryService:
                     download_media_video=payload.download_media_video,
                     download_media_audio=payload.download_media_audio,
                     download_media_thumbnail=payload.download_media_thumbnail,
+                    extract_images=payload.extract_images,
+                    classify_images=payload.classify_images,
+                    describe_images=payload.describe_images,
+                    image_min_edge_px=payload.image_min_edge_px,
+                    image_max_bytes=payload.image_max_bytes,
+                    image_max_count=payload.image_max_count,
                 ),
             )
             if not selected_rows:
@@ -6543,6 +6683,7 @@ class AttachedRepositoryService:
                 rerun_failed_only=payload.rerun_failed_only,
                 use_llm=repo_settings.use_llm,
                 llm_backend=repo_settings.llm_backend,
+                vision_backend=repo_settings.vision_backend,
                 research_purpose=repo_settings.research_purpose,
                 searxng_base_url=repo_settings.searxng_base_url,
                 fetch_delay=repo_settings.fetch_delay,
@@ -6554,6 +6695,7 @@ class AttachedRepositoryService:
                 run_llm_title=run_llm_title,
                 run_llm_summary=run_llm_summary,
                 run_llm_rating=run_llm_rating,
+                run_images=run_images,
                 force_redownload=payload.force_redownload,
                 force_convert=payload.force_convert,
                 force_catalog=payload.force_catalog,
@@ -6562,6 +6704,7 @@ class AttachedRepositoryService:
                 force_title=payload.force_title,
                 force_summary=payload.force_summary,
                 force_rating=payload.force_rating,
+                force_images=payload.force_images,
                 project_profile_name=project_profile_name,
                 project_profile_yaml=project_profile_yaml,
                 output_options=SourceOutputOptions(
@@ -6575,6 +6718,12 @@ class AttachedRepositoryService:
                     download_media_video=payload.download_media_video,
                     download_media_audio=payload.download_media_audio,
                     download_media_thumbnail=payload.download_media_thumbnail,
+                    extract_images=payload.extract_images,
+                    classify_images=payload.classify_images,
+                    describe_images=payload.describe_images,
+                    image_min_edge_px=payload.image_min_edge_px,
+                    image_max_bytes=payload.image_max_bytes,
+                    image_max_count=payload.image_max_count,
                 ),
                 target_rows=[row.model_copy(deep=True) for row in selected_rows],
                 output_dir=self.path,
@@ -7200,6 +7349,7 @@ class AttachedRepositoryService:
         run_llm_title: bool = False,
         run_llm_summary: bool = False,
         run_llm_rating: bool = False,
+        run_images: bool = False,
         output_options: SourceOutputOptions | None = None,
     ) -> tuple[list[SourceManifestRow], str, str]:
         normalized_source_ids = source_ids or set()
@@ -7224,6 +7374,7 @@ class AttachedRepositoryService:
                         run_llm_title=run_llm_title,
                         run_llm_summary=run_llm_summary,
                         run_llm_rating=run_llm_rating,
+                        run_images=run_images,
                         output_options=effective_output_options,
                     )
                 ]
@@ -7246,6 +7397,7 @@ class AttachedRepositoryService:
                     run_llm_title=run_llm_title,
                     run_llm_summary=run_llm_summary,
                     run_llm_rating=run_llm_rating,
+                    run_images=run_images,
                     output_options=effective_output_options,
                 )
             ]
@@ -7277,6 +7429,7 @@ class AttachedRepositoryService:
         run_llm_title: bool,
         run_llm_summary: bool,
         run_llm_rating: bool,
+        run_images: bool = False,
         output_options: SourceOutputOptions,
     ) -> bool:
         if run_download:
@@ -7301,6 +7454,8 @@ class AttachedRepositoryService:
         if run_llm_summary and not self._row_has_artifact(row, "summary_file"):
             return True
         if run_llm_rating and not self._row_has_artifact(row, "rating_file"):
+            return True
+        if run_images and not self._row_has_artifact(row, "image_index_file"):
             return True
         return False
 
@@ -9966,6 +10121,25 @@ def _media_type_for_repository_source_path(path: Path, kind: str) -> str:
     }[_normalize_source_file_kind(kind)]
 
 
+def _image_media_type(path: Path, recorded_mime: str) -> str:
+    if recorded_mime.startswith("image/"):
+        return recorded_mime
+    guessed, _ = mimetypes.guess_type(path.name)
+    if guessed and guessed.startswith("image/"):
+        return guessed
+    return {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+        ".bmp": "image/bmp",
+        ".svg": "image/svg+xml",
+        ".tiff": "image/tiff",
+        ".avif": "image/avif",
+    }.get(path.suffix.lower(), "application/octet-stream")
+
+
 def _repository_source_file_headers(path: Path) -> dict[str, str]:
     headers = {
         "Referrer-Policy": "no-referrer",
@@ -11893,6 +12067,7 @@ def _normalize_agent_phase_names(
     run_citation_verify: bool = False,
     run_rating: bool = False,
     run_summary: bool = False,
+    run_images: bool = False,
 ) -> list[str]:
     allowed = {
         PHASE_FETCH,
@@ -11903,6 +12078,7 @@ def _normalize_agent_phase_names(
         PHASE_CITATION_VERIFY,
         PHASE_SUMMARY,
         PHASE_RATING,
+        PHASE_IMAGES,
     }
     normalized: list[str] = []
     seen: set[str] = set()
@@ -11933,6 +12109,8 @@ def _normalize_agent_phase_names(
         defaults.append(PHASE_SUMMARY)
     if run_rating:
         defaults.append(PHASE_RATING)
+    if run_images:
+        defaults.append(PHASE_IMAGES)
     return defaults
 
 
@@ -12296,6 +12474,7 @@ def _build_pending_source_status(
         run_llm_title=bool(getattr(orchestrator, "run_llm_title", False)),
         run_llm_summary=bool(getattr(orchestrator, "run_llm_summary", False)),
         run_llm_rating=bool(getattr(orchestrator, "run_llm_rating", False)),
+        run_images=bool(getattr(orchestrator, "run_images", False)),
         force_redownload=bool(getattr(orchestrator, "force_redownload", False)),
         force_convert=bool(getattr(orchestrator, "force_convert", False)),
         force_catalog=bool(getattr(orchestrator, "force_catalog", False)),
@@ -12304,6 +12483,7 @@ def _build_pending_source_status(
         force_title=bool(getattr(orchestrator, "force_title", False)),
         force_summary=bool(getattr(orchestrator, "force_summary", False)),
         force_rating=bool(getattr(orchestrator, "force_rating", False)),
+        force_images=bool(getattr(orchestrator, "force_images", False)),
         output_dir=str(getattr(orchestrator, "status_output_dir", "output_run")),
         manifest_csv=str(getattr(orchestrator, "status_manifest_csv", "output_run/manifest.csv")),
         manifest_xlsx=str(

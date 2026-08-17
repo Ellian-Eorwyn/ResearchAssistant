@@ -28,6 +28,11 @@ class AppSettings(BaseModel):
 
     last_repository_path: str = ""
     llm_backend: LLMBackendConfig = Field(default_factory=LLMBackendConfig)
+    # Optional dedicated backend for image (vision) work. When unset, image
+    # classification/description reuse `llm_backend` -- the default backend is
+    # already multimodal. Set this only to point image work at a different
+    # port/model without disturbing the text path.
+    vision_backend: LLMBackendConfig | None = None
     use_llm: bool = False
     searxng_base_url: str = ""
     fetch_delay: float = Field(default=2.0, ge=1.0, le=10.0)
@@ -68,6 +73,8 @@ class EffectiveSettings(BaseModel):
     """
 
     llm_backend: LLMBackendConfig = Field(default_factory=LLMBackendConfig)
+    # Effective vision backend: always concrete (falls back to llm_backend).
+    vision_backend: LLMBackendConfig = Field(default_factory=LLMBackendConfig)
     use_llm: bool = False
     research_purpose: str = ""
     default_project_profile_name: str = ""
@@ -82,6 +89,7 @@ class EffectiveSettings(BaseModel):
     ) -> EffectiveSettings:
         return cls(
             llm_backend=app.llm_backend,
+            vision_backend=app.vision_backend or app.llm_backend,
             use_llm=app.use_llm,
             fetch_delay=app.fetch_delay,
             searxng_base_url=app.searxng_base_url,

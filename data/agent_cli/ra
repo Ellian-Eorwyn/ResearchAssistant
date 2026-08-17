@@ -40,7 +40,7 @@ from pathlib import Path
 # contract, or this file built itself. Mirrors `gate_for` in
 # backend/workflow/models.py -- the server's answer wins when it sends one.
 GATED = re.compile(
-    r"--confirm-overwrite\b|--apply\b|\bra (fetch|retry|convert|run-column|set-constraints)\b"
+    r"--confirm-overwrite\b|--apply\b|\bra (fetch|retry|convert|images|run-column|set-constraints)\b"
 )
 
 # Bumped whenever a response shape this file reads changes. The server declares
@@ -589,6 +589,13 @@ def cmd_convert(args, token):
     return cmd_fetch(args, token)
 
 
+def cmd_images(args, token):
+    # Extract page images (if not already), then classify relevant/incidental
+    # and describe the relevant ones with the vision model.
+    args.phases = "images"
+    return cmd_fetch(args, token)
+
+
 def cmd_triage(args, token):
     check_contract(token)
     body, _ = request("GET", "/api/workflow/v1/triage", token=token, params={"phase": args.phase})
@@ -874,6 +881,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true")
     p.add_argument("--wait", action="store_true")
     p.set_defaults(func=cmd_convert)
+
+    p = sub.add_parser("images", help="Extract page images, then classify and describe them.")
+    p.add_argument("--scope", default="all",
+                   choices=["queued", "all", "import", "latest_import", "empty_only"])
+    p.add_argument("--ids", default="", help="Comma-separated ids; overrides --scope.")
+    p.add_argument("--force", action="store_true", help="Re-analyze images already processed.")
+    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--wait", action="store_true")
+    p.set_defaults(func=cmd_images)
 
     p = sub.add_parser("triage", help="Group failures and say what to do about each.")
     p.add_argument("--phase", default="fetch")

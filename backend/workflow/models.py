@@ -44,6 +44,10 @@ _GATED: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bra fetch\b"), "This downloads the sources and takes a while."),
     (re.compile(r"\bra retry\b"), "This re-downloads the sources that failed."),
     (re.compile(r"\bra convert\b"), "This rebuilds the stored text for those sources."),
+    (
+        re.compile(r"\bra images\b"),
+        "This classifies and describes page images with the vision model, which spends model calls.",
+    ),
     (re.compile(r"--apply\b"), "This writes to the repository."),
 )
 

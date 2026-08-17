@@ -697,6 +697,51 @@ async def open_repository_source_file(
     )
 
 
+@router.get("/repository/sources/{source_id}/images")
+async def list_repository_source_images(source_id: str, request: Request) -> dict:
+    service = request.app.state.repository_service
+    try:
+        return service.list_source_images(source_id)
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 404 if "not found" in detail.lower() else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+
+
+@router.get("/repository/sources/{source_id}/images/{image_id}")
+async def open_repository_source_image(source_id: str, image_id: str, request: Request):
+    service = request.app.state.repository_service
+    try:
+        path, media_type, headers = service.resolve_source_image(
+            source_id=source_id, image_id=image_id
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = (
+            404
+            if "not found" in detail.lower() or "no file" in detail.lower()
+            else 400
+        )
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+    return FileResponse(path=str(path), media_type=media_type, headers=headers)
+
+
+@router.get("/repository/sources/{source_id}/image-descriptions")
+async def open_repository_source_image_descriptions(source_id: str, request: Request):
+    service = request.app.state.repository_service
+    try:
+        path, media_type, headers = service.resolve_source_image_descriptions(source_id)
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = (
+            404
+            if "not found" in detail.lower() or "no image descriptions" in detail.lower()
+            else 400
+        )
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+    return FileResponse(path=str(path), media_type=media_type, headers=headers)
+
+
 @router.patch("/repository/sources/{source_id}")
 async def patch_repository_source(
     source_id: str,

@@ -88,7 +88,7 @@ class CheckpointTests(unittest.TestCase):
 
     # Anything that downloads for a long time, spends model calls, or writes.
     DANGEROUS = re.compile(
-        r"--confirm-overwrite\b|--apply\b|\bra (fetch|retry|convert|run-column|set-constraints)\b"
+        r"--confirm-overwrite\b|--apply\b|\bra (fetch|retry|convert|images|run-column|set-constraints)\b"
     )
 
     def _orientations(self):
@@ -180,6 +180,7 @@ class CheckpointTests(unittest.TestCase):
             "ra fetch --wait",
             "ra retry --wait",
             "ra convert --force",
+            "ra images --wait",
             "ra run-column custom_a --wait",
             "ra create-sources --apply",
             "ra set-constraints --apply",
@@ -401,6 +402,35 @@ class SkillDocumentTests(unittest.TestCase):
                 if re.search(pattern, text):
                     offenders.append(f"{path.relative_to(ROOT)}: {why}")
         self.assertEqual(offenders, [], "\n  ".join(["Skills regressed to hand-built requests:"] + offenders))
+
+
+class PhaseNameConsistencyTests(unittest.TestCase):
+    """The phase list is declared in several places; they must not drift.
+
+    `images` was added and the router's PHASE_NAMES accepted it while the
+    request model's `Literal` still rejected it, so a run request 500'd before
+    reaching any phase code. These lock every declared phase to a request the
+    model accepts and a task flag the mapper sets.
+    """
+
+    def test_request_model_accepts_every_router_phase(self) -> None:
+        from backend.models.agent import AgentRunSourcePhasesRequest
+        from backend.routers.agent import PHASE_NAMES
+
+        for phase in PHASE_NAMES:
+            request = AgentRunSourcePhasesRequest(phases=[phase])
+            self.assertEqual(request.phases, [phase])
+
+    def test_images_phase_maps_to_run_and_force_flags(self) -> None:
+        from backend.models.agent import AgentRunSourcePhasesRequest
+        from backend.routers.agent import PHASE_NAMES, _to_repository_task_request
+
+        self.assertIn("images", PHASE_NAMES)
+        task = _to_repository_task_request(
+            AgentRunSourcePhasesRequest(phases=["images"], force=True)
+        )
+        self.assertTrue(task.run_images)
+        self.assertTrue(task.force_images)
 
 
 if __name__ == "__main__":

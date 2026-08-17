@@ -72,7 +72,7 @@ class CliContractTests(unittest.TestCase):
         expected = {
             "version", "doctor", "where", "plan-sheet", "create-sources",
             "create-columns", "set-constraints", "set-values", "columns", "fetch",
-            "convert", "triage", "retry", "attach", "run-column", "remap", "watch",
+            "convert", "images", "triage", "retry", "attach", "run-column", "remap", "watch",
         }
         self.assertEqual(names, expected)
 

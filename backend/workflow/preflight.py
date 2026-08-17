@@ -204,6 +204,40 @@ def run_preflight(
                 ),
             )
 
+            # Vision powers the opt-in `images` phase; a miss is a warning, not a
+            # blocker. Probe the dedicated vision backend when one is set,
+            # otherwise the shared backend (only worth it once chat answered).
+            vision_llm = getattr(settings, "vision_backend", None) or llm
+            same_backend = (
+                getattr(vision_llm, "base_url", "") == llm.base_url
+                and getattr(vision_llm, "model", "") == llm.model
+            )
+            if answered or not same_backend:
+                vision_ok, vision_error = _vision_probe(vision_llm)
+                where = (
+                    "the LLM backend"
+                    if same_backend
+                    else f"{vision_llm.base_url} (model {vision_llm.model!r})"
+                )
+                add(
+                    "llm_vision_responds",
+                    vision_ok,
+                    "warning",
+                    (
+                        f"Vision model on {where} described a test image."
+                        if vision_ok
+                        else f"Vision model on {where} did not answer: {vision_error}"
+                    ),
+                    ""
+                    if vision_ok
+                    else (
+                        "Image extraction still runs, but the `images` phase "
+                        "(relevant/incidental classification and descriptions) needs "
+                        "a multimodal model; set vision_backend to one if the main "
+                        "model is text-only."
+                    ),
+                )
+
     # --- the tool the agent is holding ------------------------------------
     #
     # Provenance deliberately leaves an edited copy alone, but it reports that
@@ -325,6 +359,49 @@ def _completion_probe(llm: Any) -> tuple[bool, str]:
             close = getattr(client, "sync_close", None)
             if callable(close):
                 close()
+
+    try:
+        return _in_worker_thread(probe)
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def _vision_probe(llm: Any) -> tuple[bool, str]:
+    """Send a small test image through the multimodal path.
+
+    Vision powers the opt-in `images` phase (classify + describe), so a failure
+    here is a warning, not a column blocker. The image is a 32x32 PNG constant so
+    the probe needs no image library of its own.
+    """
+
+    def probe() -> tuple[bool, str]:
+        import asyncio
+        import base64
+
+        from backend.llm.client import UnifiedLLMClient
+
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAATklEQVR4nGP8//8/Ay0BE01N"
+            "Zxi1gAgwGgcEAQsuCdHKkwwkgtft5piCo3FAEIwGEUEwGkQEwWgQEQSjQTTwQcQ42vAiBEaT"
+            "KUFA8yACAGXtCTsSN2tcAAAAAElFTkSuQmCC"
+        )
+
+        async def call() -> str:
+            client = UnifiedLLMClient(llm)
+            try:
+                return await client.vision_chat(
+                    system_prompt="You describe images.",
+                    user_prompt="Reply with the single word OK.",
+                    image_bytes=png,
+                    mime_type="image/png",
+                    response_format=None,
+                )
+            finally:
+                await client.close()
+
+        reply = asyncio.run(call())
+        text = str(reply or "").strip()
+        return bool(text), "" if text else "the model returned an empty response"
 
     try:
         return _in_worker_thread(probe)

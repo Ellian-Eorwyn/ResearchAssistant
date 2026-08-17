@@ -187,7 +187,7 @@ def _authorize(request: Request, *, access: str, request_id: str) -> JSONRespons
     return None
 
 
-PHASE_NAMES = ("fetch", "convert", "cleanup", "tag", "summarize")
+PHASE_NAMES = ("fetch", "convert", "cleanup", "tag", "summarize", "images")
 
 
 def _normalize_requested_phases(values: list[str]) -> list[str]:
@@ -239,6 +239,7 @@ def _to_repository_task_request(payload: AgentRunSourcePhasesRequest) -> Reposit
     run_cleanup = "cleanup" in phases
     run_tag = "tag" in phases
     run_summarize = "summarize" in phases
+    run_images = "images" in phases
     force = bool(payload.force)
     return RepositorySourceTaskRequest(
         scope=payload.scope or "queued",
@@ -253,12 +254,14 @@ def _to_repository_task_request(payload: AgentRunSourcePhasesRequest) -> Reposit
         run_llm_title=False,
         run_llm_summary=run_summarize,
         run_llm_rating=run_tag,
+        run_images=run_images,
         force_redownload=force and run_download,
         force_convert=force and run_convert,
         force_llm_cleanup=force and run_cleanup,
         force_title=False,
         force_summary=force and run_summarize,
         force_rating=force and run_tag,
+        force_images=force and run_images,
         project_profile_name=payload.project_profile_name,
         include_raw_file=True,
         include_rendered_html=True,
@@ -858,7 +861,7 @@ def _mcp_tool_definitions() -> list[dict[str, Any]]:
                         "type": "array",
                         "items": {
                             "type": "string",
-                            "enum": ["fetch", "convert", "tag", "summarize"],
+                            "enum": ["fetch", "convert", "images", "tag", "summarize"],
                         },
                     },
                     "project_profile_name": {"type": "string"},

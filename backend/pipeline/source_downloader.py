@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -24,11 +25,15 @@ from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit
 
 import httpx
 import fitz  # PyMuPDF
+from PIL import Image
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 
 from backend.llm.client import UnifiedLLMClient
 from backend.llm.prompts import (
+    IMAGE_ANALYZE_SYSTEM,
+    IMAGE_ANALYZE_USER,
+    IMAGE_CLASSIFY_SYSTEM,
     SOURCE_CATALOG_SYSTEM,
     SOURCE_CATALOG_USER,
     SOURCE_CITATION_VERIFY_SYSTEM,
@@ -63,6 +68,7 @@ from backend.pipeline.fetch_verification import (
     looks_blocked,
     verify_fetch,
 )
+from backend.pipeline import image_extraction
 from backend.pipeline.media_links import (
     DiscoveredMedia,
     extract_youtube_urls,
@@ -139,6 +145,8 @@ NOTE_OCR_PDF_PARTIAL = "ocr_pdf_partial"
 NOTE_MEDIA_LINKS_FOUND = "media_links_found"
 NOTE_MEDIA_DOWNLOAD_FAILED = "media_download_failed"
 NOTE_MEDIA_TRANSCRIPT_MISSING = "media_transcript_missing"
+NOTE_IMAGE_EXTRACTION_CAPPED = "image_extraction_capped"
+NOTE_IMAGE_ANALYSIS_PARTIAL = "image_analysis_partial"
 PHASE_FETCH = "fetch"
 PHASE_CONVERT = "convert"
 PHASE_CLEANUP = "cleanup"
@@ -147,6 +155,7 @@ PHASE_CATALOG = "catalog"
 PHASE_CITATION_VERIFY = "citation_verify"
 PHASE_SUMMARY = "summary"
 PHASE_RATING = "rating"
+PHASE_IMAGES = "images"
 
 LEGACY_PHASE_ALIASES = {
     "summarize": PHASE_SUMMARY,
@@ -163,6 +172,7 @@ PROMPT_VERSION_CITATION_VERIFY = "source_citation_verify.v1"
 PROMPT_VERSION_TITLE = "source_title.v1"
 PROMPT_VERSION_SUMMARY = "source_summary.v1"
 PROMPT_VERSION_RATING = "source_rating.v1"
+PROMPT_VERSION_IMAGES = "source_images.v1"
 
 INSTALL_BOOTSTRAP_COMMAND = "./scripts/bootstrap_venv.sh"
 INSTALL_REQUIREMENTS_COMMAND = ".venv/bin/python -m pip install -r requirements.txt"
@@ -174,6 +184,14 @@ PDF_NATIVE_PAGE_MIN_CHARS = 120
 PDF_NATIVE_DOC_MIN_AVG_CHARS = 180
 PDF_TEXT_ALPHA_MIN_RATIO = 0.55
 PDF_OCR_MIN_CHARS = 80
+
+# Longest edge, in pixels, of the copy sent to the vision model. Bounds token
+# cost without touching the stored original.
+IMAGE_VISION_MAX_EDGE = 1024
+# Wall-clock ceiling on downloading a single source's images, so a pathological
+# page cannot stall a fetch indefinitely.
+IMAGE_EXTRACTION_TIME_BUDGET_S = 90.0
+IMAGE_FETCH_USER_AGENT = "Mozilla/5.0 (compatible; ResearchAssistant/1.0; +image-extraction)"
 
 DOCUMENT_CONTENT_TYPE_EXT = {
     "application/msword": ".doc",
@@ -802,6 +820,100 @@ def metadata_rel(source_id: str, *, writes_to_repository: bool) -> Path:
     return Path("metadata") / f"{source_id}.json"
 
 
+def images_dir_rel(source_id: str, *, writes_to_repository: bool) -> Path:
+    if writes_to_repository:
+        return Path("sources") / source_id / "images"
+    return Path("images") / source_id
+
+
+def image_file_rel(
+    source_id: str, seq: int, ext: str, *, writes_to_repository: bool
+) -> Path:
+    return images_dir_rel(source_id, writes_to_repository=writes_to_repository) / (
+        f"{source_id}_img_{seq:04d}{ext}"
+    )
+
+
+def image_index_rel(source_id: str, *, writes_to_repository: bool) -> Path:
+    return images_dir_rel(source_id, writes_to_repository=writes_to_repository) / (
+        f"{source_id}_images.json"
+    )
+
+
+def image_descriptions_rel(source_id: str, *, writes_to_repository: bool) -> Path:
+    """The canonical per-source image-descriptions markdown."""
+    if writes_to_repository:
+        return Path("sources") / source_id / f"{source_id}_image_descriptions.md"
+    return Path("summaries") / f"{source_id}_image_descriptions.md"
+
+
+def image_descriptions_shared_rel(source_id: str) -> Path:
+    """The browsable top-level mirror of a source's image descriptions."""
+    return Path("image_descriptions") / f"{source_id}.md"
+
+
+def image_descriptions_index_rel() -> Path:
+    return Path("image_descriptions") / "index.md"
+
+
+def _hash_image_set(records: list[dict]) -> str:
+    """Digest of a source's image set, used to detect change across runs."""
+    hashes = sorted(str(r.get("sha256", "")) for r in records if r.get("sha256"))
+    if not hashes:
+        return ""
+    return hashlib.sha256("\n".join(hashes).encode("utf-8")).hexdigest()
+
+
+def _parse_image_analysis(raw_response: str, describe: bool) -> dict | None:
+    """Parse a vision model's JSON verdict into a normalized record patch.
+
+    Tolerant of prose or code fences around the JSON. Returns None when no JSON
+    object can be recovered so the caller can mark that one image failed without
+    aborting the phase.
+    """
+    text = (raw_response or "").strip()
+    if not text:
+        return None
+    data: object
+    try:
+        data = json.loads(text)
+    except Exception:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return None
+        try:
+            data = json.loads(text[start : end + 1])
+        except Exception:
+            return None
+    if not isinstance(data, dict):
+        return None
+
+    classification = str(data.get("classification", "")).strip().lower()
+    if classification not in ("relevant", "incidental"):
+        classification = "relevant" if classification in ("content", "relevant") else "incidental"
+    category = str(data.get("category", "") or "").strip()[:40]
+    try:
+        confidence = float(data.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+    reason = str(data.get("reason", "") or "").strip()
+    description = str(data.get("description", "") or "").strip() if describe else ""
+    relevance = str(data.get("relevance", "") or "").strip() if describe else ""
+    if classification != "relevant":
+        description = ""
+        relevance = ""
+    return {
+        "classification": classification,
+        "category": category,
+        "confidence": confidence,
+        "reason": reason,
+        "description": description,
+        "relevance": relevance,
+    }
+
+
 # Every signal the verifier looks at lives in the head of the document, so a
 # retroactive pass never needs to read a whole file.
 REVERIFY_READ_BYTES = 65536
@@ -1165,6 +1277,7 @@ class SourceDownloadOrchestrator:
         rerun_failed_only: bool = False,
         use_llm: bool = False,
         llm_backend: LLMBackendConfig | None = None,
+        vision_backend: LLMBackendConfig | None = None,
         research_purpose: str = "",
         searxng_base_url: str = "",
         fetch_delay: float = 2.0,
@@ -1176,6 +1289,7 @@ class SourceDownloadOrchestrator:
         run_llm_title: bool = False,
         run_llm_summary: bool = True,
         run_llm_rating: bool = False,
+        run_images: bool = False,
         force_redownload: bool = False,
         force_convert: bool = False,
         force_catalog: bool = False,
@@ -1184,6 +1298,7 @@ class SourceDownloadOrchestrator:
         force_title: bool = False,
         force_summary: bool = False,
         force_rating: bool = False,
+        force_images: bool = False,
         project_profile_name: str = "",
         project_profile_yaml: str = "",
         output_options: SourceOutputOptions | None = None,
@@ -1202,6 +1317,9 @@ class SourceDownloadOrchestrator:
         self.rerun_failed_only = rerun_failed_only
         self.use_llm = use_llm
         self.llm_backend = llm_backend or LLMBackendConfig()
+        # Image (vision) work reuses the text backend unless a dedicated one is
+        # configured -- the default backend is already multimodal.
+        self.vision_backend = vision_backend or self.llm_backend
         self.research_purpose = (research_purpose or "").strip()
         self.searxng_base_url = str(searxng_base_url or "").strip()
         self.fetch_delay = max(1.0, min(10.0, fetch_delay))
@@ -1213,6 +1331,7 @@ class SourceDownloadOrchestrator:
         self.force_title = bool(force_title)
         self.force_summary = bool(force_summary)
         self.force_rating = bool(force_rating)
+        self.force_images = bool(force_images)
         self.output_options = output_options or SourceOutputOptions()
         self.run_download = bool(run_download or self.force_redownload)
         self.run_convert = bool(run_convert or (self.run_download and self.output_options.include_markdown))
@@ -1222,6 +1341,7 @@ class SourceDownloadOrchestrator:
         self.run_llm_title = bool(run_llm_title or self.force_title)
         self.run_llm_summary = bool(run_llm_summary or self.force_summary)
         self.run_llm_rating = bool(run_llm_rating or self.force_rating)
+        self.run_images = bool(run_images or self.force_images)
         self.project_profile_name = (project_profile_name or "").strip()
         self.project_profile_yaml = (project_profile_yaml or "").strip()
         self.target_rows = [
@@ -1247,6 +1367,7 @@ class SourceDownloadOrchestrator:
                 PHASE_CITATION_VERIFY,
                 PHASE_SUMMARY,
                 PHASE_RATING,
+                PHASE_IMAGES,
             }
         ]
         self.row_persist_callback = row_persist_callback
@@ -1319,6 +1440,8 @@ class SourceDownloadOrchestrator:
             phases.append(PHASE_SUMMARY)
         if self.run_llm_rating:
             phases.append(PHASE_RATING)
+        if self.run_images:
+            phases.append(PHASE_IMAGES)
         return phases
 
     def _initial_phase_states(self) -> dict[str, SourcePhaseMetadata]:
@@ -1415,6 +1538,7 @@ class SourceDownloadOrchestrator:
                 or self.run_llm_title
                 or self.run_llm_summary
                 or self.run_llm_rating
+                or self.run_images
             ):
                 raise RuntimeError("Select at least one phase to run")
             if self.run_download and not any(
@@ -1438,6 +1562,7 @@ class SourceDownloadOrchestrator:
             self.runtime_capabilities = detect_runtime_capabilities(
                 use_llm=self.use_llm,
                 llm_backend=self.llm_backend,
+                vision_backend=self.vision_backend,
             )
             self._initialize_status(
                 targets=targets,
@@ -2074,6 +2199,22 @@ class SourceDownloadOrchestrator:
     def _metadata_rel(self, row: SourceManifestRow) -> Path:
         return metadata_rel(row.id, writes_to_repository=self.writes_to_repository)
 
+    def _images_dir_rel(self, row: SourceManifestRow) -> Path:
+        return images_dir_rel(row.id, writes_to_repository=self.writes_to_repository)
+
+    def _image_file_rel(self, row: SourceManifestRow, seq: int, ext: str) -> Path:
+        return image_file_rel(
+            row.id, seq, ext, writes_to_repository=self.writes_to_repository
+        )
+
+    def _image_index_rel(self, row: SourceManifestRow) -> Path:
+        return image_index_rel(row.id, writes_to_repository=self.writes_to_repository)
+
+    def _image_descriptions_rel(self, row: SourceManifestRow) -> Path:
+        return image_descriptions_rel(
+            row.id, writes_to_repository=self.writes_to_repository
+        )
+
     def _should_skip_successful_target(
         self, target: SourceTarget, rows_by_id: dict[str, SourceManifestRow]
     ) -> bool:
@@ -2368,6 +2509,7 @@ class SourceDownloadOrchestrator:
             (self.run_citation_verify, PHASE_CITATION_VERIFY),
             (self.run_llm_summary, PHASE_SUMMARY),
             (self.run_llm_rating, PHASE_RATING),
+            (self.run_images, PHASE_IMAGES),
         ):
             if should_run:
                 self._set_phase_state(phase, "running")
@@ -3653,6 +3795,7 @@ class SourceDownloadOrchestrator:
         self._generate_source_citation_verification(row, notes)
         self._generate_source_summary(row, notes)
         self._generate_source_rating(row, notes)
+        self._generate_source_images(row, notes)
         row.notes = "; ".join(dict.fromkeys(n for n in notes if n))
         metadata_rel = self._metadata_rel(row)
         row.metadata_file = metadata_rel.as_posix()
@@ -3679,6 +3822,8 @@ class SourceDownloadOrchestrator:
                 "summary_file": row.summary_file,
                 "rating_file": row.rating_file,
                 "metadata_file": row.metadata_file,
+                "image_index_file": row.image_index_file,
+                "image_descriptions_file": row.image_descriptions_file,
             },
             "notes": row.notes,
             "sha256": row.sha256,
@@ -4713,7 +4858,565 @@ class SourceDownloadOrchestrator:
             )
             logger.warning("Rating generation failed for %s: %s", row.id, exc)
 
+    # ---- Image handling -------------------------------------------------
 
+    def _generate_source_images(self, row: SourceManifestRow, notes: list[str]) -> None:
+        """Extract page images (cheap, automatic) and, in the opt-in ``images``
+        phase, classify each relevant|incidental and describe the relevant ones.
+
+        Extraction runs whenever a fetch runs or the phase is explicitly
+        requested; the vision work runs only in the phase. A convert-only run
+        does neither, so convert stays network-free.
+        """
+        opts = self.output_options
+        wants_extract = bool(opts.extract_images) and (self.run_download or self.run_images)
+        if not wants_extract and not self.run_images:
+            if row.image_index_file and _has_output_file(self.output_dir, row.image_index_file):
+                row.image_status = row.image_status or "extracted"
+            elif not row.image_status:
+                row.image_status = "not_requested"
+            return
+
+        if self._skip_phase_for_blocked_fetch(row, PHASE_IMAGES, "image_status"):
+            return
+
+        if self.run_images:
+            self._begin_row_phase(
+                row,
+                PHASE_IMAGES,
+                model=self.vision_backend.model,
+                profile_name=self.project_profile_name,
+                prompt_version=PROMPT_VERSION_IMAGES,
+            )
+
+        # 1. Extract + download (idempotent, network, no LLM).
+        records = self._extract_source_images(row, notes)
+
+        # Auto-extraction path (phase not requested): images on disk, no vision.
+        if not self.run_images:
+            return
+
+        # 2. Classify + describe (opt-in phase only).
+        if not opts.classify_images:
+            row.image_status = "extracted"
+            self._complete_row_phase(
+                row,
+                PHASE_IMAGES,
+                status="completed",
+                content_digest=_hash_image_set(records),
+                model=self.vision_backend.model,
+                profile_name=self.project_profile_name,
+                prompt_version=PROMPT_VERSION_IMAGES,
+            )
+            return
+
+        skip_reason = self._image_vision_skip_reason()
+        if skip_reason:
+            row.image_status = skip_reason
+            if NOTE_RUNTIME_MISSING_LLM_VISION not in notes:
+                notes.append(NOTE_RUNTIME_MISSING_LLM_VISION)
+            self._complete_row_phase(
+                row,
+                PHASE_IMAGES,
+                status="skipped",
+                error=f"{skip_reason}: image classification needs a vision-capable model",
+                error_code=skip_reason,
+                model=self.vision_backend.model,
+                profile_name=self.project_profile_name,
+                prompt_version=PROMPT_VERSION_IMAGES,
+            )
+            return
+
+        failed = self._analyze_source_images(row, records, notes)
+        self._persist_image_index(row, records)
+
+        relevant = [r for r in records if r.get("classification") == "relevant"]
+        row.relevant_image_count = len(relevant)
+        if opts.describe_images and relevant:
+            self._write_image_descriptions(row, records)
+        elif not row.image_descriptions_status:
+            row.image_descriptions_status = "not_requested"
+
+        if failed:
+            row.image_status = "partial"
+            if NOTE_IMAGE_ANALYSIS_PARTIAL not in notes:
+                notes.append(NOTE_IMAGE_ANALYSIS_PARTIAL)
+        else:
+            row.image_status = "analyzed"
+        self._complete_row_phase(
+            row,
+            PHASE_IMAGES,
+            status="completed",
+            content_digest=_hash_image_set(records),
+            model=self.vision_backend.model,
+            profile_name=self.project_profile_name,
+            prompt_version=PROMPT_VERSION_IMAGES,
+        )
+
+    def _image_vision_skip_reason(self) -> str:
+        if not self.use_llm:
+            return "skipped_llm_disabled"
+        if not llm_backend_ready_for_vision(self.vision_backend):
+            return "skipped_llm_not_configured"
+        if not self.runtime_capabilities.llm_vision_enabled:
+            return "skipped_vision_unavailable"
+        return ""
+
+    def _image_source_html(self, row: SourceManifestRow) -> tuple[str, str]:
+        """The best HTML for image extraction plus the base URL to resolve against."""
+        base_url = row.final_url or row.canonical_url or row.original_url or ""
+        if str(row.detected_type or "").strip().lower() != "html":
+            return "", base_url
+        for rel in (row.rendered_file, row.raw_file):
+            if rel and _has_output_file(self.output_dir, rel):
+                text = self._read_text(Path(rel))
+                if text.strip():
+                    return text, base_url
+        return "", base_url
+
+    def _load_image_index(self, row: SourceManifestRow) -> list[dict]:
+        text = self._read_text(self._image_index_rel(row))
+        if not text.strip():
+            return []
+        try:
+            data = json.loads(text)
+        except Exception:
+            return []
+        images = data.get("images") if isinstance(data, dict) else None
+        return images if isinstance(images, list) else []
+
+    def _persist_image_index(self, row: SourceManifestRow, records: list[dict]) -> None:
+        index_rel = self._image_index_rel(row)
+        relevant = sum(1 for r in records if r.get("classification") == "relevant")
+        payload = {
+            "source_id": row.id,
+            "generated_at": _utc_now_iso(),
+            "prompt_version": PROMPT_VERSION_IMAGES,
+            "vision_model": self.vision_backend.model,
+            "profile_name": self.project_profile_name,
+            "image_count": len(records),
+            "relevant_image_count": relevant,
+            "images": records,
+        }
+        self._write_text(
+            index_rel, json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        )
+        row.image_index_file = index_rel.as_posix()
+        row.images_dir = self._images_dir_rel(row).as_posix()
+        row.image_count = len(records)
+
+    @staticmethod
+    def _next_image_seq(records: list[dict]) -> int:
+        max_seq = 0
+        for rec in records:
+            match = re.search(r"_img_(\d+)$", str(rec.get("image_id", "")))
+            if match:
+                max_seq = max(max_seq, int(match.group(1)))
+        return max_seq + 1
+
+    def _download_image_bytes(
+        self, http: httpx.Client, url: str, max_bytes: int
+    ) -> tuple[bytes, str] | None:
+        if not url:
+            return None
+        try:
+            with http.stream("GET", url) as resp:
+                if resp.status_code != 200:
+                    return None
+                ctype = resp.headers.get("content-type", "").split(";")[0].strip().lower()
+                clen = resp.headers.get("content-length")
+                if clen and clen.isdigit() and int(clen) > max_bytes:
+                    return None
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in resp.iter_bytes():
+                    total += len(chunk)
+                    if total > max_bytes:
+                        return None
+                    chunks.append(chunk)
+                data = b"".join(chunks)
+        except Exception:
+            return None
+        if not data:
+            return None
+        mime = ctype if ctype.startswith("image/") else image_extraction.sniff_mime(data)
+        if not mime.startswith("image/"):
+            return None
+        return data, mime
+
+    def _inspect_image(self, data: bytes, mime: str) -> tuple[int, int, str] | None:
+        """Return (width, height, mime) for a downloaded image, or None if it is
+        undecodable. SVG is reported with zero dimensions (it is vector)."""
+        sniffed = image_extraction.sniff_mime(data)
+        norm = (mime or "").split(";")[0].strip().lower()
+        if sniffed == "image/svg+xml" or norm == "image/svg+xml":
+            return (0, 0, "image/svg+xml")
+        try:
+            with Image.open(io.BytesIO(data)) as im:
+                width, height = im.size
+                fmt = (im.format or "").lower()
+        except Exception:
+            return None
+        actual = {
+            "jpeg": "image/jpeg",
+            "png": "image/png",
+            "gif": "image/gif",
+            "webp": "image/webp",
+            "bmp": "image/bmp",
+            "tiff": "image/tiff",
+        }.get(fmt, norm if norm.startswith("image/") else sniffed)
+        return (width, height, actual)
+
+    def _prepare_vision_bytes(self, data: bytes, mime: str) -> tuple[bytes, str]:
+        """Downscale a copy of the image to bound vision-token cost."""
+        try:
+            with Image.open(io.BytesIO(data)) as im:
+                im = im.convert("RGB")
+                longest = max(im.size)
+                if longest > IMAGE_VISION_MAX_EDGE:
+                    ratio = IMAGE_VISION_MAX_EDGE / float(longest)
+                    im = im.resize(
+                        (max(1, int(im.size[0] * ratio)), max(1, int(im.size[1] * ratio)))
+                    )
+                buf = io.BytesIO()
+                im.save(buf, format="PNG")
+                return buf.getvalue(), "image/png"
+        except Exception:
+            return data, mime
+
+    def _extract_source_images(
+        self, row: SourceManifestRow, notes: list[str]
+    ) -> list[dict]:
+        """Download inline page images into sources/{id}/images/ and index them.
+
+        Idempotent: images already recorded (by URL) are not re-fetched, and an
+        image whose bytes match one already stored (by sha256) is recorded as an
+        alias rather than duplicated on disk.
+        """
+        opts = self.output_options
+        records = self._load_image_index(row)
+        if not opts.extract_images:
+            return records
+
+        by_url = {(r.get("resolved_url") or r.get("original_url")): r for r in records}
+        by_hash = {r.get("sha256"): r for r in records if r.get("sha256")}
+
+        html_text, base_url = self._image_source_html(row)
+        if not html_text:
+            if not records and row.image_status in ("", "not_requested"):
+                row.image_status = "no_source"
+            return records
+
+        refs = image_extraction.extract_image_refs(html_text, base_url=base_url)
+        seq = self._next_image_seq(records)
+        capped = False
+        started = time.monotonic()
+        http: httpx.Client | None = None
+        try:
+            for ref in refs:
+                if len(records) >= opts.image_max_count:
+                    capped = True
+                    break
+                if time.monotonic() - started > IMAGE_EXTRACTION_TIME_BUDGET_S:
+                    capped = True
+                    break
+                key = ref.resolved_url or ref.original_url
+                if not key or key in by_url:
+                    continue
+                if not image_extraction.passes_dimension_prefilter(
+                    ref.width_attr, ref.height_attr, opts.image_min_edge_px
+                ):
+                    continue
+
+                if ref.is_data_uri:
+                    decoded = image_extraction.parse_data_uri(ref.original_url)
+                    if not decoded:
+                        continue
+                    data, mime = decoded
+                else:
+                    if http is None:
+                        http = httpx.Client(
+                            timeout=30.0,
+                            follow_redirects=True,
+                            headers={"User-Agent": IMAGE_FETCH_USER_AGENT},
+                        )
+                    fetched = self._download_image_bytes(http, ref.resolved_url, opts.image_max_bytes)
+                    if not fetched:
+                        continue
+                    data, mime = fetched
+
+                if not data or len(data) > opts.image_max_bytes:
+                    continue
+                digest = image_extraction.sha256_bytes(data)
+                if digest in by_hash:
+                    alias_target = by_hash[digest]
+                    aliases = alias_target.setdefault("aliases", [])
+                    if key and key not in aliases:
+                        aliases.append(key)
+                    by_url[key] = alias_target
+                    continue
+
+                inspected = self._inspect_image(data, mime)
+                if inspected is None:
+                    continue
+                width, height, norm_mime = inspected
+                is_vector = norm_mime == "image/svg+xml"
+                if not is_vector and (
+                    width < opts.image_min_edge_px or height < opts.image_min_edge_px
+                ):
+                    # Too small once truly measured: a UI icon, not content.
+                    continue
+
+                ext = image_extraction.extension_for_mime(norm_mime)
+                file_rel = self._image_file_rel(row, seq, ext)
+                self._write_binary(file_rel, data)
+                record = {
+                    "image_id": f"{row.id}_img_{seq:04d}",
+                    "file": file_rel.name,
+                    "original_url": "(data-uri)" if ref.is_data_uri else ref.original_url,
+                    "resolved_url": ref.resolved_url,
+                    "aliases": [],
+                    "alt": ref.alt,
+                    "origin": ref.origin,
+                    "width": width,
+                    "height": height,
+                    "mime": norm_mime,
+                    "bytes": len(data),
+                    "sha256": digest,
+                    "classification": "",
+                    "category": "vector_graphic" if is_vector else "",
+                    "confidence": 0.0,
+                    "reason": "",
+                    "description": "",
+                    "relevance": "",
+                    "analysis": "",
+                    "analysis_signature": "",
+                }
+                records.append(record)
+                by_url[key] = record
+                by_hash[digest] = record
+                seq += 1
+        finally:
+            if http is not None:
+                http.close()
+
+        if capped and NOTE_IMAGE_EXTRACTION_CAPPED not in notes:
+            notes.append(NOTE_IMAGE_EXTRACTION_CAPPED)
+
+        row.images_dir = self._images_dir_rel(row).as_posix()
+        if records:
+            self._persist_image_index(row, records)
+            if row.image_status in ("", "not_requested", "no_source"):
+                row.image_status = "extracted"
+        elif row.image_status in ("", "not_requested"):
+            row.image_status = "no_images"
+        return records
+
+    def _analyze_source_images(
+        self, row: SourceManifestRow, records: list[dict], notes: list[str]
+    ) -> int:
+        """Classify (and, when enabled, describe) each image. Returns the count
+        that failed analysis; the phase still completes so partial results land."""
+        describe = bool(self.output_options.describe_images)
+        model = self.vision_backend.model
+        profile = self.project_profile_name
+        system_prompt = (IMAGE_ANALYZE_SYSTEM if describe else IMAGE_CLASSIFY_SYSTEM).format(
+            project_profile_yaml=self.project_profile_yaml or "(no project profile provided)",
+        )
+        research_purpose = self.research_purpose or "No explicit research purpose was provided."
+        page_title = row.title or "(unknown)"
+        page_url = row.final_url or row.original_url or "(unknown)"
+        min_edge = self.output_options.image_min_edge_px
+        failed = 0
+
+        for rec in records:
+            signature = (
+                f"{rec.get('sha256')}::{PROMPT_VERSION_IMAGES}::{model}::{profile}::{int(describe)}"
+            )
+            if (
+                not self.force_images
+                and rec.get("analysis_signature") == signature
+                and rec.get("classification")
+            ):
+                continue
+
+            if rec.get("mime") == "image/svg+xml":
+                rec.update(
+                    classification="incidental",
+                    category="vector_graphic",
+                    confidence=0.5,
+                    reason="Vector graphic; not analyzed by the raster vision model.",
+                    description="",
+                    relevance="",
+                    analysis="deterministic",
+                    analysis_signature=signature,
+                )
+                continue
+
+            edges = [rec.get("width") or 0, rec.get("height") or 0]
+            if all(edges) and min(edges) < min_edge:
+                rec.update(
+                    classification="incidental",
+                    category="icon",
+                    confidence=0.6,
+                    reason="Below the content size threshold; treated as a UI icon.",
+                    description="",
+                    relevance="",
+                    analysis="deterministic",
+                    analysis_signature=signature,
+                )
+                continue
+
+            data = self._read_binary(self._images_dir_rel(row) / str(rec.get("file", "")))
+            if not data:
+                failed += 1
+                rec["analysis"] = "failed"
+                continue
+
+            vision_bytes, vision_mime = self._prepare_vision_bytes(
+                data, rec.get("mime") or "image/png"
+            )
+            user_prompt = IMAGE_ANALYZE_USER.format(
+                research_purpose=research_purpose,
+                page_title=page_title,
+                page_url=page_url,
+                alt_text=rec.get("alt") or "(none)",
+                nearby_text="(none)",
+            )
+            try:
+                raw = run_async_in_sync(
+                    self._run_image_vision,
+                    system_prompt,
+                    user_prompt,
+                    vision_bytes,
+                    vision_mime,
+                ).strip()
+            except Exception as exc:
+                failed += 1
+                rec["analysis"] = "failed"
+                rec["reason"] = f"vision_failed: {type(exc).__name__}"
+                logger.warning("Image analysis failed for %s: %s", rec.get("image_id"), exc)
+                continue
+
+            parsed = _parse_image_analysis(raw, describe)
+            if parsed is None:
+                failed += 1
+                rec["analysis"] = "failed"
+                continue
+            rec.update(parsed)
+            rec["analysis"] = "vision"
+            rec["analysis_signature"] = signature
+            rec["model"] = model
+            rec["prompt_version"] = PROMPT_VERSION_IMAGES
+        return failed
+
+    async def _run_image_vision(
+        self, system_prompt: str, user_prompt: str, image_bytes: bytes, mime_type: str
+    ) -> str:
+        client = UnifiedLLMClient(self.vision_backend)
+        try:
+            return await client.vision_chat(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                image_bytes=image_bytes,
+                mime_type=mime_type,
+                response_format="json",
+            )
+        finally:
+            await client.close()
+
+    def _render_image_descriptions(
+        self, row: SourceManifestRow, relevant: list[dict], total: int, image_prefix: str
+    ) -> str:
+        lines = [f"# Image descriptions — source {row.id}", ""]
+        if row.title:
+            lines.append(f"**Source:** {row.title}")
+        if row.final_url or row.original_url:
+            lines.append(f"**URL:** {row.final_url or row.original_url}")
+        lines.append(f"**Relevant images:** {len(relevant)} of {total} extracted")
+        lines.append("")
+        for rec in relevant:
+            lines.append(f"## {rec.get('image_id')}")
+            lines.append("")
+            alt = rec.get("alt") or rec.get("image_id")
+            lines.append(f"![{alt}]({image_prefix}{rec.get('file')})")
+            lines.append("")
+            if rec.get("category"):
+                lines.append(f"- **Category:** {rec['category']}")
+            if rec.get("description"):
+                lines.append(f"- **Shows:** {rec['description']}")
+            if rec.get("relevance"):
+                lines.append(f"- **Relevance:** {rec['relevance']}")
+            if rec.get("confidence"):
+                lines.append(f"- **Confidence:** {rec['confidence']:.2f}")
+            if rec.get("resolved_url"):
+                lines.append(f"- **Original:** {rec['resolved_url']}")
+            lines.append("")
+        return "\n".join(lines).rstrip() + "\n"
+
+    def _write_image_descriptions(
+        self, row: SourceManifestRow, records: list[dict]
+    ) -> None:
+        relevant = [r for r in records if r.get("classification") == "relevant"]
+        if not relevant:
+            row.image_descriptions_status = "not_requested"
+            return
+
+        # Canonical per-source copy: images/ sits beside it.
+        per_source_rel = self._image_descriptions_rel(row)
+        self._write_text(
+            per_source_rel,
+            self._render_image_descriptions(row, relevant, len(records), "images/"),
+        )
+        row.image_descriptions_file = per_source_rel.as_posix()
+        row.image_descriptions_status = "generated"
+
+        # Browsable top-level mirror: reach back into the source's images/ dir.
+        if self.writes_to_repository:
+            shared_prefix = f"../sources/{row.id}/images/"
+        else:
+            shared_prefix = f"../images/{row.id}/"
+        self._write_text(
+            image_descriptions_shared_rel(row.id),
+            self._render_image_descriptions(row, relevant, len(records), shared_prefix),
+        )
+        self._update_image_descriptions_index(row, len(relevant), len(records))
+
+    def _update_image_descriptions_index(
+        self, row: SourceManifestRow, relevant_count: int, total_count: int
+    ) -> None:
+        index_json_rel = Path("image_descriptions") / "index.json"
+        data: dict = {}
+        existing = self._read_text(index_json_rel)
+        if existing.strip():
+            try:
+                loaded = json.loads(existing)
+                if isinstance(loaded, dict):
+                    data = loaded
+            except Exception:
+                data = {}
+        data[row.id] = {
+            "source_id": row.id,
+            "title": row.title,
+            "url": row.final_url or row.original_url,
+            "relevant_image_count": relevant_count,
+            "image_count": total_count,
+            "file": f"{row.id}.md",
+            "updated_at": _utc_now_iso(),
+        }
+        self._write_text(
+            index_json_rel, json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+        )
+        lines = ["# Image descriptions index", "", "Sources with research-relevant images.", ""]
+        for sid in sorted(data.keys()):
+            entry = data[sid]
+            title = entry.get("title") or entry.get("url") or sid
+            lines.append(
+                f"- [{sid}]({entry.get('file', sid + '.md')}) — {title} "
+                f"({entry.get('relevant_image_count', 0)} relevant / "
+                f"{entry.get('image_count', 0)} images)"
+            )
+        self._write_text(image_descriptions_index_rel(), "\n".join(lines).rstrip() + "\n")
 
     def _write_binary(self, rel_path: Path, content: bytes) -> None:
         dest = self.output_dir / rel_path
@@ -7396,6 +8099,7 @@ def _utc_now_iso() -> str:
 def detect_runtime_capabilities(
     use_llm: bool,
     llm_backend: LLMBackendConfig,
+    vision_backend: LLMBackendConfig | None = None,
 ) -> RuntimeCapabilities:
     runtime_notes: list[str] = []
     runtime_guidance: list[dict[str, str]] = []
@@ -7499,7 +8203,7 @@ def detect_runtime_capabilities(
 
     llm_vision_enabled = False
     if use_llm:
-        llm_vision_enabled = llm_backend_ready_for_vision(llm_backend)
+        llm_vision_enabled = llm_backend_ready_for_vision(vision_backend or llm_backend)
         if not llm_vision_enabled:
             runtime_notes.append(NOTE_RUNTIME_MISSING_LLM_VISION)
 

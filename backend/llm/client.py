@@ -13,6 +13,8 @@ from backend.models.settings import LLMBackendConfig
 
 logger = logging.getLogger(__name__)
 
+OCR_SYSTEM = "You are an OCR engine. Return only extracted text from the image."
+
 
 class UnifiedLLMClient:
     """Wraps both Ollama and OpenAI-compatible API backends."""
@@ -130,17 +132,55 @@ class UnifiedLLMClient:
         """Run OCR-style extraction from an image using a multimodal model."""
         call_id = get_llm_call_logger().start_chat(
             self.config,
-            "You are an OCR engine. Return only extracted text from the image.",
+            OCR_SYSTEM,
             f"{prompt}\n\n[image: {mime_type}, {len(image_bytes)} bytes]",
             None,
             call_type="vision_ocr",
         )
         try:
             if self.config.kind == "ollama":
-                content, usage = await self._ollama_vision_ocr(prompt, image_bytes)
+                content, usage = await self._ollama_vision(
+                    OCR_SYSTEM, prompt, image_bytes, None
+                )
             else:
-                content, usage = await self._openai_vision_ocr(
-                    prompt, image_bytes, mime_type
+                content, usage = await self._openai_vision(
+                    OCR_SYSTEM, prompt, image_bytes, mime_type, None
+                )
+            get_llm_call_logger().finish(call_id, response_text=content, usage=usage)
+            return content
+        except Exception as exc:
+            get_llm_call_logger().finish(call_id, error=exc)
+            raise
+
+    async def vision_chat(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        image_bytes: bytes,
+        mime_type: str = "image/png",
+        response_format: str | None = "json",
+    ) -> str:
+        """Send a multimodal (image + text) chat request and return the text.
+
+        Generalizes :meth:`vision_ocr`: the system prompt and JSON response format
+        are caller-controlled, so the same multimodal path serves image
+        classification and description, not just OCR.
+        """
+        call_id = get_llm_call_logger().start_chat(
+            self.config,
+            system_prompt,
+            f"{user_prompt}\n\n[image: {mime_type}, {len(image_bytes)} bytes]",
+            response_format,
+            call_type="vision_chat",
+        )
+        try:
+            if self.config.kind == "ollama":
+                content, usage = await self._ollama_vision(
+                    system_prompt, user_prompt, image_bytes, response_format
+                )
+            else:
+                content, usage = await self._openai_vision(
+                    system_prompt, user_prompt, image_bytes, mime_type, response_format
                 )
             get_llm_call_logger().finish(call_id, response_text=content, usage=usage)
             return content
@@ -268,8 +308,8 @@ class UnifiedLLMClient:
 
     # ---- Vision methods (async only) ----
 
-    async def _ollama_vision_ocr(
-        self, prompt: str, image_bytes: bytes
+    async def _ollama_vision(
+        self, system: str, user: str, image_bytes: bytes, fmt: str | None
     ) -> tuple[str, dict]:
         base = self.config.base_url.rstrip("/")
         image_b64 = base64.b64encode(image_bytes).decode("ascii")
@@ -277,20 +317,17 @@ class UnifiedLLMClient:
             "model": self.config.model,
             "stream": False,
             "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an OCR engine. Return only extracted text from the image."
-                    ),
-                },
+                {"role": "system", "content": system},
                 {
                     "role": "user",
-                    "content": prompt,
+                    "content": user,
                     "images": [image_b64],
                 },
             ],
             "options": {"temperature": self.config.temperature},
         }
+        if fmt == "json":
+            body["format"] = "json"
         think_value = _ollama_think_value(self.config.think_mode)
         if think_value is not None:
             body["think"] = think_value
@@ -299,17 +336,19 @@ class UnifiedLLMClient:
         data = resp.json()
         return str(data.get("message", {}).get("content", "")).strip(), _ollama_usage(data)
 
-    async def _openai_vision_ocr(
+    async def _openai_vision(
         self,
-        prompt: str,
+        system: str,
+        user: str,
         image_bytes: bytes,
         mime_type: str,
+        fmt: str | None,
     ) -> tuple[str, dict]:
         base = self.config.base_url.rstrip("/")
         headers = self._openai_headers()
         image_b64 = base64.b64encode(image_bytes).decode("ascii")
         content = [
-            {"type": "text", "text": prompt},
+            {"type": "text", "text": user},
             {
                 "type": "image_url",
                 "image_url": {"url": f"data:{mime_type};base64,{image_b64}"},
@@ -318,16 +357,13 @@ class UnifiedLLMClient:
         body: dict = {
             "model": self.config.model,
             "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an OCR engine. Return only extracted text from the image."
-                    ),
-                },
+                {"role": "system", "content": system},
                 {"role": "user", "content": content},
             ],
             "temperature": 0,
         }
+        if fmt == "json":
+            body["response_format"] = {"type": "json_object"}
 
         for path in ["/v1/chat/completions", "/chat/completions"]:
             try:
