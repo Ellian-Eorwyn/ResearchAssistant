@@ -285,6 +285,7 @@ export const api = {
       instruction_prompt?: string;
       output_constraint?: RepositoryColumnConfig["output_constraint"];
       include_row_context?: boolean;
+      row_context_scope?: RepositoryColumnConfig["row_context_scope"];
       include_source_text?: boolean;
     },
   ) =>

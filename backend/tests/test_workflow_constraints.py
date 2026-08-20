@@ -184,21 +184,31 @@ class RowContextTests(unittest.TestCase):
         self.assertFalse(needs_row_context(ORG_TYPE.replace("row metadata", "the document")))
 
     def test_file_paths_reach_a_prompt_that_asks_for_them(self) -> None:
-        """`Source PDF` asks for raw_file and rendered_pdf_file by name."""
-        import inspect
+        """`Source PDF` asks for raw_file, rendered_pdf_file, ocr_pdf_file by name,
+        so they must survive the row-metadata filter under every scope that sends
+        metadata (both "all" and "fetch_metadata")."""
+        from backend.storage.attached_repository import _row_metadata_for_scope
 
-        from backend.storage.attached_repository import (
-            AttachedRepositoryService as Service,
-        )
-
-        source = inspect.getsource(Service._generate_column_value_for_row)
-        excluded = source.split("row_metadata = {")[1].split("}")[0]
-        for field in ("raw_file", "rendered_pdf_file", "ocr_pdf_file"):
-            self.assertNotIn(
-                f'"{field}"',
-                excluded,
-                f"{field} is stripped from row metadata, so a prompt naming it cannot work.",
-            )
+        record = {
+            "raw_file": "sources/1/raw.pdf",
+            "rendered_pdf_file": "sources/1/rendered.pdf",
+            "ocr_pdf_file": "sources/1/ocr.pdf",
+            "rating_raw_json": "{...}",
+            "citation_field_evidence_json": "{...}",
+        }
+        for scope in ("all", "fetch_metadata"):
+            out = _row_metadata_for_scope(record, scope)
+            for field in ("raw_file", "rendered_pdf_file", "ocr_pdf_file"):
+                self.assertIn(
+                    field,
+                    out,
+                    f"{field} is stripped from row metadata under scope={scope!r}, "
+                    "so a prompt naming it cannot work.",
+                )
+        # The large JSON blobs are still withheld under "all".
+        all_meta = _row_metadata_for_scope(record, "all")
+        self.assertNotIn("rating_raw_json", all_meta)
+        self.assertNotIn("citation_field_evidence_json", all_meta)
 
 
 class BlockedPageTests(unittest.TestCase):

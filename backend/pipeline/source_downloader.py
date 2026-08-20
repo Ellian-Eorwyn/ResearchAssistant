@@ -69,6 +69,7 @@ from backend.pipeline.fetch_verification import (
     verify_fetch,
 )
 from backend.pipeline import image_extraction
+from backend.pipeline.date_signals import extract_date_signals
 from backend.pipeline.media_links import (
     DiscoveredMedia,
     extract_youtube_urls,
@@ -3192,6 +3193,7 @@ class SourceDownloadOrchestrator:
             row.sha256 = hashlib.sha256(raw_html.encode("utf-8")).hexdigest()
             row.title = extract_title(raw_html)
             row.canonical_url = extract_canonical_url(raw_html)
+            row.date_signals = extract_date_signals(raw_html) or row.date_signals
 
         if self.output_options.include_rendered_pdf:
             self._cancel_event.wait(self.fetch_delay)

@@ -26,6 +26,7 @@ import type {
   RepositorySourceFileKind,
   RepositorySourcePatchRequest,
   RepositorySourceTaskRequest,
+  RowContextScope,
 } from "../api/types";
 import {
   Button,
@@ -1015,7 +1016,7 @@ interface ColumnPromptDraftState {
   kind: "builtin" | "custom";
   prompt: string;
   outputConstraint: RepositoryColumnOutputConstraint | null;
-  includeRowContext: boolean;
+  rowContextScope: RowContextScope;
   includeSourceText: boolean;
 }
 
@@ -1364,18 +1365,27 @@ function ColumnPromptModal({
               </span>
             </span>
           </label>
-          <label className="flex items-start gap-3 text-body-md text-on-surface">
-            <input
-              checked={draft.includeRowContext}
-              type="checkbox"
-              onChange={(event) => onChange({ includeRowContext: event.target.checked })}
-            />
-            <span>
-              Include row metadata from other relevant columns
-              <span className="block text-on-surface-variant">
-                Includes values like title, authors, dates, organization, citation fields, summary,
-                and related structured metadata.
-              </span>
+          <label className="flex flex-col gap-1 text-body-md text-on-surface">
+            <span>Row metadata sent with the prompt</span>
+            <select
+              className="rounded-md border border-outline bg-surface px-2 py-1 text-body-md"
+              value={draft.rowContextScope}
+              onChange={(event) =>
+                onChange({ rowContextScope: event.target.value as RowContextScope })
+              }
+            >
+              <option value="none">None — document text only</option>
+              <option value="fetch_metadata">
+                Fetch metadata only — URLs, statuses, media/image counts, file paths
+              </option>
+              <option value="all">All columns — includes other columns' extracted values</option>
+            </select>
+            <span className="block text-on-surface-variant">
+              {draft.rowContextScope === "fetch_metadata"
+                ? "Deterministic fetch/ingest fields only. Never another column's extracted value, so this column cannot be influenced by other LLM runs."
+                : draft.rowContextScope === "all"
+                  ? "The full manifest record, including title, authors, dates, organization, citation fields, summary, and other columns' values."
+                  : "The prompt sees only the fetched document text."}
             </span>
           </label>
         </div>
@@ -2943,7 +2953,9 @@ export function RepositoryBrowserPage() {
       kind: column.kind,
       prompt: column.instruction_prompt || "",
       outputConstraint: column.output_constraint,
-      includeRowContext: Boolean(column.include_row_context),
+      rowContextScope:
+        column.row_context_scope ??
+        (column.include_row_context ? "all" : "none"),
       includeSourceText: column.include_source_text !== false,
     });
     setColumnPromptError("");
@@ -2957,7 +2969,8 @@ export function RepositoryBrowserPage() {
       await api.updateRepositoryColumn(columnPromptDraft.columnId, {
         instruction_prompt: columnPromptDraft.prompt,
         output_constraint: columnPromptDraft.outputConstraint,
-        include_row_context: columnPromptDraft.includeRowContext,
+        row_context_scope: columnPromptDraft.rowContextScope,
+        include_row_context: columnPromptDraft.rowContextScope !== "none",
         include_source_text: columnPromptDraft.includeSourceText,
       });
       setColumnPromptDraft(null);

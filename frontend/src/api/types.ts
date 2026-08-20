@@ -596,6 +596,8 @@ export interface RepositoryColumnOutputConstraint {
   format_hint: string;
 }
 
+export type RowContextScope = "none" | "fetch_metadata" | "all";
+
 export interface RepositoryColumnConfig {
   id: string;
   label: string;
@@ -604,6 +606,7 @@ export interface RepositoryColumnConfig {
   instruction_prompt: string;
   output_constraint: RepositoryColumnOutputConstraint | null;
   include_row_context: boolean;
+  row_context_scope?: RowContextScope | null;
   include_source_text: boolean;
   last_run_at: string;
   last_run_status: string;
@@ -756,6 +759,7 @@ export interface RepositoryManifestColumn {
   instruction_prompt: string;
   output_constraint: RepositoryColumnOutputConstraint | null;
   include_row_context: boolean;
+  row_context_scope?: RowContextScope | null;
   include_source_text: boolean;
   last_run_at: string;
   last_run_status: string;

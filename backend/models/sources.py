@@ -92,6 +92,11 @@ class SourceManifestRow(BaseModel):
     relevant_image_count: int = 0
     image_descriptions_file: str = ""
     image_descriptions_status: str = ""  # not_requested | generated | skipped_* | failed
+    # Deterministic publication-date signals pulled from the raw HTML (labelled
+    # candidates like "jsonld_published=2023-04-13; byline=Apr 13, 2023"). The
+    # markdown/cleanup step strips datelines, so this is how a text-only column
+    # gets to see the date the page actually states. See pipeline/date_signals.py.
+    date_signals: str = ""
     custom_fields: dict[str, str] = Field(default_factory=dict)
     phase_metadata: dict[str, SourcePhaseMetadata] = Field(default_factory=dict)
     # Column ids whose stored value was computed from this source's *previous*
@@ -166,7 +171,73 @@ SOURCE_MANIFEST_COLUMNS = [
     "relevant_image_count",
     "image_index_file",
     "image_descriptions_status",
+    "date_signals",
 ]
+
+
+# Deterministic fetch/ingest provenance a column prompt may see under the
+# "fetch_metadata" row-context scope. This is an explicit ALLOW-list, not a
+# block-list: a column run with this scope receives only these keys and never
+# another column's extracted value. It deliberately excludes every field that
+# is itself produced by an LLM step -- the catalog fields (`title`,
+# `author_names`, `publication_date`, `publication_year`, `document_type`,
+# `organization_name`, `organization_type`, `tags_text`), the summary/rating/
+# citation families in MANIFEST_DERIVED_COLUMNS, and all custom columns -- so
+# that one column's coding cannot influence another's. The image_* fields are
+# ingest-side signals (counts/status from the image pipeline), not another
+# column's answer, so they are included.
+FETCH_METADATA_FIELDS = frozenset(
+    {
+        # provenance / identity of the fetch itself
+        "source_kind",
+        "import_type",
+        "imported_at",
+        "provenance_ref",
+        "source_document_name",
+        # URLs
+        "original_url",
+        "final_url",
+        "canonical_url",
+        # fetch outcome
+        "fetch_status",
+        "fetch_verification",
+        "http_status",
+        "content_type",
+        "detected_type",
+        "fetch_method",
+        "error_message",
+        "fetched_at",
+        "extraction_method",
+        "sha256",
+        "markdown_char_count",
+        # captured files
+        "raw_file",
+        "rendered_file",
+        "rendered_pdf_file",
+        "ocr_pdf_file",
+        "ocr_status",
+        "markdown_file",
+        # media
+        "video_file",
+        "audio_file",
+        "thumbnail_file",
+        "media_status",
+        "media_duration_seconds",
+        # discovery graph (assigned deterministically during download)
+        "discovered_from",
+        "discovered_source_ids",
+        "discovered_media_urls",
+        "discovered_media_count",
+        # image pipeline (ingest-side signals, not another column's answer)
+        "image_status",
+        "image_count",
+        "relevant_image_count",
+        "image_index_file",
+        "image_descriptions_status",
+        # deterministic publication-date signals pulled from the raw HTML
+        "date_signals",
+    }
+)
 
 
 class SourceManifestArtifact(BaseModel):
