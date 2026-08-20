@@ -345,6 +345,17 @@ class RepositoryColumnConfig(BaseModel):
     instruction_prompt: str = ""
     output_constraint: RepositoryColumnOutputConstraint | None = None
     include_row_context: bool = False
+    # Which row metadata (if any) the column's prompt is sent alongside the
+    # document text. When set it overrides `include_row_context`:
+    #   - "none":          document text only (no row metadata at all)
+    #   - "fetch_metadata": deterministic fetch/ingest fields only (URLs,
+    #                       statuses, source_kind, media/image counts, file
+    #                       paths) and never another column's extracted value
+    #   - "all":           the full manifest record (legacy behaviour, may
+    #                       include other columns' outputs)
+    # Left None for backward compatibility, in which case `include_row_context`
+    # decides ("all" when True, "none" when False).
+    row_context_scope: Literal["none", "fetch_metadata", "all"] | None = None
     include_source_text: bool = True
     last_run_at: str = ""
     last_run_status: str = ""
@@ -359,6 +370,7 @@ class RepositoryColumnUpdateRequest(BaseModel):
     instruction_prompt: str | None = None
     output_constraint: RepositoryColumnOutputConstraint | None = None
     include_row_context: bool | None = None
+    row_context_scope: Literal["none", "fetch_metadata", "all"] | None = None
     include_source_text: bool | None = None
 
 

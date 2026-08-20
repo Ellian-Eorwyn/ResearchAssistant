@@ -100,6 +100,7 @@ from backend.models.project_profiles import (
 )
 from backend.models.settings import AppSettings, EffectiveSettings, RepoSettings
 from backend.models.sources import (
+    FETCH_METADATA_FIELDS,
     SOURCE_MANIFEST_COLUMNS,
     SourceDownloadRequest,
     SourceDownloadStatus,
@@ -645,6 +646,13 @@ class AttachedRepositoryService:
 
             if "include_row_context" in patch and patch.get("include_row_context") is not None:
                 config.include_row_context = bool(patch.get("include_row_context"))
+
+            if "row_context_scope" in patch and patch.get("row_context_scope") is not None:
+                scope = str(patch.get("row_context_scope"))
+                if scope in {"none", "fetch_metadata", "all"}:
+                    config.row_context_scope = scope
+                    # Keep the legacy boolean coherent for readers/UI.
+                    config.include_row_context = scope != "none"
 
             if "include_source_text" in patch and patch.get("include_source_text") is not None:
                 config.include_source_text = bool(patch.get("include_source_text"))
@@ -1201,7 +1209,7 @@ class AttachedRepositoryService:
             manifest_record.get(str(config.builtin_key or config.id))
         )
         include_source_text = _effective_column_include_source_text(config)
-        include_row_context = _effective_column_include_row_context(config)
+        row_context_scope = _effective_column_row_context_scope(config)
         source_text = ""
         if include_source_text:
             source_text = self._load_repository_text_artifact(row, "llm_cleanup_file")
@@ -1212,22 +1220,7 @@ class AttachedRepositoryService:
                 int(repo_settings.llm_backend.max_source_chars or 0),
             )
 
-        row_metadata: dict[str, str | int | float | bool] = {}
-        if include_row_context:
-            row_metadata = {
-                key: value
-                for key, value in manifest_record.items()
-                # Only the large JSON blobs are withheld. File paths stay: a
-                # prompt asking to "return `ocr_pdf_file` exactly as given"
-                # cannot work without them, and stripping some paths while
-                # leaving `ocr_pdf_file` through made that column half-work in a
-                # way nothing reported.
-                if key
-                not in {
-                    "rating_raw_json",
-                    "citation_field_evidence_json",
-                }
-            }
+        row_metadata = _row_metadata_for_scope(manifest_record, row_context_scope)
         hard_rules = "\n".join(
             [
                 "- Output only the target cell value.",
@@ -10398,12 +10391,56 @@ def _effective_column_output_constraint(
     return _infer_column_output_constraint(prompt_text)
 
 
+def _effective_column_row_context_scope(
+    config: RepositoryColumnConfig | None = None,
+) -> str:
+    """Resolve which row metadata a column is sent: none | fetch_metadata | all.
+
+    An explicit `row_context_scope` wins. When it is unset we fall back to the
+    legacy `include_row_context` boolean so existing columns keep behaving
+    exactly as before (True -> "all", False -> "none").
+    """
+    if config is None:
+        return "none"
+    scope = getattr(config, "row_context_scope", None)
+    if scope in {"none", "fetch_metadata", "all"}:
+        return scope
+    return "all" if bool(config.include_row_context) else "none"
+
+
 def _effective_column_include_row_context(
     config: RepositoryColumnConfig | None = None,
 ) -> bool:
-    if config is None:
-        return False
-    return bool(config.include_row_context)
+    return _effective_column_row_context_scope(config) != "none"
+
+
+def _row_metadata_for_scope(
+    manifest_record: dict[str, str | int | float | bool],
+    scope: str,
+) -> dict[str, str | int | float | bool]:
+    """The row-metadata block a column prompt is sent, given its scope.
+
+    - "all": the whole manifest record minus the two large JSON blobs. File
+      paths stay -- a prompt asking to "return `ocr_pdf_file` exactly as given"
+      cannot work without them. May include other columns' extracted values.
+    - "fetch_metadata": deterministic fetch/ingest provenance only (see
+      FETCH_METADATA_FIELDS). Never another column's extracted value or an LLM
+      catalog field, so one column's coding cannot influence another's.
+    - anything else ("none"): no metadata at all.
+    """
+    if scope == "all":
+        return {
+            key: value
+            for key, value in manifest_record.items()
+            if key not in {"rating_raw_json", "citation_field_evidence_json"}
+        }
+    if scope == "fetch_metadata":
+        return {
+            key: value
+            for key, value in manifest_record.items()
+            if key in FETCH_METADATA_FIELDS
+        }
+    return {}
 
 
 def _effective_column_include_source_text(
@@ -10591,6 +10628,9 @@ def _build_manifest_column_metadata(
                 else None
             ),
             "include_row_context": _effective_column_include_row_context(
+                config_lookup.get(field_name)
+            ),
+            "row_context_scope": _effective_column_row_context_scope(
                 config_lookup.get(field_name)
             ),
             "include_source_text": _effective_column_include_source_text(
