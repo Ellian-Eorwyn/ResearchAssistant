@@ -5,7 +5,12 @@ from __future__ import annotations
 from fastapi import APIRouter, Body, Query, Request
 
 from backend.llm.client import UnifiedLLMClient
-from backend.models.settings import AppSettings, LLMBackendConfig, ModelsResponse
+from backend.models.settings import (
+    AppSettings,
+    LLMBackendConfig,
+    ModelsResponse,
+    resolve_effective_backend,
+)
 
 router = APIRouter()
 
@@ -28,7 +33,14 @@ async def save_settings(
     store = request.app.state.file_store
     service = request.app.state.repository_service
     current = store.load_app_settings()
-    merged = current.model_copy(update=payload)
+    # Overlay the incoming keys on the current settings and re-validate, so
+    # nested payload fields (backend_profiles, llm_backend) are coerced from raw
+    # dicts into models. A shallow model_copy(update=...) would leave them as
+    # dicts and break resolve_effective_backend below.
+    merged = AppSettings.model_validate({**current.model_dump(mode="json"), **payload})
+    # Keep `llm_backend` in sync with the selected profile (and synthesize the
+    # Default profile if the client sent none).
+    merged = resolve_effective_backend(merged)
     if service.is_attached:
         merged.last_repository_path = str(service.path)
     store.save_app_settings(merged)

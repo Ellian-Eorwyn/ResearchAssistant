@@ -1,13 +1,20 @@
 import { useState } from "react";
 
 import { Button, InputField, SectionHeader, SelectField, SurfaceCard } from "../components/primitives";
-import { useAppState } from "../state/AppState";
+import { PROVIDER_LABELS, useAppState } from "../state/AppState";
+import type { BackendProvider } from "../api/types";
 
 export function SettingsPage() {
   const {
     appSettingsDraft,
     setAppSettingsDraft,
     saveAppSettings,
+    selectBackendProfile,
+    saveBackendProfile,
+    duplicateBackendProfile,
+    deleteBackendProfile,
+    setActiveBackendProvider,
+    renameActiveBackendProfile,
     mergeRepositories,
     pickRepositoryDirectory,
     repoError,
@@ -19,6 +26,12 @@ export function SettingsPage() {
     loadingModels,
   } = useAppState();
   const [mergePending, setMergePending] = useState(false);
+
+  const backendProfiles = appSettingsDraft.backend_profiles;
+  const activeProfile = backendProfiles.find(
+    (profile) => profile.id === appSettingsDraft.active_profile_id,
+  );
+  const activeProvider: BackendProvider = activeProfile?.provider ?? "custom";
 
   const handleMergeRepository = async () => {
     setMergePending(true);
@@ -51,22 +64,56 @@ export function SettingsPage() {
 
       <SurfaceCard>
         <div className="mb-3 text-title-sm font-semibold">LLM Backend Settings</div>
+
+        <div className="mb-4 rounded-md border border-outline-variant bg-surface-container-low p-3">
+          <div className="grid gap-3 md:grid-cols-2">
+            <SelectField
+              label="Saved Backend"
+              value={appSettingsDraft.active_profile_id}
+              onChange={(event) => void selectBackendProfile(event.target.value)}
+            >
+              {backendProfiles.map((profile) => (
+                <option key={profile.id} value={profile.id}>
+                  {profile.name || "(unnamed)"}
+                </option>
+              ))}
+            </SelectField>
+
+            <InputField
+              label="Profile Name"
+              value={activeProfile?.name ?? ""}
+              onChange={(event) => renameActiveBackendProfile(event.target.value)}
+              placeholder="e.g. Claude (work)"
+            />
+          </div>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <Button variant="primary" disabled={savingSettings} onClick={() => void saveBackendProfile()}>
+              {savingSettings ? "Saving..." : "Save Backend"}
+            </Button>
+            <Button variant="secondary" onClick={() => void duplicateBackendProfile()}>
+              Duplicate
+            </Button>
+            <Button
+              variant="danger"
+              disabled={backendProfiles.length <= 1}
+              onClick={() => void deleteBackendProfile(appSettingsDraft.active_profile_id)}
+            >
+              Delete
+            </Button>
+          </div>
+        </div>
+
         <div className="grid gap-3 md:grid-cols-2">
           <SelectField
-            label="Backend Type"
-            value={appSettingsDraft.llm_backend.kind}
-            onChange={(event) =>
-              setAppSettingsDraft((prev) => ({
-                ...prev,
-                llm_backend: {
-                  ...prev.llm_backend,
-                  kind: event.target.value,
-                },
-              }))
-            }
+            label="Provider"
+            value={activeProvider}
+            onChange={(event) => setActiveBackendProvider(event.target.value as BackendProvider)}
           >
-            <option value="ollama">Ollama (Local)</option>
-            <option value="openai">OpenAI-Compatible</option>
+            {PROVIDER_LABELS.map((provider) => (
+              <option key={provider.value} value={provider.value}>
+                {provider.label}
+              </option>
+            ))}
           </SelectField>
 
           <InputField
@@ -146,21 +193,28 @@ export function SettingsPage() {
           />
 
           <SelectField
-            label="Think Mode"
-            value={appSettingsDraft.llm_backend.think_mode}
+            label="Reasoning"
+            value={appSettingsDraft.llm_backend.reasoning_level}
             onChange={(event) =>
               setAppSettingsDraft((prev) => ({
                 ...prev,
                 llm_backend: {
                   ...prev.llm_backend,
-                  think_mode: event.target.value as "default" | "think" | "no_think",
+                  reasoning_level: event.target.value as
+                    | "default"
+                    | "off"
+                    | "low"
+                    | "medium"
+                    | "high",
                 },
               }))
             }
           >
             <option value="default">Default</option>
-            <option value="think">Think</option>
-            <option value="no_think">No Think</option>
+            <option value="off">Off</option>
+            <option value="low">Low</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
           </SelectField>
 
           <InputField
@@ -176,6 +230,24 @@ export function SettingsPage() {
                 llm_backend: {
                   ...prev.llm_backend,
                   num_ctx: Number.parseInt(event.target.value || "8192", 10),
+                },
+              }))
+            }
+          />
+
+          <InputField
+            label="Max Tokens (0 = provider default)"
+            type="number"
+            min={0}
+            max={200000}
+            step={256}
+            value={String(appSettingsDraft.llm_backend.max_tokens)}
+            onChange={(event) =>
+              setAppSettingsDraft((prev) => ({
+                ...prev,
+                llm_backend: {
+                  ...prev.llm_backend,
+                  max_tokens: Number.parseInt(event.target.value || "0", 10),
                 },
               }))
             }
@@ -232,7 +304,7 @@ export function SettingsPage() {
 
         <div className="mt-4 flex flex-wrap gap-2">
           <Button variant="primary" disabled={savingSettings} onClick={() => void saveAppSettings()}>
-            {savingSettings ? "Saving..." : "Save LLM Backend Settings"}
+            {savingSettings ? "Saving..." : "Save LLM Settings"}
           </Button>
         </div>
       </SurfaceCard>

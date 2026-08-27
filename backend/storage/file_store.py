@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from backend.models.common import PipelineStage, StageStatus
-from backend.models.settings import AppSettings
+from backend.models.settings import AppSettings, resolve_effective_backend
 from backend.storage.project_profiles import (
     list_project_profiles_in_dir,
     resolve_project_profile_yaml,
@@ -152,9 +152,14 @@ class FileStore:
     def load_app_settings(self) -> AppSettings:
         raw = self.load_settings()
         try:
-            return AppSettings(**raw)
+            settings = AppSettings(**raw)
         except Exception:
-            return AppSettings()
+            settings = AppSettings()
+        # Normalize the profile library and project the active profile down into
+        # `llm_backend`. This is also the migration backstop: an existing config
+        # with no `backend_profiles` gets a "Default" profile synthesized here on
+        # first load.
+        return resolve_effective_backend(settings)
 
     def save_app_settings(self, settings: AppSettings) -> None:
         self.save_settings(settings.model_dump(mode="json"))

@@ -15,8 +15,12 @@ import { api } from "../api/client";
 import { DirectoryBrowserModal } from "../components/DirectoryBrowserModal";
 import type {
   AppSettings,
+  BackendProfile,
+  BackendProvider,
   BibliographyResult,
   IngestionProfile,
+  LLMBackendConfig,
+  ReasoningLevel,
   IngestionProfileSuggestion,
   ExportResult,
   JobStatusResponse,
@@ -34,19 +38,45 @@ import type {
 
 import { createContext } from "react";
 
+const DEFAULT_LLM_BACKEND: LLMBackendConfig = {
+  kind: "ollama",
+  base_url: "http://localhost:11434",
+  api_key: "",
+  model: "",
+  temperature: 0,
+  think_mode: "default",
+  reasoning_level: "default",
+  num_ctx: 8192,
+  max_tokens: 0,
+  max_source_chars: 0,
+  llm_timeout: 300,
+};
+
+// Friendly provider presets -> concrete backend kind + default base URL.
+// Mirror of PROVIDER_PRESETS in backend/models/settings.py.
+const PROVIDER_PRESETS: Record<BackendProvider, { kind: string; base_url: string }> = {
+  openai: { kind: "openai", base_url: "https://api.openai.com/v1" },
+  anthropic: { kind: "anthropic", base_url: "https://api.anthropic.com" },
+  together: { kind: "openai", base_url: "https://api.together.xyz/v1" },
+  ollama: { kind: "ollama", base_url: "http://localhost:11434" },
+  llamacpp: { kind: "openai", base_url: "http://localhost:8080/v1" },
+  custom: { kind: "openai", base_url: "" },
+};
+
+export const PROVIDER_LABELS: Array<{ value: BackendProvider; label: string }> = [
+  { value: "openai", label: "OpenAI" },
+  { value: "anthropic", label: "Claude (Anthropic)" },
+  { value: "together", label: "Together.ai" },
+  { value: "ollama", label: "Ollama (Local)" },
+  { value: "llamacpp", label: "Llama.cpp" },
+  { value: "custom", label: "Custom (OpenAI-compatible)" },
+];
+
 const DEFAULT_APP_SETTINGS: AppSettings = {
   last_repository_path: "",
-  llm_backend: {
-    kind: "ollama",
-    base_url: "http://localhost:11434",
-    api_key: "",
-    model: "",
-    temperature: 0,
-    think_mode: "default",
-    num_ctx: 8192,
-    max_source_chars: 0,
-    llm_timeout: 300,
-  },
+  backend_profiles: [],
+  active_profile_id: "",
+  llm_backend: { ...DEFAULT_LLM_BACKEND },
   use_llm: false,
   fetch_delay: 2,
   searxng_base_url: "",
@@ -120,6 +150,13 @@ interface AppStateValue {
   appSettingsDraft: AppSettings;
   setAppSettingsDraft: Dispatch<SetStateAction<AppSettings>>;
   saveAppSettings: (nextSettings?: AppSettings) => Promise<void>;
+  selectBackendProfile: (profileId: string) => Promise<void>;
+  saveBackendProfile: () => Promise<void>;
+  saveBackendProfileAs: (name: string) => Promise<void>;
+  duplicateBackendProfile: () => Promise<void>;
+  deleteBackendProfile: (profileId: string) => Promise<void>;
+  setActiveBackendProvider: (provider: BackendProvider) => void;
+  renameActiveBackendProfile: (name: string) => void;
   sourceTaskDraft: RepositorySourceTaskRequest;
   setSourceTaskDraft: Dispatch<SetStateAction<RepositorySourceTaskRequest>>;
   processingJobId: string | null;
@@ -216,17 +253,47 @@ function normalizeThinkMode(value: string): "default" | "think" | "no_think" {
   return "default";
 }
 
+function normalizeReasoningLevel(value: string): ReasoningLevel {
+  if (value === "off" || value === "low" || value === "medium" || value === "high") return value;
+  return "default";
+}
+
+function normalizeBackendConfig(config: LLMBackendConfig): LLMBackendConfig {
+  return {
+    ...config,
+    temperature: normalizeTemperature(config.temperature),
+    think_mode: normalizeThinkMode(config.think_mode),
+    reasoning_level: normalizeReasoningLevel(config.reasoning_level),
+    num_ctx: Math.max(2048, Math.min(262144, config.num_ctx)),
+    max_tokens: Math.max(0, Math.min(200000, config.max_tokens || 0)),
+    max_source_chars: Math.max(0, Math.min(120000, config.max_source_chars)),
+    llm_timeout: Math.max(30, Math.min(1800, config.llm_timeout)),
+  };
+}
+
+// Persist edits from the live form (bound to `llm_backend`) into the active
+// profile's config, so the server -- which re-derives `llm_backend` from the
+// active profile -- keeps those edits.
+function syncActiveProfile(settings: AppSettings): AppSettings {
+  if (!settings.active_profile_id) return settings;
+  return {
+    ...settings,
+    backend_profiles: settings.backend_profiles.map((profile) =>
+      profile.id === settings.active_profile_id
+        ? { ...profile, config: { ...settings.llm_backend } }
+        : profile,
+    ),
+  };
+}
+
 function normalizeAppSettingsDraft(settings: AppSettings): AppSettings {
   return {
     ...settings,
-    llm_backend: {
-      ...settings.llm_backend,
-      temperature: normalizeTemperature(settings.llm_backend.temperature),
-      think_mode: normalizeThinkMode(settings.llm_backend.think_mode),
-      num_ctx: Math.max(2048, Math.min(262144, settings.llm_backend.num_ctx)),
-      max_source_chars: Math.max(0, Math.min(120000, settings.llm_backend.max_source_chars)),
-      llm_timeout: Math.max(30, Math.min(1800, settings.llm_backend.llm_timeout)),
-    },
+    llm_backend: normalizeBackendConfig(settings.llm_backend),
+    backend_profiles: settings.backend_profiles.map((profile) => ({
+      ...profile,
+      config: normalizeBackendConfig(profile.config),
+    })),
   };
 }
 
@@ -1023,7 +1090,9 @@ export function AppStateProvider({ children }: PropsWithChildren) {
     setProcessingError("");
     setSourceError("");
     try {
-      const savedAppSettings = await api.saveAppSettings(normalizeAppSettingsDraft(appSettingsDraft));
+      const savedAppSettings = await api.saveAppSettings(
+        normalizeAppSettingsDraft(syncActiveProfile(appSettingsDraft)),
+      );
       setAppSettings(savedAppSettings);
       setAppSettingsDraft(savedAppSettings);
       const response = await api.processRepositoryDocuments(files, selectedIngestionProfileId);
@@ -1056,7 +1125,9 @@ export function AppStateProvider({ children }: PropsWithChildren) {
     setProcessingError("");
     setSourceError("");
     try {
-      const savedAppSettings = await api.saveAppSettings(normalizeAppSettingsDraft(appSettingsDraft));
+      const savedAppSettings = await api.saveAppSettings(
+        normalizeAppSettingsDraft(syncActiveProfile(appSettingsDraft)),
+      );
       setAppSettings(savedAppSettings);
       setAppSettingsDraft(savedAppSettings);
       const response = await api.reprocessRepositoryDocuments({
@@ -1247,7 +1318,11 @@ export function AppStateProvider({ children }: PropsWithChildren) {
     setSavingSettings(true);
     setRepoError("");
     try {
-      const payload = normalizeAppSettingsDraft(nextSettings ?? appSettingsDraft);
+      // Fold live backend-form edits into the active profile first -- the
+      // server re-derives `llm_backend` from the active profile, so an edit
+      // that only touched `llm_backend` would otherwise be discarded.
+      const synced = syncActiveProfile(nextSettings ?? appSettingsDraft);
+      const payload = normalizeAppSettingsDraft(synced);
       const saved = await api.saveAppSettings(payload);
       setAppSettings(saved);
       setAppSettingsDraft(saved);
@@ -1258,6 +1333,129 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       setSavingSettings(false);
     }
   }, [appSettingsDraft]);
+
+  // ---- Saved backend profiles ----
+
+  const setActiveBackendProvider = useCallback((provider: BackendProvider) => {
+    const preset = PROVIDER_PRESETS[provider];
+    setAppSettingsDraft((prev) => ({
+      ...prev,
+      backend_profiles: prev.backend_profiles.map((profile) =>
+        profile.id === prev.active_profile_id ? { ...profile, provider } : profile,
+      ),
+      llm_backend: {
+        ...prev.llm_backend,
+        kind: preset.kind,
+        // Only overwrite the base URL when the preset carries one (Custom is
+        // blank), so switching to Custom keeps whatever the user typed.
+        base_url: preset.base_url || prev.llm_backend.base_url,
+      },
+    }));
+  }, []);
+
+  const renameActiveBackendProfile = useCallback((name: string) => {
+    setAppSettingsDraft((prev) => ({
+      ...prev,
+      backend_profiles: prev.backend_profiles.map((profile) =>
+        profile.id === prev.active_profile_id ? { ...profile, name } : profile,
+      ),
+    }));
+  }, []);
+
+  const selectBackendProfile = useCallback(
+    async (profileId: string) => {
+      const target = appSettingsDraft.backend_profiles.find((p) => p.id === profileId);
+      if (!target) return;
+      // Load the selected profile's config into the live form and make it active.
+      const next: AppSettings = {
+        ...appSettingsDraft,
+        active_profile_id: profileId,
+        llm_backend: { ...target.config },
+      };
+      setAppSettingsDraft(next);
+      setModels([]);
+      await saveAppSettings(next);
+    },
+    [appSettingsDraft, saveAppSettings],
+  );
+
+  const saveBackendProfile = useCallback(async () => {
+    // Live edits already live in `llm_backend`; saveAppSettings folds them into
+    // the active profile.
+    await saveAppSettings();
+  }, [saveAppSettings]);
+
+  const saveBackendProfileAs = useCallback(
+    async (name: string) => {
+      const id =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `profile-${Date.now()}`;
+      const active = appSettingsDraft.backend_profiles.find(
+        (p) => p.id === appSettingsDraft.active_profile_id,
+      );
+      const newProfile: BackendProfile = {
+        id,
+        name: name.trim() || "New backend",
+        provider: active?.provider ?? "custom",
+        config: { ...appSettingsDraft.llm_backend },
+      };
+      const next: AppSettings = {
+        ...appSettingsDraft,
+        backend_profiles: [...appSettingsDraft.backend_profiles, newProfile],
+        active_profile_id: id,
+      };
+      setAppSettingsDraft(next);
+      await saveAppSettings(next);
+    },
+    [appSettingsDraft, saveAppSettings],
+  );
+
+  const duplicateBackendProfile = useCallback(async () => {
+    const active = appSettingsDraft.backend_profiles.find(
+      (p) => p.id === appSettingsDraft.active_profile_id,
+    );
+    if (!active) return;
+    const id =
+      typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID()
+        : `profile-${Date.now()}`;
+    const copy: BackendProfile = {
+      ...active,
+      id,
+      name: `${active.name || "Backend"} (copy)`,
+      config: { ...active.config },
+    };
+    const next: AppSettings = {
+      ...appSettingsDraft,
+      backend_profiles: [...appSettingsDraft.backend_profiles, copy],
+      active_profile_id: id,
+      llm_backend: { ...copy.config },
+    };
+    setAppSettingsDraft(next);
+    await saveAppSettings(next);
+  }, [appSettingsDraft, saveAppSettings]);
+
+  const deleteBackendProfile = useCallback(
+    async (profileId: string) => {
+      const remaining = appSettingsDraft.backend_profiles.filter((p) => p.id !== profileId);
+      const wasActive = appSettingsDraft.active_profile_id === profileId;
+      const nextActiveId = wasActive
+        ? remaining[0]?.id ?? ""
+        : appSettingsDraft.active_profile_id;
+      const nextActive = remaining.find((p) => p.id === nextActiveId);
+      const next: AppSettings = {
+        ...appSettingsDraft,
+        backend_profiles: remaining,
+        active_profile_id: nextActiveId,
+        llm_backend: nextActive ? { ...nextActive.config } : appSettingsDraft.llm_backend,
+      };
+      setAppSettingsDraft(next);
+      // If the last profile was deleted, the server re-synthesizes a Default.
+      await saveAppSettings(next);
+    },
+    [appSettingsDraft, saveAppSettings],
+  );
 
   const loadModels = useCallback(async () => {
     setLoadingModels(true);
@@ -1479,6 +1677,13 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       appSettingsDraft,
       setAppSettingsDraft,
       saveAppSettings,
+      selectBackendProfile,
+      saveBackendProfile,
+      saveBackendProfileAs,
+      duplicateBackendProfile,
+      deleteBackendProfile,
+      setActiveBackendProvider,
+      renameActiveBackendProfile,
       sourceTaskDraft,
       setSourceTaskDraft,
       processingJobId,
@@ -1561,6 +1766,13 @@ export function AppStateProvider({ children }: PropsWithChildren) {
       appSettings,
       appSettingsDraft,
       saveAppSettings,
+      selectBackendProfile,
+      saveBackendProfile,
+      saveBackendProfileAs,
+      duplicateBackendProfile,
+      deleteBackendProfile,
+      setActiveBackendProvider,
+      renameActiveBackendProfile,
       sourceTaskDraft,
       processingJobId,
       sourceTaskJobId,
