@@ -260,16 +260,35 @@ export interface PickDirectoryResponse {
   path: string;
 }
 
+export type ReasoningLevel = "default" | "off" | "low" | "medium" | "high";
+
 export interface LLMBackendConfig {
-  kind: "ollama" | "openai" | string;
+  kind: "ollama" | "openai" | "anthropic" | string;
   base_url: string;
   api_key: string;
   model: string;
   temperature: number;
   think_mode: "default" | "think" | "no_think";
+  reasoning_level: ReasoningLevel;
   num_ctx: number;
+  max_tokens: number;
   max_source_chars: number;
   llm_timeout: number;
+}
+
+export type BackendProvider =
+  | "openai"
+  | "anthropic"
+  | "together"
+  | "ollama"
+  | "llamacpp"
+  | "custom";
+
+export interface BackendProfile {
+  id: string;
+  name: string;
+  provider: BackendProvider;
+  config: LLMBackendConfig;
 }
 
 export interface RepoSettings {
@@ -279,6 +298,10 @@ export interface RepoSettings {
 
 export interface AppSettings {
   last_repository_path: string;
+  /** Saved library of named backends the user can switch between. */
+  backend_profiles: BackendProfile[];
+  /** Id of the profile currently projected into `llm_backend`. */
+  active_profile_id: string;
   llm_backend: LLMBackendConfig;
   use_llm: boolean;
   searxng_base_url: string;

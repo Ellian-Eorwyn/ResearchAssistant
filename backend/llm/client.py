@@ -46,6 +46,13 @@ class UnifiedLLMClient:
                 resp.raise_for_status()
                 data = resp.json()
                 return [m["name"] for m in data.get("models", [])]
+            elif self.config.kind == "anthropic":
+                resp = await self._client.get(
+                    f"{base}/v1/models", headers=self._anthropic_headers()
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                return [m["id"] for m in data.get("data", [])]
             else:
                 headers = self._openai_headers()
                 for path in ["/v1/models", "/models"]:
@@ -85,6 +92,10 @@ class UnifiedLLMClient:
                 content, usage = await self._ollama_chat(
                     system_prompt, user_prompt, response_format
                 )
+            elif self.config.kind == "anthropic":
+                content, usage = await self._anthropic_chat(
+                    system_prompt, user_prompt, response_format
+                )
             else:
                 content, usage = await self._openai_chat(
                     system_prompt, user_prompt, response_format
@@ -111,6 +122,10 @@ class UnifiedLLMClient:
         try:
             if self.config.kind == "ollama":
                 content, usage = self._ollama_chat_sync(
+                    system_prompt, user_prompt, response_format
+                )
+            elif self.config.kind == "anthropic":
+                content, usage = self._anthropic_chat_sync(
                     system_prompt, user_prompt, response_format
                 )
             else:
@@ -141,6 +156,10 @@ class UnifiedLLMClient:
             if self.config.kind == "ollama":
                 content, usage = await self._ollama_vision(
                     OCR_SYSTEM, prompt, image_bytes, None
+                )
+            elif self.config.kind == "anthropic":
+                content, usage = await self._anthropic_vision(
+                    OCR_SYSTEM, prompt, image_bytes, mime_type, None
                 )
             else:
                 content, usage = await self._openai_vision(
@@ -177,6 +196,10 @@ class UnifiedLLMClient:
             if self.config.kind == "ollama":
                 content, usage = await self._ollama_vision(
                     system_prompt, user_prompt, image_bytes, response_format
+                )
+            elif self.config.kind == "anthropic":
+                content, usage = await self._anthropic_vision(
+                    system_prompt, user_prompt, image_bytes, mime_type, response_format
                 )
             else:
                 content, usage = await self._openai_vision(
@@ -286,7 +309,9 @@ class UnifiedLLMClient:
         }
         if fmt == "json":
             body["format"] = "json"
-        think_value = _ollama_think_value(self.config.think_mode)
+        think_value = _ollama_think_from_level(
+            _effective_reasoning_level(self.config)
+        )
         if think_value is not None:
             body["think"] = think_value
         return body
@@ -294,16 +319,27 @@ class UnifiedLLMClient:
     def _build_openai_body(
         self, system: str, user: str, fmt: str | None
     ) -> dict:
+        # Honor the configured temperature/max_tokens (this path used to hardcode
+        # temperature=0 and drop everything else). reasoning_effort is only sent
+        # for a non-default reasoning_level so standard chat models -- which
+        # don't accept it -- are unaffected; reasoning models (o-series, gpt-5)
+        # additionally reject `temperature`/`max_tokens`, an accepted edge for a
+        # user-configured OpenAI-compatible endpoint.
         body: dict = {
             "model": self.config.model,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "temperature": 0,
+            "temperature": self.config.temperature,
         }
         if fmt == "json":
             body["response_format"] = {"type": "json_object"}
+        if self.config.max_tokens > 0:
+            body["max_tokens"] = self.config.max_tokens
+        effort = _openai_reasoning_effort(_effective_reasoning_level(self.config))
+        if effort is not None:
+            body["reasoning_effort"] = effort
         return body
 
     # ---- Vision methods (async only) ----
@@ -328,7 +364,9 @@ class UnifiedLLMClient:
         }
         if fmt == "json":
             body["format"] = "json"
-        think_value = _ollama_think_value(self.config.think_mode)
+        think_value = _ollama_think_from_level(
+            _effective_reasoning_level(self.config)
+        )
         if think_value is not None:
             body["think"] = think_value
         resp = await self._client.post(f"{base}/api/chat", json=body)
@@ -360,10 +398,15 @@ class UnifiedLLMClient:
                 {"role": "system", "content": system},
                 {"role": "user", "content": content},
             ],
-            "temperature": 0,
+            "temperature": self.config.temperature,
         }
         if fmt == "json":
             body["response_format"] = {"type": "json_object"}
+        if self.config.max_tokens > 0:
+            body["max_tokens"] = self.config.max_tokens
+        effort = _openai_reasoning_effort(_effective_reasoning_level(self.config))
+        if effort is not None:
+            body["reasoning_effort"] = effort
 
         for path in ["/v1/chat/completions", "/chat/completions"]:
             try:
@@ -390,6 +433,107 @@ class UnifiedLLMClient:
         if self.config.api_key:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
         return headers
+
+    # ---- Anthropic (native Messages API) ----
+
+    def _anthropic_headers(self) -> dict[str, str]:
+        return {
+            "content-type": "application/json",
+            "x-api-key": self.config.api_key,
+            "anthropic-version": "2023-06-01",
+        }
+
+    def _build_anthropic_body(
+        self, system: str, user: str, fmt: str | None
+    ) -> dict:
+        # Anthropic's Messages API differs from OpenAI's: `system` is top-level,
+        # `max_tokens` is required, and there is no JSON response_format (we
+        # emulate it with a system instruction). Sampling params (temperature)
+        # are intentionally omitted -- current Claude models reject them with a
+        # 400 -- so reasoning is expressed via `output_config.effort` / a
+        # disabled `thinking` block instead.
+        system_text = system
+        if fmt == "json":
+            system_text = (
+                f"{system}\n\nRespond with a single valid JSON object and "
+                "nothing else."
+            ).strip()
+        body: dict = {
+            "model": self.config.model,
+            "max_tokens": self.config.max_tokens or 4096,
+            "system": system_text,
+            "messages": [{"role": "user", "content": user}],
+        }
+        level = _effective_reasoning_level(self.config)
+        if level == "off":
+            body["thinking"] = {"type": "disabled"}
+        else:
+            effort = _anthropic_effort(level)
+            if effort is not None:
+                body["output_config"] = {"effort": effort}
+        return body
+
+    async def _anthropic_chat(
+        self, system: str, user: str, fmt: str | None
+    ) -> tuple[str, dict]:
+        base = self.config.base_url.rstrip("/")
+        body = self._build_anthropic_body(system, user, fmt)
+        resp = await self._client.post(
+            f"{base}/v1/messages", json=body, headers=self._anthropic_headers()
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return _anthropic_text(data), _anthropic_usage(data)
+
+    def _anthropic_chat_sync(
+        self, system: str, user: str, fmt: str | None
+    ) -> tuple[str, dict]:
+        client = self._get_sync_client()
+        base = self.config.base_url.rstrip("/")
+        body = self._build_anthropic_body(system, user, fmt)
+        resp = client.post(
+            f"{base}/v1/messages",
+            json=body,
+            headers=self._anthropic_headers(),
+            timeout=self.config.llm_timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return _anthropic_text(data), _anthropic_usage(data)
+
+    async def _anthropic_vision(
+        self,
+        system: str,
+        user: str,
+        image_bytes: bytes,
+        mime_type: str,
+        fmt: str | None,
+    ) -> tuple[str, dict]:
+        base = self.config.base_url.rstrip("/")
+        image_b64 = base64.b64encode(image_bytes).decode("ascii")
+        body = self._build_anthropic_body(system, user, fmt)
+        body["messages"] = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": mime_type,
+                            "data": image_b64,
+                        },
+                    },
+                ],
+            }
+        ]
+        resp = await self._client.post(
+            f"{base}/v1/messages", json=body, headers=self._anthropic_headers()
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return _anthropic_text(data), _anthropic_usage(data)
 
 
 def _normalize_openai_message_content(content: object) -> str:
@@ -419,10 +563,59 @@ def _ollama_usage(data: dict) -> dict[str, int]:
     return usage
 
 
-def _ollama_think_value(think_mode: str) -> bool | None:
-    mode = (think_mode or "default").strip().lower()
-    if mode == "think":
+def _effective_reasoning_level(config: LLMBackendConfig) -> str:
+    """Resolve the cross-provider reasoning level for a config.
+
+    Prefers the unified `reasoning_level`; when it is "default" it falls back to
+    the legacy Ollama `think_mode` so existing configs keep behaving.
+    """
+    level = (config.reasoning_level or "default").strip().lower()
+    if level != "default":
+        return level
+    return {"think": "high", "no_think": "off"}.get(config.think_mode, "default")
+
+
+def _ollama_think_from_level(level: str) -> bool | None:
+    if level in ("low", "medium", "high"):
         return True
-    if mode == "no_think":
+    if level == "off":
         return False
-    return None
+    return None  # "default" -> omit the field
+
+
+def _openai_reasoning_effort(level: str) -> str | None:
+    if level in ("low", "medium", "high"):
+        return level
+    if level == "off":
+        return "minimal"
+    return None  # "default" -> omit the field
+
+
+def _anthropic_effort(level: str) -> str | None:
+    if level in ("low", "medium", "high"):
+        return level
+    return None  # "off"/"default" handled by the caller
+
+
+def _anthropic_text(data: dict) -> str:
+    blocks = data.get("content", []) or []
+    parts = [
+        b.get("text", "")
+        for b in blocks
+        if isinstance(b, dict) and b.get("type") == "text"
+    ]
+    return "".join(parts).strip()
+
+
+def _anthropic_usage(data: dict) -> dict[str, int]:
+    usage_raw = data.get("usage", {}) or {}
+    prompt_tokens = usage_raw.get("input_tokens")
+    completion_tokens = usage_raw.get("output_tokens")
+    usage: dict[str, int] = {}
+    if isinstance(prompt_tokens, int):
+        usage["prompt_tokens"] = prompt_tokens
+    if isinstance(completion_tokens, int):
+        usage["completion_tokens"] = completion_tokens
+    if isinstance(prompt_tokens, int) and isinstance(completion_tokens, int):
+        usage["total_tokens"] = prompt_tokens + completion_tokens
+    return usage
