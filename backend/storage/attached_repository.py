@@ -137,6 +137,7 @@ from backend.pipeline.source_downloader import (
     PHASE_FETCH,
     PHASE_IMAGES,
     PHASE_RATING,
+    PHASE_RESIGNAL,
     PHASE_SUMMARY,
     PHASE_TITLE,
     _apply_citation_manual_overrides,
@@ -149,6 +150,7 @@ from backend.pipeline.source_downloader import (
     _normalize_phase_name,
     _citation_reference_url_for_row,
     _normalize_row_phase_metadata,
+    effective_markdown_rel_path,
     mark_downstream_stale,
     mark_downstream_stale_for_blocked,
     markdown_rel,
@@ -1212,9 +1214,20 @@ class AttachedRepositoryService:
         row_context_scope = _effective_column_row_context_scope(config)
         source_text = ""
         if include_source_text:
-            source_text = self._load_repository_text_artifact(row, "llm_cleanup_file")
-            if not source_text:
-                source_text = self._load_repository_text_artifact(row, "markdown_file")
+            # Use the single source of truth for "which markdown represents this
+            # source now": it prefers the LLM-cleaned copy but only while it is
+            # current, so a stale cleanup left behind by a re-attach/reconvert
+            # (e.g. a page replaced by its real PDF) never feeds the column run.
+            source_rel = effective_markdown_rel_path(row, self.path)
+            if source_rel:
+                resolved = self.path / source_rel
+                if resolved.is_file():
+                    try:
+                        source_text = resolved.read_text(
+                            encoding="utf-8", errors="replace"
+                        ).strip()
+                    except OSError:
+                        source_text = ""
             source_text = _truncate_column_run_text(
                 source_text,
                 int(repo_settings.llm_backend.max_source_chars or 0),
@@ -1407,6 +1420,7 @@ class AttachedRepositoryService:
         fetch_fields = {
             "fetch_status",
             "fetch_verification",
+            "error_message",
         }
         citation_fields = {
             "citation_title",
@@ -1486,6 +1500,12 @@ class AttachedRepositoryService:
                     row.fetch_verification = self._normalize_source_patch_text(
                         patch.get("fetch_verification")
                     ).lower()
+                if "error_message" in requested_fields:
+                    # A human reason for a forced status (shown on Resolve Fetches),
+                    # or "" to clear a stale one. Not lower-cased: it is prose.
+                    row.error_message = self._normalize_source_patch_text(
+                        patch.get("error_message")
+                    )
 
             if "custom_fields" in requested_fields:
                 custom_updates = patch.get("custom_fields") or {}
@@ -6562,6 +6582,7 @@ class AttachedRepositoryService:
         run_llm_summary = bool(payload.run_llm_summary or payload.force_summary)
         run_llm_rating = bool(payload.run_llm_rating or payload.force_rating)
         run_images = bool(payload.run_images or payload.force_images)
+        run_resignal = bool(payload.run_resignal or payload.force_resignal)
         if not (
             run_download
             or run_convert
@@ -6572,6 +6593,7 @@ class AttachedRepositoryService:
             or run_llm_summary
             or run_llm_rating
             or run_images
+            or run_resignal
         ):
             raise ValueError("Select at least one source phase to run.")
         if run_download and not any(
@@ -6599,6 +6621,7 @@ class AttachedRepositoryService:
             run_rating=run_llm_rating,
             run_summary=run_llm_summary,
             run_images=run_images,
+            run_resignal=run_resignal,
         )
 
         with self._writer_lock():
@@ -6624,6 +6647,7 @@ class AttachedRepositoryService:
                 run_llm_summary=run_llm_summary,
                 run_llm_rating=run_llm_rating,
                 run_images=run_images,
+                run_resignal=run_resignal,
                 output_options=SourceOutputOptions(
                     include_raw_file=payload.include_raw_file,
                     include_rendered_html=payload.include_rendered_html,
@@ -6689,6 +6713,7 @@ class AttachedRepositoryService:
                 run_llm_summary=run_llm_summary,
                 run_llm_rating=run_llm_rating,
                 run_images=run_images,
+                run_resignal=run_resignal,
                 force_redownload=payload.force_redownload,
                 force_convert=payload.force_convert,
                 force_catalog=payload.force_catalog,
@@ -6698,6 +6723,7 @@ class AttachedRepositoryService:
                 force_summary=payload.force_summary,
                 force_rating=payload.force_rating,
                 force_images=payload.force_images,
+                force_resignal=payload.force_resignal,
                 project_profile_name=project_profile_name,
                 project_profile_yaml=project_profile_yaml,
                 output_options=SourceOutputOptions(
@@ -7343,6 +7369,7 @@ class AttachedRepositoryService:
         run_llm_summary: bool = False,
         run_llm_rating: bool = False,
         run_images: bool = False,
+        run_resignal: bool = False,
         output_options: SourceOutputOptions | None = None,
     ) -> tuple[list[SourceManifestRow], str, str]:
         normalized_source_ids = source_ids or set()
@@ -7368,6 +7395,7 @@ class AttachedRepositoryService:
                         run_llm_summary=run_llm_summary,
                         run_llm_rating=run_llm_rating,
                         run_images=run_images,
+                        run_resignal=run_resignal,
                         output_options=effective_output_options,
                     )
                 ]
@@ -7391,6 +7419,7 @@ class AttachedRepositoryService:
                     run_llm_summary=run_llm_summary,
                     run_llm_rating=run_llm_rating,
                     run_images=run_images,
+                    run_resignal=run_resignal,
                     output_options=effective_output_options,
                 )
             ]
@@ -7423,6 +7452,7 @@ class AttachedRepositoryService:
         run_llm_summary: bool,
         run_llm_rating: bool,
         run_images: bool = False,
+        run_resignal: bool = False,
         output_options: SourceOutputOptions,
     ) -> bool:
         if run_download:
@@ -7449,6 +7479,13 @@ class AttachedRepositoryService:
         if run_llm_rating and not self._row_has_artifact(row, "rating_file"):
             return True
         if run_images and not self._row_has_artifact(row, "image_index_file"):
+            return True
+        if (
+            run_resignal
+            and str(row.detected_type or "").strip().lower() == "html"
+            and self._row_has_artifact(row, "raw_file")
+            and not str(row.date_signals or "").strip()
+        ):
             return True
         return False
 
@@ -12108,6 +12145,7 @@ def _normalize_agent_phase_names(
     run_rating: bool = False,
     run_summary: bool = False,
     run_images: bool = False,
+    run_resignal: bool = False,
 ) -> list[str]:
     allowed = {
         PHASE_FETCH,
@@ -12119,6 +12157,7 @@ def _normalize_agent_phase_names(
         PHASE_SUMMARY,
         PHASE_RATING,
         PHASE_IMAGES,
+        PHASE_RESIGNAL,
     }
     normalized: list[str] = []
     seen: set[str] = set()
@@ -12151,6 +12190,8 @@ def _normalize_agent_phase_names(
         defaults.append(PHASE_RATING)
     if run_images:
         defaults.append(PHASE_IMAGES)
+    if run_resignal:
+        defaults.append(PHASE_RESIGNAL)
     return defaults
 
 
@@ -12515,6 +12556,7 @@ def _build_pending_source_status(
         run_llm_summary=bool(getattr(orchestrator, "run_llm_summary", False)),
         run_llm_rating=bool(getattr(orchestrator, "run_llm_rating", False)),
         run_images=bool(getattr(orchestrator, "run_images", False)),
+        run_resignal=bool(getattr(orchestrator, "run_resignal", False)),
         force_redownload=bool(getattr(orchestrator, "force_redownload", False)),
         force_convert=bool(getattr(orchestrator, "force_convert", False)),
         force_catalog=bool(getattr(orchestrator, "force_catalog", False)),
@@ -12524,6 +12566,7 @@ def _build_pending_source_status(
         force_summary=bool(getattr(orchestrator, "force_summary", False)),
         force_rating=bool(getattr(orchestrator, "force_rating", False)),
         force_images=bool(getattr(orchestrator, "force_images", False)),
+        force_resignal=bool(getattr(orchestrator, "force_resignal", False)),
         output_dir=str(getattr(orchestrator, "status_output_dir", "output_run")),
         manifest_csv=str(getattr(orchestrator, "status_manifest_csv", "output_run/manifest.csv")),
         manifest_xlsx=str(

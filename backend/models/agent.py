@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from backend.models.sources import SourcePhaseMetadata
 
-AgentPhaseName = Literal["fetch", "convert", "cleanup", "tag", "summarize", "images"]
+AgentPhaseName = Literal["fetch", "convert", "cleanup", "tag", "summarize", "images", "resignal"]
 
 
 class AgentErrorPayload(BaseModel):

@@ -306,6 +306,9 @@ class SourceDownloadRequest(BaseModel):
     run_llm_summary: bool = True
     run_llm_rating: bool = False
     run_images: bool = False
+    # Regenerate deterministic fetch/ingest signals (e.g. date_signals) from
+    # already-saved artifacts, with no network fetch. See PHASE_RESIGNAL.
+    run_resignal: bool = False
     force_redownload: bool = False
     force_convert: bool = False
     force_catalog: bool = False
@@ -315,6 +318,7 @@ class SourceDownloadRequest(BaseModel):
     force_summary: bool = False
     force_rating: bool = False
     force_images: bool = False
+    force_resignal: bool = False
     project_profile_name: str = ""
     include_raw_file: bool = True
     include_rendered_html: bool = True
@@ -393,6 +397,7 @@ class SourceDownloadStatus(BaseModel):
     run_llm_summary: bool = True
     run_llm_rating: bool = False
     run_images: bool = False
+    run_resignal: bool = False
     force_redownload: bool = False
     force_convert: bool = False
     force_catalog: bool = False
@@ -402,6 +407,7 @@ class SourceDownloadStatus(BaseModel):
     force_summary: bool = False
     force_rating: bool = False
     force_images: bool = False
+    force_resignal: bool = False
     project_profile_name: str = ""
     output_options: SourceOutputOptions = Field(default_factory=SourceOutputOptions)
     output_summary: SourceOutputSummary = Field(default_factory=SourceOutputSummary)

@@ -40,7 +40,7 @@ from pathlib import Path
 # contract, or this file built itself. Mirrors `gate_for` in
 # backend/workflow/models.py -- the server's answer wins when it sends one.
 GATED = re.compile(
-    r"--confirm-overwrite\b|--apply\b|\bra (fetch|retry|convert|images|run-column|set-constraints)\b"
+    r"--confirm-overwrite\b|--apply\b|\bra (fetch|retry|convert|images|run-column|run-columns|full-run|set-constraints|set-fetch-status|edit-column)\b|\bra config --use-llm\b|\bra set-purpose --file\b|\bra profile --(set|upload)\b"
 )
 
 # Bumped whenever a response shape this file reads changes. The server declares
@@ -596,6 +596,14 @@ def cmd_images(args, token):
     return cmd_fetch(args, token)
 
 
+def cmd_refresh_metadata(args, token):
+    # Regenerate deterministic fetch/ingest signals (e.g. date_signals) from the
+    # files already on disk -- no re-download. Runs fetch-time-only steps after a
+    # fetch, on any individual or collection of sources.
+    args.phases = "resignal"
+    return cmd_fetch(args, token)
+
+
 def cmd_triage(args, token):
     check_contract(token)
     body, _ = request("GET", "/api/workflow/v1/triage", token=token, params={"phase": args.phase})
@@ -783,6 +791,285 @@ def cmd_watch(args, token):
 
 
 # ---------------------------------------------------------------------------
+# helpers for the plain-REST surface (settings, profiles, sources, columns)
+# ---------------------------------------------------------------------------
+
+
+def rest(method, path, *, token, payload=None):
+    """Call a plain REST endpoint (not `/api/workflow/v1`). Raise on HTTP >= 400.
+
+    The workflow endpoints answer with a `{status, data}` envelope; these older
+    REST endpoints answer with the model itself, or `{"detail": ...}` on error.
+    """
+    body, status = request(method, path, token=token, payload=payload)
+    if status >= 400:
+        detail = body.get("detail") if isinstance(body, dict) else ""
+        raise Problem(str(detail or f"HTTP {status} from {path}"), code="request_failed")
+    # Most of these endpoints answer with a model dict; a few (project-profiles)
+    # answer with a list. Return whatever came back and let the caller shape it.
+    return body
+
+
+def read_text_arg(spec):
+    """Read prompt / research-purpose text from a file path, or stdin for '-'."""
+    if spec == "-":
+        return sys.stdin.read()
+    path = Path(spec).expanduser()
+    if not path.is_file():
+        raise Problem(f"No such file: {spec}", code="file_not_found", exit_code=EXIT_USAGE)
+    return path.read_text(encoding="utf-8")
+
+
+def _pad_id(value):
+    value = str(value or "").strip()
+    return f"{int(value):06d}" if value.isdigit() else value
+
+
+def _norm_label(value):
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _orientation_columns(token):
+    body, _ = request("GET", "/api/workflow/v1/orientation", token=token)
+    return data_of(body).get("columns", [])
+
+
+def cmd_config(args, token):
+    """Show the backend, or turn the model on/off (the app-wide `use_llm` gate)."""
+    if args.use_llm is not None:
+        settings = rest("PUT", "/api/settings", token=token, payload={"use_llm": args.use_llm == "on"})
+    else:
+        settings = rest("GET", "/api/settings", token=token)
+    backend = settings.get("llm_backend") or {}
+    on = bool(settings.get("use_llm"))
+    lines = [
+        f"LLM is {'ON' if on else 'OFF'}.",
+        f"  backend: {backend.get('kind', '?')} {backend.get('base_url', '?')} model={backend.get('model', '?')!r}",
+        f"  vision: {'dedicated backend' if settings.get('vision_backend') else 'reuses the text backend'}",
+    ]
+    nxt = ["ra doctor"] if on else ["ra config --use-llm on"]
+    return True, "\n".join(lines), nxt, settings, []
+
+
+def cmd_set_purpose(args, token):
+    """Set or show the repository's research prompt (injected into every column run)."""
+    if not args.file or args.show:
+        settings = rest("GET", "/api/repository/settings", token=token)
+        purpose = str(settings.get("research_purpose") or "")
+        shown = purpose[:1000] + ("..." if len(purpose) > 1000 else "")
+        return True, f"Research prompt ({len(purpose)} chars):\n{shown}", ["ra where"], settings, []
+    text = read_text_arg(args.file).strip()
+    settings = rest("PUT", "/api/repository/settings", token=token, payload={"research_purpose": text})
+    return True, f"Research prompt set ({len(text)} chars).", ["ra doctor"], settings, []
+
+
+def _profile_names(listing):
+    if isinstance(listing, dict):
+        items = listing.get("profiles") or listing.get("items") or listing.get("data") or []
+    else:
+        items = listing or []
+    names = []
+    for item in items:
+        if isinstance(item, str):
+            names.append(item)
+        elif isinstance(item, dict):
+            names.append(str(item.get("filename") or item.get("name") or item.get("profile_name") or ""))
+    return [n for n in names if n]
+
+
+def cmd_profile(args, token):
+    """List / show / select / upload the project profile that scores the sources."""
+    if args.set:
+        settings = rest("PUT", "/api/repository/settings", token=token,
+                        payload={"default_project_profile_name": args.set})
+        return True, f"Active project profile set to {args.set!r}.", ["ra doctor"], settings, []
+    if args.upload:
+        path = Path(args.upload).expanduser()
+        if not path.is_file():
+            raise Problem(f"No such file: {args.upload}", code="file_not_found", exit_code=EXIT_USAGE)
+        name = path.name
+        rest("PUT", f"/api/project-profiles/{urllib.parse.quote(name)}", token=token,
+             payload={"content": path.read_text(encoding="utf-8")})
+        return True, f"Uploaded profile {name!r}. Activate it with: ra profile --set {name}", \
+            [f"ra profile --set {name}"], {"filename": name}, []
+    listing = rest("GET", "/api/project-profiles", token=token)
+    settings = rest("GET", "/api/repository/settings", token=token)
+    active = str(settings.get("default_project_profile_name") or "")
+    names = _profile_names(listing)
+    lines = [f"{len(names)} project profile(s); active: {active or '(none)'}"]
+    for name in names:
+        lines.append(f"  {'* ' if name == active else '  '}{name}")
+    nxt = ["ra doctor"] if active else ([f"ra profile --set {names[0]}"] if names else ["ra doctor"])
+    return True, "\n".join(lines), nxt, {"profiles": names, "active": active}, []
+
+
+def cmd_set_cell(args, token):
+    """Set one custom-column value on one source (e.g. a citation the model declined)."""
+    check_contract(token)
+    col = args.column.strip()
+    key = "column_id" if col.startswith("custom_") else "column_label"
+    params = {key: col, "values": {_pad_id(args.source_id): args.value}, "overwrite": bool(args.overwrite)}
+    ok, summary, nxt, data, problems = _operation("set-cell", "set_column_values", params, args.apply, token)
+    if ok and not args.apply:
+        # The generic apply hint (`ra set-cell --apply`) drops the positional
+        # args, so rebuild the complete command the caller should run.
+        full = ("ra set-cell " + shlex.quote(col) + " " + _pad_id(args.source_id) + " "
+                + shlex.quote(args.value) + (" --overwrite" if args.overwrite else "") + " --apply")
+        why = nxt[0].get("why") if (nxt and isinstance(nxt[0], dict)) else ""
+        nxt = [{"command": full, "gate": "ask_user",
+                "why": why or "Show the user this change and get their agreement first."}]
+    return ok, summary, nxt, data, problems
+
+
+def cmd_set_fetch_status(args, token):
+    """Force one or more sources' fetch status (what the Resolve Fetches screen lists)."""
+    check_contract(token)
+    ids = [_pad_id(i) for i in args.ids.split(",") if i.strip()]
+    if not ids:
+        raise Problem("Name at least one source id.", code="usage", exit_code=EXIT_USAGE)
+    payload = {"fetch_status": args.status}
+    if args.reason is not None:
+        payload["error_message"] = args.reason
+    done = []
+    for sid in ids:
+        rest("PATCH", f"/api/repository/sources/{sid}", token=token, payload=payload)
+        done.append(sid)
+    phrase = {
+        "partial": "marked partial (shows in Resolve Fetches)",
+        "blocked": "marked blocked (shows in Resolve Fetches)",
+        "failed": "marked failed (shows in Resolve Fetches)",
+        "success": "marked resolved (success)",
+        "queued": "re-queued for fetch",
+        "not_applicable": "marked not-applicable",
+    }.get(args.status, args.status)
+    return True, f"{len(done)} source(s) {phrase}: {', '.join(done)}", ["ra where"], \
+        {"ids": done, "status": args.status}, []
+
+
+def _column_patch_from_args(args):
+    patch = {}
+    if args.prompt_file:
+        patch["instruction_prompt"] = read_text_arg(args.prompt_file).strip()
+    if args.scope:
+        patch["row_context_scope"] = args.scope
+        patch["include_row_context"] = args.scope != "none"
+    if args.source_text:
+        patch["include_source_text"] = args.source_text == "yes"
+    if args.allowed is not None or args.fallback is not None:
+        constraint = {}
+        if args.allowed is not None:
+            constraint["allowed_values"] = [v.strip() for v in args.allowed.split(",") if v.strip()]
+        if args.fallback is not None:
+            constraint["fallback_value"] = args.fallback
+        patch["output_constraint"] = constraint
+    return patch
+
+
+def cmd_edit_column(args, token):
+    """Create a column, or change its prompt / scope / source-text / allowed values."""
+    check_contract(token)
+    target = args.column.strip()
+    columns = _orientation_columns(token)
+    match = next(
+        (c for c in columns
+         if c.get("id") == target or _norm_label(c.get("label")) == _norm_label(target)),
+        None,
+    )
+    patch = _column_patch_from_args(args)
+    created = False
+    if match is None:
+        if not args.create:
+            raise Problem(
+                f"No column matches {target!r}. List them with `ra columns`, or add --create to make it.",
+                code="unknown_column",
+                remedy=f"ra edit-column {shlex.quote(target)} --create --prompt-file <file>",
+            )
+        new_column = rest("POST", "/api/repository/columns", token=token,
+                          payload={"label": (args.label or target)})
+        cid = str(new_column.get("id") or "")
+        created = True
+    else:
+        cid = str(match.get("id") or "")
+    if patch:
+        rest("PATCH", f"/api/repository/columns/{cid}", token=token, payload=patch)
+    what = "created" if created else "updated"
+    fields = ", ".join(patch.keys()) if patch else "no prompt/settings changed"
+    nxt = ["ra run-columns --confirm-overwrite  # re-code every source with the new prompt", "ra columns"]
+    return True, f"Column {target!r} {what} as {cid} ({fields}).", nxt, \
+        {"id": cid, "created": created, "changed": list(patch)}, []
+
+
+def _run_one_column(column_id, scope, confirm_overwrite, source_ids, token):
+    body, _ = request(
+        "POST", "/api/workflow/v1/runs/columns", token=token,
+        payload={"column_id": column_id, "scope": scope, "source_ids": source_ids,
+                 "confirm_overwrite": confirm_overwrite, "wait_seconds": 120},
+    )
+    raise_if_busy(body, token)
+    data = data_of(body)
+    if not data.get("terminal") and data.get("run_id"):
+        data = follow(data["run_id"], token) or data
+    return data
+
+
+def cmd_run_columns(args, token):
+    """Run every prompted column over the sources, in sequence."""
+    check_contract(token)
+    columns = [c for c in _orientation_columns(token) if c.get("has_prompt")]
+    if not columns:
+        return True, "No prompted columns to run.", ["ra columns"], {}, []
+    source_ids = [_pad_id(i) for i in (getattr(args, "sources", "") or "").split(",") if i.strip()]
+    confirm = bool(args.confirm_overwrite)
+    scope = "selected" if source_ids else ("all" if confirm else "empty_only")
+    lines, total_failed, needs_confirm = [], 0, 0
+    for column in columns:
+        data = _run_one_column(column["id"], scope, confirm, source_ids, token)
+        label = str(column.get("label", ""))[:40]
+        if data.get("confirmation_required"):
+            needs_confirm += 1
+            lines.append(f"  {label:42} skipped — values present (use --confirm-overwrite)")
+            continue
+        failed = data.get("failed_rows") or 0
+        total_failed += failed
+        lines.append(f"  {label:42} {data.get('succeeded_rows', 0)} ok, {failed} failed")
+    mode = "overwrite" if confirm else "empty cells only"
+    where = f" on {len(source_ids)} source(s)" if source_ids else ""
+    head = f"Ran {len(columns)} column(s) ({mode}){where}."
+    if needs_confirm and not confirm:
+        head += " Some columns already have values — re-run with --confirm-overwrite to replace them."
+    nxt = ["ra where"] if not total_failed else ["ra triage --phase rating", "ra where"]
+    return total_failed == 0, head + "\n" + "\n".join(lines), nxt, {"columns": len(columns)}, []
+
+
+def _run_source_phases(phases, source_ids, token, force=False):
+    body, _ = request(
+        "POST", "/api/workflow/v1/runs/source-phases", token=token,
+        payload={"phases": phases, "scope": "all", "source_ids": source_ids,
+                 "force": force, "limit": None, "wait_seconds": 120},
+    )
+    raise_if_busy(body, token)
+    data = data_of(body)
+    if not data.get("terminal") and data.get("run_id"):
+        data = follow(data["run_id"], token) or data
+    return data
+
+
+def cmd_full_run(args, token):
+    """The one-shot re-run: refresh fetch signals, run images, then run every column."""
+    check_contract(token)
+    ids = [_pad_id(i) for i in (args.ids or "").split(",") if i.strip()]
+    lines = []
+    signals = _run_source_phases(["resignal"], ids, token)
+    lines.append(f"  refresh-metadata: {signals.get('summary', 'done')}")
+    images = _run_source_phases(["images"], ids, token)
+    lines.append(f"  images: {images.get('summary', 'done')}")
+    column_args = argparse.Namespace(sources=",".join(ids), confirm_overwrite=True)
+    ok, csummary, _cnext, _cdata, cproblems = cmd_run_columns(column_args, token)
+    lines.append("  columns:\n    " + csummary.replace("\n", "\n    "))
+    return ok, "Full run complete.\n" + "\n".join(lines), ["ra where"], {"source_ids": ids}, cproblems
+
+
+# ---------------------------------------------------------------------------
 # entry point
 # ---------------------------------------------------------------------------
 
@@ -891,6 +1178,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wait", action="store_true")
     p.set_defaults(func=cmd_images)
 
+    p = sub.add_parser(
+        "refresh-metadata",
+        help="Regenerate fetch-time signals (e.g. date_signals) from saved files; no re-download.",
+    )
+    p.add_argument("--scope", default="all",
+                   choices=["queued", "all", "import", "latest_import", "empty_only"])
+    p.add_argument("--ids", default="", help="Comma-separated ids; overrides --scope.")
+    p.add_argument("--force", action="store_true", help="Recompute even signals already present.")
+    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--wait", action="store_true")
+    p.set_defaults(func=cmd_refresh_metadata)
+
     p = sub.add_parser("triage", help="Group failures and say what to do about each.")
     p.add_argument("--phase", default="fetch")
     p.set_defaults(func=cmd_triage)
@@ -927,6 +1226,61 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("run_id")
     p.add_argument("--wait", action="store_true")
     p.set_defaults(func=cmd_watch)
+
+    p = sub.add_parser("config", help="Show the backend, or turn the model on/off.")
+    p.add_argument("--use-llm", choices=["on", "off"], default=None, dest="use_llm")
+    p.add_argument("--show", action="store_true")
+    p.set_defaults(func=cmd_config)
+
+    p = sub.add_parser("set-purpose", help="Set or show the repository's research prompt.")
+    p.add_argument("--file", default="", help="Path to a text file, or - for stdin.")
+    p.add_argument("--show", action="store_true")
+    p.set_defaults(func=cmd_set_purpose)
+
+    p = sub.add_parser("profile", help="List, show, select (--set), or upload the project profile.")
+    p.add_argument("--set", default="", help="Filename of the profile to make active.")
+    p.add_argument("--upload", default="", help="Path to a profile YAML to add.")
+    p.add_argument("--list", action="store_true")
+    p.add_argument("--show", action="store_true")
+    p.set_defaults(func=cmd_profile)
+
+    p = sub.add_parser("set-cell", help="Set one custom-column value on one source.")
+    p.add_argument("column", help="Column id (custom_...) or label.")
+    p.add_argument("source_id")
+    p.add_argument("value")
+    p.add_argument("--overwrite", action="store_true", help="Replace a value already there.")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_set_cell)
+
+    p = sub.add_parser("set-fetch-status", help="Force a source's fetch status (Resolve Fetches).")
+    p.add_argument("ids", help="Comma-separated source ids.")
+    p.add_argument("status",
+                   choices=["success", "partial", "blocked", "failed", "queued", "not_applicable"])
+    p.add_argument("--reason", default=None, help='Human note to show ("" clears it).')
+    p.set_defaults(func=cmd_set_fetch_status)
+
+    p = sub.add_parser("edit-column", help="Create or change a column's prompt / scope / constraint.")
+    p.add_argument("column", help="Column id or label.")
+    p.add_argument("--create", action="store_true", help="Make the column if it does not exist.")
+    p.add_argument("--label", default="", help="Label for a newly created column (defaults to the name given).")
+    p.add_argument("--prompt-file", default="", dest="prompt_file",
+                   help="Path to the instruction prompt text (- for stdin).")
+    p.add_argument("--scope", choices=["none", "fetch_metadata", "all"], default="")
+    p.add_argument("--source-text", choices=["yes", "no"], default="", dest="source_text")
+    p.add_argument("--allowed", default=None, help="Comma-separated allowed values.")
+    p.add_argument("--fallback", default=None, help="Fallback value when evidence is insufficient.")
+    p.set_defaults(func=cmd_edit_column)
+
+    p = sub.add_parser("run-columns", help="Run every prompted column over the sources.")
+    p.add_argument("--confirm-overwrite", action="store_true", dest="confirm_overwrite",
+                   help="Overwrite existing values (default is empty cells only).")
+    p.add_argument("--sources", default="", help="Comma-separated source ids; default is all.")
+    p.add_argument("--wait", action="store_true", help="(Always waits; accepted for symmetry.)")
+    p.set_defaults(func=cmd_run_columns)
+
+    p = sub.add_parser("full-run", help="Refresh signals, run images, then run every column.")
+    p.add_argument("--ids", default="", help="Comma-separated source ids; default is all sources.")
+    p.set_defaults(func=cmd_full_run)
 
     return parser
 

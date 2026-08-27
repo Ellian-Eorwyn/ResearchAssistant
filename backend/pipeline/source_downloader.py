@@ -157,6 +157,9 @@ PHASE_CITATION_VERIFY = "citation_verify"
 PHASE_SUMMARY = "summary"
 PHASE_RATING = "rating"
 PHASE_IMAGES = "images"
+# Regenerate deterministic fetch/ingest signals (e.g. date_signals) from
+# artifacts already on disk, without a network fetch. Opt-in, like images.
+PHASE_RESIGNAL = "resignal"
 
 LEGACY_PHASE_ALIASES = {
     "summarize": PHASE_SUMMARY,
@@ -1291,6 +1294,7 @@ class SourceDownloadOrchestrator:
         run_llm_summary: bool = True,
         run_llm_rating: bool = False,
         run_images: bool = False,
+        run_resignal: bool = False,
         force_redownload: bool = False,
         force_convert: bool = False,
         force_catalog: bool = False,
@@ -1300,6 +1304,7 @@ class SourceDownloadOrchestrator:
         force_summary: bool = False,
         force_rating: bool = False,
         force_images: bool = False,
+        force_resignal: bool = False,
         project_profile_name: str = "",
         project_profile_yaml: str = "",
         output_options: SourceOutputOptions | None = None,
@@ -1333,6 +1338,7 @@ class SourceDownloadOrchestrator:
         self.force_summary = bool(force_summary)
         self.force_rating = bool(force_rating)
         self.force_images = bool(force_images)
+        self.force_resignal = bool(force_resignal)
         self.output_options = output_options or SourceOutputOptions()
         self.run_download = bool(run_download or self.force_redownload)
         self.run_convert = bool(run_convert or (self.run_download and self.output_options.include_markdown))
@@ -1343,6 +1349,7 @@ class SourceDownloadOrchestrator:
         self.run_llm_summary = bool(run_llm_summary or self.force_summary)
         self.run_llm_rating = bool(run_llm_rating or self.force_rating)
         self.run_images = bool(run_images or self.force_images)
+        self.run_resignal = bool(run_resignal or self.force_resignal)
         self.project_profile_name = (project_profile_name or "").strip()
         self.project_profile_yaml = (project_profile_yaml or "").strip()
         self.target_rows = [
@@ -1369,6 +1376,7 @@ class SourceDownloadOrchestrator:
                 PHASE_SUMMARY,
                 PHASE_RATING,
                 PHASE_IMAGES,
+                PHASE_RESIGNAL,
             }
         ]
         self.row_persist_callback = row_persist_callback
@@ -1443,6 +1451,8 @@ class SourceDownloadOrchestrator:
             phases.append(PHASE_RATING)
         if self.run_images:
             phases.append(PHASE_IMAGES)
+        if self.run_resignal:
+            phases.append(PHASE_RESIGNAL)
         return phases
 
     def _initial_phase_states(self) -> dict[str, SourcePhaseMetadata]:
@@ -1540,6 +1550,7 @@ class SourceDownloadOrchestrator:
                 or self.run_llm_summary
                 or self.run_llm_rating
                 or self.run_images
+                or self.run_resignal
             ):
                 raise RuntimeError("Select at least one phase to run")
             if self.run_download and not any(
@@ -2511,6 +2522,7 @@ class SourceDownloadOrchestrator:
             (self.run_llm_summary, PHASE_SUMMARY),
             (self.run_llm_rating, PHASE_RATING),
             (self.run_images, PHASE_IMAGES),
+            (self.run_resignal, PHASE_RESIGNAL),
         ):
             if should_run:
                 self._set_phase_state(phase, "running")
@@ -3798,6 +3810,7 @@ class SourceDownloadOrchestrator:
         self._generate_source_summary(row, notes)
         self._generate_source_rating(row, notes)
         self._generate_source_images(row, notes)
+        self._regenerate_fetch_signals(row, notes)
         row.notes = "; ".join(dict.fromkeys(n for n in notes if n))
         metadata_rel = self._metadata_rel(row)
         row.metadata_file = metadata_rel.as_posix()
@@ -4859,6 +4872,63 @@ class SourceDownloadOrchestrator:
                 prompt_version=PROMPT_VERSION_RATING,
             )
             logger.warning("Rating generation failed for %s: %s", row.id, exc)
+
+    # ---- Fetch-signal regeneration --------------------------------------
+
+    def _regenerate_fetch_signals(self, row: SourceManifestRow, notes: list[str]) -> None:
+        """Recompute deterministic fetch/ingest signals from saved artifacts.
+
+        Some signals are derived from the raw HTML only in the fetch path, so a
+        repository fetched before a signal existed never gets it without a full
+        re-download. This opt-in ``resignal`` phase closes that gap: it reads the
+        raw file already on disk and recomputes the signal in place, with no
+        network call. Idempotent -- it can be re-run any time, on any subset of
+        sources, and only fills a signal it can actually derive.
+
+        Today it regenerates ``date_signals`` (the raw-HTML publication-date
+        candidates the Citation/Year prompts read). New raw-HTML-derived signals
+        belong here too, alongside it, so one phase refreshes them all.
+        """
+        if not self.run_resignal:
+            return
+
+        self._begin_row_phase(row, PHASE_RESIGNAL, prompt_version="resignal.pipeline.v1")
+
+        # Only HTML sources carry raw-HTML date signals; a PDF/video/document row
+        # has nothing to derive, so it is a clean no-op rather than a failure.
+        if row.detected_type != "html":
+            self._complete_row_phase(row, PHASE_RESIGNAL, status="skipped")
+            return
+
+        raw_path = Path(row.raw_file) if row.raw_file else None
+        if raw_path is None or not _has_output_file(self.output_dir, row.raw_file):
+            self._complete_row_phase(
+                row,
+                PHASE_RESIGNAL,
+                status="skipped",
+                error="resignal_missing_prerequisite: raw_file_not_found",
+                error_code="resignal_missing_prerequisite",
+            )
+            return
+
+        raw_html = self._read_text(raw_path)
+        changed: list[str] = []
+
+        new_date_signals = extract_date_signals(raw_html)
+        if new_date_signals and new_date_signals != row.date_signals:
+            row.date_signals = new_date_signals
+            changed.append("date_signals")
+
+        if changed:
+            notes.append("resignal_regenerated: " + ", ".join(changed))
+        self._complete_row_phase(
+            row,
+            PHASE_RESIGNAL,
+            status="completed",
+            content_digest=hashlib.sha256(
+                (row.date_signals or "").encode("utf-8")
+            ).hexdigest(),
+        )
 
     # ---- Image handling -------------------------------------------------
 
@@ -7702,6 +7772,12 @@ def _row_task_outcome(
                 outcomes.append(_phase_status_outcome(metadata.status))
             else:
                 outcomes.append(_phase_status_outcome(row.rating_status))
+        elif phase == PHASE_RESIGNAL:
+            metadata = _get_phase_metadata(row, PHASE_RESIGNAL)
+            if metadata is not None:
+                outcomes.append(_phase_status_outcome(metadata.status))
+            else:
+                outcomes.append("pending")
 
     if any(item == "failed" for item in outcomes):
         return "failed"

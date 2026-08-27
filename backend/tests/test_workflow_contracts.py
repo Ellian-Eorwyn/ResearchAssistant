@@ -311,6 +311,7 @@ class SkillDocumentTests(unittest.TestCase):
 
     # Words that look like codes but are prose, filenames, fields or commands.
     ALLOWED = {
+        "date_signals", "fetch_metadata",
         "instruction_prompt", "fetch_status", "error_message", "phase_metadata",
         "error_code", "source_id", "source_ids", "new_id", "column_id", "job_id",
         "run_id", "state_fingerprint", "idempotency_key", "confirm_overwrite",

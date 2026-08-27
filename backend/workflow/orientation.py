@@ -241,14 +241,31 @@ def _next_actions(report: Orientation) -> list[NextAction]:
     if not prompted:
         actions.append(na("ra create-columns"))
     elif not queued:
+        # The bulk path a weak model should follow: full-run does the steps in
+        # the order columns depend on -- refresh fetch signals (date_signals),
+        # analyse images, then run every column -- so date/visual columns are
+        # never coded before their inputs exist. It is gated, so the user still
+        # confirms the spend.
+        unfilled = [c for c in prompted if (getattr(c, "empty_rows", 0) or 0) > 0]
+        if unfilled:
+            actions.append(
+                na(
+                    "ra full-run",
+                    why=(
+                        f"{len(unfilled)} column(s) have empty cells. full-run refreshes fetch "
+                        "signals and images, then runs every column over "
+                        f"{report.total_sources} source(s) -- many model calls."
+                    ),
+                )
+            )
         first = _first_to_run(prompted)
         if first is not None:
             actions.append(
                 na(
                     f"ra run-column {first.id} --wait",
                     why=(
-                        f"{report.total_sources} source(s) x 1 model call for "
-                        f"{first.label!r}. Ask before spending them."
+                        f"Cautious alternative: run just {first.label!r} first "
+                        f"({report.total_sources} model calls) to check its prompt before a full run."
                     ),
                 )
             )

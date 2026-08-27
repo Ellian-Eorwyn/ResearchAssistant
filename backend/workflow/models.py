@@ -48,6 +48,34 @@ _GATED: tuple[tuple[re.Pattern[str], str], ...] = (
         re.compile(r"\bra images\b"),
         "This classifies and describes page images with the vision model, which spends model calls.",
     ),
+    (
+        re.compile(r"\bra run-columns\b"),
+        "This runs many columns; every source costs one model call per column. Say how many and wait.",
+    ),
+    (
+        re.compile(r"\bra full-run\b"),
+        "This runs the whole pipeline (signals, images, every column) over the sources — many model calls.",
+    ),
+    (
+        re.compile(r"\bra set-fetch-status\b"),
+        "This changes a source's fetch status in the repository.",
+    ),
+    (
+        re.compile(r"\bra edit-column\b"),
+        "This changes a column's prompt or settings, which affects every future run of it.",
+    ),
+    (
+        re.compile(r"\bra config --use-llm\b"),
+        "This changes whether the model runs for the whole app.",
+    ),
+    (
+        re.compile(r"\bra set-purpose --file\b"),
+        "This rewrites the repository's research prompt.",
+    ),
+    (
+        re.compile(r"\bra profile --(set|upload)\b"),
+        "This changes which project profile scores the sources.",
+    ),
     (re.compile(r"--apply\b"), "This writes to the repository."),
 )
 

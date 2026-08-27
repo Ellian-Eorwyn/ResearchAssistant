@@ -150,6 +150,28 @@ def _resolve(
             "",
         )
 
+    # A value that is not one of the column's own listed answers reads oddly next
+    # to model-written cells; surface it in the dry-run so the caller sees it
+    # before --apply (set-cell is written verbatim, unchecked against constraints).
+    allowed = list(
+        getattr(getattr(config, "output_constraint", None), "allowed_values", None) or []
+    )
+    if allowed:
+        allowed_set = {str(v).strip().casefold() for v in allowed}
+        off = [p for p in planned if p.after and p.after.casefold() not in allowed_set]
+        if off:
+            warn(
+                "value_not_in_allowed",
+                f"{len(off)} value(s) are not among {config.label!r}'s allowed answers "
+                f"({', '.join(repr(v) for v in allowed[:8])}"
+                + ("..." if len(allowed) > 8 else "")
+                + "): "
+                + ", ".join(repr(p.after[:40]) for p in off[:6])
+                + ("..." if len(off) > 6 else "")
+                + ". Stored as-is.",
+                "",
+            )
+
     return config, planned, blockers, warnings
 
 

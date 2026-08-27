@@ -222,8 +222,12 @@ If `ra where` reports values `computed from text that has since been rebuilt`,
 those cells are wrong and `--scope empty_only` will not revisit them. The exact
 re-run command is in `next`.
 
-To change a prompt and redo a column, edit it in the app, then re-run that column
-with `--scope all --confirm-overwrite`.
+To change a prompt and redo a column, use `.agents/bin/ra edit-column` (or edit
+it in the app), then re-run that column with `--scope all --confirm-overwrite`.
+
+For data fixes and one-shot re-runs — change a cell, mark a source's fetch
+status, edit a column, enable the model, or run everything at once with
+`ra full-run` — see the **ra-operator** skill.
 
 ## If you get lost
 

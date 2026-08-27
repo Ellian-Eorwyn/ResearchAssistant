@@ -283,6 +283,8 @@ class RepositorySourcePatchRequest(BaseModel):
     # Manual override for a fetch the verifier mis-scored.
     fetch_status: str | None = None
     fetch_verification: str | None = None
+    # A human reason to show beside a forced status (or "" to clear a stale one).
+    error_message: str | None = None
     custom_fields: dict[str, str | None] = Field(default_factory=dict)
 
 

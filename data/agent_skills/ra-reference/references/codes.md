@@ -34,6 +34,7 @@ split out for you. `ra triage` groups by them and gives you the remedy.
 | `playwright_not_installed` | The headless browser is not installed, so pages needing rendering will fail. | no — fix the environment |
 | `rating_generation_failed` | The model call for the rating failed. Often transient. | yes |
 | `rendering_failure` | The headless browser failed to render the page. | no — fix the environment |
+| `resignal_missing_prerequisite` | Not classified. | unknown |
 | `runtime_missing_yt_dlp` | yt-dlp is not installed, so video sources cannot be downloaded. | no — fix the environment |
 | `summary_generation_failed` | The model call for the summary failed. Often transient. | yes |
 | `timeout` | The site did not respond in time. Often transient, especially under load. | yes |
@@ -77,7 +78,7 @@ Blockers: `column_without_allowed_values`, `constraint_already_set`, `unknown_co
 
 Blockers: `column_label_ambiguous`, `column_required`, `unknown_column_id`, `unknown_column_label`, `values_required`
 
-Warnings: `unknown_source_id`, `value_already_present`
+Warnings: `unknown_source_id`, `value_already_present`, `value_not_in_allowed`
 
 ## Spreadsheet notes
 

@@ -144,7 +144,7 @@ def run_preflight(
         use_llm,
         "blocker_for_columns",
         "LLM is enabled." if use_llm else "LLM is switched off in Settings.",
-        "" if use_llm else "Turn on 'use LLM' in the app's Settings page.",
+        "" if use_llm else "ra config --use-llm on",
     )
 
     shape_ok = bool(llm) and llm_backend_ready_for_chat(llm)
